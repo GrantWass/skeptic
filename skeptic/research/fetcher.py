@@ -32,13 +32,13 @@ class HistoricalSession:
     up_token_id: str
     down_token_id: str
 
-    # Trade prices during the first 60 seconds for each outcome
-    up_trades_m1: list[float] = field(default_factory=list)   # prices seen ≤60s
-    down_trades_m1: list[float] = field(default_factory=list)
+    # Trade (timestamp, price) pairs during the first 60 seconds for each outcome
+    up_trades_m1: list[tuple[int, float]] = field(default_factory=list)   # (ts, price) ≤60s
+    down_trades_m1: list[tuple[int, float]] = field(default_factory=list)
 
-    # All trade prices during the full window
-    up_trades_all: list[float] = field(default_factory=list)
-    down_trades_all: list[float] = field(default_factory=list)
+    # All trade (timestamp, price) pairs during the full window, chronological
+    up_trades_all: list[tuple[int, float]] = field(default_factory=list)
+    down_trades_all: list[tuple[int, float]] = field(default_factory=list)
 
     # Resolution: 1.0 if UP won, 0.0 if DOWN won; None if unresolvable
     up_resolution: float | None = None
@@ -46,19 +46,31 @@ class HistoricalSession:
 
     @property
     def up_min_m1(self) -> float | None:
-        return min(self.up_trades_m1) if self.up_trades_m1 else None
+        return min(p for _, p in self.up_trades_m1) if self.up_trades_m1 else None
 
     @property
     def down_min_m1(self) -> float | None:
-        return min(self.down_trades_m1) if self.down_trades_m1 else None
+        return min(p for _, p in self.down_trades_m1) if self.down_trades_m1 else None
 
-    @property
-    def up_max_after_open(self) -> float | None:
-        return max(self.up_trades_all) if self.up_trades_all else None
+    def up_max_after_fill(self, buy_threshold: float) -> float | None:
+        """Max UP price after the first buy fill in minute 1 at or below buy_threshold."""
+        fill_ts = next(
+            (ts for ts, p in self.up_trades_m1 if p <= buy_threshold), None
+        )
+        if fill_ts is None:
+            return None
+        subsequent = [p for ts, p in self.up_trades_all if ts > fill_ts]
+        return max(subsequent) if subsequent else None
 
-    @property
-    def down_max_after_open(self) -> float | None:
-        return max(self.down_trades_all) if self.down_trades_all else None
+    def down_max_after_fill(self, buy_threshold: float) -> float | None:
+        """Max DOWN price after the first buy fill in minute 1 at or below buy_threshold."""
+        fill_ts = next(
+            (ts for ts, p in self.down_trades_m1 if p <= buy_threshold), None
+        )
+        if fill_ts is None:
+            return None
+        subsequent = [p for ts, p in self.down_trades_all if ts > fill_ts]
+        return max(subsequent) if subsequent else None
 
 
 async def fetch_sessions_for_asset(
@@ -105,9 +117,9 @@ async def _build_session(market: Market, clob: ClobClient) -> HistoricalSession 
             if price <= 0:
                 continue
             if market.start_ts <= ts <= window_end:
-                session.up_trades_all.append(price)
+                session.up_trades_all.append((ts, price))
                 if ts <= market.start_ts + 60:
-                    session.up_trades_m1.append(price)
+                    session.up_trades_m1.append((ts, price))
 
         for trade in down_trades:
             ts = int(trade.get("created_at", 0) or trade.get("timestamp", 0) or 0)
@@ -115,14 +127,14 @@ async def _build_session(market: Market, clob: ClobClient) -> HistoricalSession 
             if price <= 0:
                 continue
             if market.start_ts <= ts <= window_end:
-                session.down_trades_all.append(price)
+                session.down_trades_all.append((ts, price))
                 if ts <= market.start_ts + 60:
-                    session.down_trades_m1.append(price)
+                    session.down_trades_m1.append((ts, price))
 
         # Resolution: derive from market outcomePrices or final trade prices
         # At resolution UP = 1.0 or 0.0; DOWN = complementary
         if session.up_trades_all:
-            final_up = session.up_trades_all[-1]
+            final_up = session.up_trades_all[-1][1]
             session.up_resolution = 1.0 if final_up >= 0.9 else 0.0
             session.down_resolution = 1.0 - session.up_resolution
 
@@ -197,18 +209,18 @@ def load_from_price_files(
 
         for ts, up, dn in rows:
             if up is not None:
-                session.up_trades_all.append(up)
+                session.up_trades_all.append((ts, up))
                 if ts <= m1_cutoff:
-                    session.up_trades_m1.append(up)
+                    session.up_trades_m1.append((ts, up))
             if dn is not None:
-                session.down_trades_all.append(dn)
+                session.down_trades_all.append((ts, dn))
                 if ts <= m1_cutoff:
-                    session.down_trades_m1.append(dn)
+                    session.down_trades_m1.append((ts, dn))
 
         # Derive resolution from last price in window
         # Final price should be near 1.0 (win) or 0.0 (loss) after resolution
-        last_up = session.up_trades_all[-1] if session.up_trades_all else None
-        last_dn = session.down_trades_all[-1] if session.down_trades_all else None
+        last_up = session.up_trades_all[-1][1] if session.up_trades_all else None
+        last_dn = session.down_trades_all[-1][1] if session.down_trades_all else None
         if last_up is not None:
             session.up_resolution = 1.0 if last_up >= 0.9 else (0.0 if last_up <= 0.1 else None)
         if last_dn is not None:
