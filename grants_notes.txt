@@ -1,0 +1,3 @@
+python scripts/research.py --from-prices --capital 500 --position-size 0.05
+
+ython scripts/collect_prices.py --assets BTC ETH SOL DOGE XRP BNB HYPE

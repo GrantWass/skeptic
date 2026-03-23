@@ -1,0 +1,14 @@
+.env
+.creds.json
+data/sessions.db
+data/reports/
+data/prices/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
