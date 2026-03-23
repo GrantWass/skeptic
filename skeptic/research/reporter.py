@@ -57,8 +57,8 @@ def save_full_grid(asset: str, df: pd.DataFrame) -> str:
 def write_report(
     per_asset_best: dict[str, dict],
     asset_ranking: pd.DataFrame,
-    current_buy: float = config.BUY_PRICE,
-    current_sell: float = config.SELL_PRICE,
+    current_buy: float | None = config.BUY_PRICE,
+    current_sell: float | None = config.SELL_PRICE,
     data_source: str = "api",
     capital: float = 500.0,
     position_size_pct: float = config.POSITION_SIZE_PCT,
@@ -117,7 +117,9 @@ def write_report(
         "",
         "---",
         "",
-        f"## Asset Ranking at Current Thresholds (buy={current_buy:.2f}, sell={current_sell:.2f})",
+        f"## Asset Ranking at Current Thresholds "
+        f"(buy={'unset' if current_buy is None else f'{current_buy:.2f}'}, "
+        f"sell={'unset' if current_sell is None else f'{current_sell:.2f}'})",
         "",
     ]
 

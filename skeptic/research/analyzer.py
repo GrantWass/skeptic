@@ -162,8 +162,8 @@ def best_params(df: pd.DataFrame) -> dict:
 
 def rank_assets(
     asset_sessions: dict[str, list[HistoricalSession]],
-    buy: float = 0.36,
-    sell: float = 0.56,
+    buy: float,
+    sell: float,
 ) -> pd.DataFrame:
     """
     Compare assets at fixed (buy, sell) thresholds. Returns a DataFrame

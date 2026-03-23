@@ -58,6 +58,14 @@ async def main(args: argparse.Namespace) -> None:
         config.SELL_PRICE = args.sell
         console.print(f"[yellow]Override: SELL_PRICE = {config.SELL_PRICE}[/yellow]")
 
+    if config.BUY_PRICE is None or config.SELL_PRICE is None:
+        console.print(
+            "[red]BUY_PRICE and SELL_PRICE must be set before trading.\n"
+            "Run [bold]python scripts/research.py[/bold] to find optimal thresholds, "
+            "then set them in skeptic/config.py or pass --buy/--sell.[/red]"
+        )
+        sys.exit(1)
+
     mode = "[bold red]DRY RUN[/bold red]" if args.dry_run else "[bold green]LIVE[/bold green]"
     console.print(f"\n[bold]Skeptic Trading Bot — {mode}[/bold]")
     console.print(f"Buy @ {config.BUY_PRICE:.2f}  |  Sell @ {config.SELL_PRICE:.2f}  |  "
