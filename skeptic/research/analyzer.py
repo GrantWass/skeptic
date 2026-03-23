@@ -54,18 +54,19 @@ def simulate(
 
         n_fills += 1
 
-        # Prefer whichever side hit the buy threshold first / lower
         if up_fill and down_fill:
-            # Both hit — in practice strategy cancels one; model as "pick the one that pays"
-            # Conservative: use the one with better outcome
-            up_pays = (s.up_max_after_fill(buy) or 0) >= sell or (s.up_resolution or 0) >= 0.9
-            down_pays = (s.down_max_after_fill(buy) or 0) >= sell or (s.down_resolution or 0) >= 0.9
-            filled_outcome_wins = up_pays or down_pays
-            # Sell hit if either outcome would have sold
-            sell_hit = (
-                (s.up_max_after_fill(buy) or 0) >= sell or
-                (s.down_max_after_fill(buy) or 0) >= sell
-            )
+            # Both touched the threshold — only the first fill is kept; the other
+            # is immediately cancelled. Determine which side triggered first.
+            # UP+DOWN ≈ 1.0 in a binary market, so true ties are impossible, but we
+            # default to UP as a tie-breaker for the rare edge case.
+            up_ts = s.up_first_fill_ts(buy)
+            down_ts = s.down_first_fill_ts(buy)
+            if up_ts is not None and (down_ts is None or up_ts <= down_ts):
+                sell_hit = (s.up_max_after_fill(buy) or 0) >= sell
+                filled_outcome_wins = sell_hit or (s.up_resolution or 0) >= 0.9
+            else:
+                sell_hit = (s.down_max_after_fill(buy) or 0) >= sell
+                filled_outcome_wins = sell_hit or (s.down_resolution or 0) >= 0.9
         elif up_fill:
             sell_hit = (s.up_max_after_fill(buy) or 0) >= sell
             filled_outcome_wins = sell_hit or (s.up_resolution or 0) >= 0.9

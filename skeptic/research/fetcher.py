@@ -52,6 +52,14 @@ class HistoricalSession:
     def down_min_m1(self) -> float | None:
         return min(p for _, p in self.down_trades_m1) if self.down_trades_m1 else None
 
+    def up_first_fill_ts(self, buy_threshold: float) -> int | None:
+        """Timestamp of the first UP trade at or below buy_threshold in minute 1."""
+        return next((ts for ts, p in self.up_trades_m1 if p <= buy_threshold), None)
+
+    def down_first_fill_ts(self, buy_threshold: float) -> int | None:
+        """Timestamp of the first DOWN trade at or below buy_threshold in minute 1."""
+        return next((ts for ts, p in self.down_trades_m1 if p <= buy_threshold), None)
+
     def up_max_after_fill(self, buy_threshold: float) -> float | None:
         """Max UP price after the first buy fill in minute 1 at or below buy_threshold."""
         fill_ts = next(
