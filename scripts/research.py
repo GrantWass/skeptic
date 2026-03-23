@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pandas as pd
 from rich.console import Console
 from rich.table import Table
 
@@ -222,16 +223,22 @@ async def main(args: argparse.Namespace) -> None:
                 f"edge={best['edge_per_session']:.4f}  fill_rate={best['fill_rate']:.2%}"
             )
 
-    # Asset ranking at current thresholds
-    asset_ranking = analyzer.rank_assets(all_sessions, buy=config.BUY_PRICE, sell=config.SELL_PRICE)
-    reporter.save_asset_ranking(asset_ranking)
-
-    table = Table(title=f"Asset Ranking (buy={config.BUY_PRICE:.2f}, sell={config.SELL_PRICE:.2f})")
-    for col in asset_ranking.columns:
-        table.add_column(col)
-    for _, row in asset_ranking.iterrows():
-        table.add_row(*[str(v) for v in row])
-    console.print(table)
+    # Asset ranking at current thresholds (only shown if thresholds are configured)
+    if config.BUY_PRICE is not None and config.SELL_PRICE is not None:
+        asset_ranking = analyzer.rank_assets(all_sessions, buy=config.BUY_PRICE, sell=config.SELL_PRICE)
+        reporter.save_asset_ranking(asset_ranking)
+        table = Table(title=f"Asset Ranking (buy={config.BUY_PRICE:.2f}, sell={config.SELL_PRICE:.2f})")
+        for col in asset_ranking.columns:
+            table.add_column(col)
+        for _, row in asset_ranking.iterrows():
+            table.add_row(*[str(v) for v in row])
+        console.print(table)
+    else:
+        asset_ranking = pd.DataFrame()
+        console.print(
+            "[dim]Skipping asset ranking — BUY_PRICE/SELL_PRICE not set in config. "
+            "Set them from the optimal thresholds above and re-run to compare assets.[/dim]"
+        )
 
     data_source = "prices" if args.from_prices else "db" if args.from_db else "api"
     reporter.save_optimal_params(per_asset_best, {})

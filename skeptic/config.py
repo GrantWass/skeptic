@@ -18,8 +18,8 @@ CLOB_PASSPHRASE: str = os.getenv("CLOB_PASSPHRASE", "")
 CHAIN_ID: int = 137  # Polygon
 
 # --- Strategy parameters ---
-BUY_PRICE: float = 0.36       # limit buy price in USDC per share
-SELL_PRICE: float = 0.56      # limit sell price in USDC per share
+BUY_PRICE: float | None = None   # set from research output (scripts/research.py)
+SELL_PRICE: float | None = None  # set from research output (scripts/research.py)
 POSITION_SIZE_PCT: float = 0.05  # fraction of total capital to deploy per window
 MONITOR_SECS: int = 60        # seconds to monitor for fills before cancelling
 
