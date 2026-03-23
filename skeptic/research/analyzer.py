@@ -58,19 +58,19 @@ def simulate(
         if up_fill and down_fill:
             # Both hit — in practice strategy cancels one; model as "pick the one that pays"
             # Conservative: use the one with better outcome
-            up_pays = (s.up_max_after_open or 0) >= sell or (s.up_resolution or 0) >= 0.9
-            down_pays = (s.down_max_after_open or 0) >= sell or (s.down_resolution or 0) >= 0.9
+            up_pays = (s.up_max_after_fill(buy) or 0) >= sell or (s.up_resolution or 0) >= 0.9
+            down_pays = (s.down_max_after_fill(buy) or 0) >= sell or (s.down_resolution or 0) >= 0.9
             filled_outcome_wins = up_pays or down_pays
             # Sell hit if either outcome would have sold
             sell_hit = (
-                (s.up_max_after_open or 0) >= sell or
-                (s.down_max_after_open or 0) >= sell
+                (s.up_max_after_fill(buy) or 0) >= sell or
+                (s.down_max_after_fill(buy) or 0) >= sell
             )
         elif up_fill:
-            sell_hit = (s.up_max_after_open or 0) >= sell
+            sell_hit = (s.up_max_after_fill(buy) or 0) >= sell
             filled_outcome_wins = sell_hit or (s.up_resolution or 0) >= 0.9
         else:
-            sell_hit = (s.down_max_after_open or 0) >= sell
+            sell_hit = (s.down_max_after_fill(buy) or 0) >= sell
             filled_outcome_wins = sell_hit or (s.down_resolution or 0) >= 0.9
 
         if sell_hit:
