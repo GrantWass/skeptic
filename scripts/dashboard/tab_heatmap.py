@@ -30,15 +30,15 @@ def render(
     gc1, gc2, gc3, gc4 = st.columns(4)
     with gc1:
         hm_buy_min = st.number_input("Buy min", value=0.10, step=0.01, format="%.2f", key="hm_buy_min")
-        hm_buy_max = st.number_input("Buy max", value=0.55, step=0.01, format="%.2f", key="hm_buy_max")
+        hm_buy_max = st.number_input("Buy max", value=0.49, step=0.01, format="%.2f", key="hm_buy_max")
     with gc2:
         hm_sell_min = st.number_input("Sell min", value=0.45, step=0.01, format="%.2f", key="hm_sell_min")
-        hm_sell_max = st.number_input("Sell max", value=0.95, step=0.01, format="%.2f", key="hm_sell_max")
+        hm_sell_max = st.number_input("Sell max", value=0.96, step=0.01, format="%.2f", key="hm_sell_max")
     with gc3:
-        hm_step = st.selectbox("Step size", [0.01, 0.02, 0.05], index=0, key="hm_step")
+        hm_step = st.selectbox("Step size", [0.03, 0.04, 0.02, 0.01, 0.05], index=0, key="hm_step")
     with gc4:
         hm_fill_window = st.slider(
-            "Fill window (s)", 15, 120, 60, 15, key="hm_fill_window",
+            "Fill window (s)", 10, 90, 60, 10, key="hm_fill_window",
             help="Seconds to watch for a fill. Move slider to re-run and compare heatmaps.",
         )
 

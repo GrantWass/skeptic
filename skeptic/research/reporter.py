@@ -56,10 +56,33 @@ def save_full_grid(asset: str, df: pd.DataFrame) -> str:
     return path
 
 
+# ── Formatting helpers ────────────────────────────────────────────────────────
+
+def _pct(v) -> str:
+    return f"{v:.1%}" if isinstance(v, (int, float)) else "—"
+
+def _edge(v) -> str:
+    return f"{v:.4f}" if isinstance(v, (int, float)) else "—"
+
+def _price(v) -> str:
+    return f"{v:.2f}" if isinstance(v, (int, float)) else "—"
+
+def _ratio(v) -> str:
+    return f"{v:.3f}" if isinstance(v, (int, float)) else "—"
+
+def _shape_label(shape: str) -> str:
+    return {"plateau": "plateau", "moderate": "moderate", "spike": "spike"}.get(shape, "unknown")
+
+def _agree_label(agree: str) -> str:
+    return agree if agree else "—"
+
+
 def write_report(
     per_asset_best: dict[str, dict],
     asset_ranking: pd.DataFrame,
     per_asset_robustness: dict[str, dict] | None = None,
+    per_asset_best_nb: dict[str, dict] | None = None,
+    per_asset_best_30pct: dict[str, dict] | None = None,
     current_buy: float | None = config.BUY_PRICE,
     current_sell: float | None = config.SELL_PRICE,
     data_source: str = "api",
@@ -69,20 +92,58 @@ def write_report(
 ) -> str:
     """Write the markdown research report. Returns path."""
     _ensure_reports_dir()
-    # Delete any previous research reports so the preview doesn't serve a cached copy
     for _old in glob.glob(os.path.join(config.REPORTS_DIR, "research_report_*.md")):
         os.remove(_old)
     suffix = random.randint(10000, 99999)
     path = os.path.join(config.REPORTS_DIR, f"research_report_{suffix}.md")
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
+    _robustness = per_asset_robustness or {}
+    _best_nb    = per_asset_best_nb    or {}
+    _best_30    = per_asset_best_30pct or {}
+
+    SESSIONS_PER_DAY = 288  # 24h × 60min / 5min
+    position_usdc = capital * position_size_pct
+
+    # ── Recommendation: prefer moderate/plateau over raw edge ─────────────────
+    def _asset_priority(a):
+        shape = _robustness.get(a, {}).get("shape", "spike")
+        edge  = per_asset_best[a].get("edge_per_session", -999)
+        rank  = {"plateau": 2, "moderate": 1, "spike": 0, "unknown": 0}
+        return (rank.get(shape, 0), edge)
+
+    best_asset = max(per_asset_best, key=_asset_priority) if per_asset_best else None
+
+    # ── TL;DR ─────────────────────────────────────────────────────────────────
+    lines = [
+        "# Skeptic Research Report",
+        f"_Generated: {now}_",
+        "",
+        "## TL;DR",
+        "",
+        "| Asset | Sessions | Fill Rate | Edge/Session | Shape | Note |",
+        "|-------|----------|-----------|--------------|-------|------|",
+    ]
+
+    for asset, params in per_asset_best.items():
+        n_sess  = int(params.get("n_sessions", 0))
+        fr      = params.get("fill_rate", 0)
+        edge    = params.get("edge_per_session")
+        shape   = _robustness.get(asset, {}).get("shape", "unknown")
+        agree   = _best_nb.get(asset, {}).get("peak_vs_neighborhood", "")
+        lines.append(
+            f"| {asset} | {n_sess} | {_pct(fr)} | {_edge(edge)} | {_shape_label(shape)} |"
+        )
+
+    # ── Methodology ───────────────────────────────────────────────────────────
+    fw_desc = f"first {config.MONITOR_SECS} seconds"
     if data_source == "prices":
         methodology_lines = [
             "Per-second mid-prices were collected via `collect_prices.py` and stored as CSV files in `data/prices/`.",
             "Each 5-minute window's price series is used to simulate fills and exits.",
             "",
             "### Strategy simulation",
-            "- **Fill** occurs if the mid-price for either UP or DOWN ≤ `buy_threshold` within the first 60 seconds",
+            f"- **Fill** occurs if the mid-price for either UP or DOWN ≤ `buy_threshold` within the {fw_desc}",
             "- **Sell hit** occurs if the mid-price subsequently reaches ≥ `sell_threshold` before window end",
             "- Otherwise position goes to resolution (1.0 or 0.0)",
             "- **Edge per session** = fill_rate × expected_PnL_per_fill",
@@ -104,115 +165,165 @@ def write_report(
             "Trade data from the CLOB was used to reconstruct intra-session prices.",
             "",
             "> **Note:** Price reconstruction from trades is an approximation.",
-            "> The bot only sees limit order fills, not the full order book mid-price.",
             "> Results should be treated as directional signals, not precise predictions.",
             "",
             "### Strategy simulation",
-            "- **Fill** occurs if the minimum trade price for either UP or DOWN ≤ `buy_threshold` within minute 1",
+            f"- **Fill** occurs if the minimum trade price for either UP or DOWN ≤ `buy_threshold` within the {fw_desc}",
             "- **Sell hit** occurs if the max subsequent trade price ≥ `sell_threshold`",
             "- Otherwise position goes to resolution (1.0 or 0.0)",
             "- **Edge per session** = fill_rate × expected_PnL_per_fill",
         ]
 
-    lines = [
-        "# Skeptic Research Report",
-        f"_Generated: {now}_",
-        "",
-        "## Methodology",
-        "",
-        *methodology_lines,
-        "",
-        "---",
-        "",
-        f"## Asset Ranking at Current Thresholds "
-        f"(buy={'unset' if current_buy is None else f'{current_buy:.2f}'}, "
-        f"sell={'unset' if current_sell is None else f'{current_sell:.2f}'})",
-        "",
-    ]
-
-    if not asset_ranking.empty:
-        lines.append(asset_ranking.to_markdown(index=False))
-    else:
-        lines.append("_No data available._")
-
-    _robustness = per_asset_robustness or {}
-
     lines += [
         "",
         "---",
         "",
-        "## Optimal Thresholds per Asset",
+        "## Methodology",
         "",
-        "| Asset | Optimal Buy | Optimal Sell | Fill Window | Fill Rate | Sell Hit Rate | Edge/Session | Neighbors | Neighbor Mean Edge | Robustness Ratio | % Positive | Shape |",
-        "|-------|-------------|--------------|-------------|-----------|---------------|--------------|-----------|-------------------|-----------------|------------|-------|",
+        *methodology_lines,
     ]
 
-    SESSIONS_PER_DAY = 288  # 24h × 60min / 5min
-    position_usdc = capital * position_size_pct
+    # ── Asset Ranking (only when thresholds are set) ──────────────────────────
+    if current_buy is not None and current_sell is not None and not asset_ranking.empty:
+        lines += [
+            "",
+            "---",
+            "",
+            f"## Asset Ranking at Current Thresholds (buy={current_buy:.2f}, sell={current_sell:.2f})",
+            "",
+            asset_ranking.to_markdown(index=False),
+        ]
+
+    # ── Optimal Parameters ────────────────────────────────────────────────────
+    lines += [
+        "",
+        "---",
+        "",
+        "## Optimal Parameters per Asset",
+        "",
+        "> Parameters with the highest edge across the full grid.",
+        "> **Shape** measures whether the peak sits on a broad plateau or is a lone spike.",
+        "> **NB Ratio** = neighbor mean edge / peak edge. How much of the peak's edge survives in the surrounding grid points (±1 step in each direction).",
+        "> - 1.0 = neighbors match the peak exactly — pure plateau",
+        "> - 0.6 = neighbors average 60% of peak edge — reasonably flat",
+        "> - 0.0 = neighbors have zero edge — lone spike",
+        "> - negative = neighbors average negative edge — the peak is an isolated island surrounded by losing combinations, strong overfitting signal",
+        "> **Peak vs NB** compares the peak to the best surrounding region — diverge means the peak may be a lucky outlier.",
+        "",
+        "| Asset | Sessions | Buy | Sell | Fill Win | Fill Rate | Sell Hit% | Edge/Session | Shape | NB Ratio | Peak vs NB |",
+        "|-------|----------|-----|------|----------|-----------|-----------|--------------|-------|----------|------------|",
+    ]
 
     for asset, params in per_asset_best.items():
-        buy  = params.get("buy", "—")
-        sell = params.get("sell", "—")
-        fw   = f"{int(params['fill_window'])}s" if "fill_window" in params else "60s"
-        fr   = params.get("fill_rate", "—")
-        shr  = params.get("sell_hit_rate", "—")
-        edge = params.get("edge_per_session", "—")
-        rob     = _robustness.get(asset, {})
-        n_nb    = rob.get("n_neighbors", "—")
-        nb_mean = rob.get("neighbor_mean_edge", "—")
-        ratio   = rob.get("robustness_ratio", "—")
-        pct_pos = f"{rob['pct_positive']:.0%}" if rob.get("pct_positive") is not None else "—"
-        shape   = rob.get("shape", "—")
+        n_sess = int(params.get("n_sessions", 0))
+        buy    = params.get("buy")
+        sell   = params.get("sell")
+        fw     = f"{int(params['fill_window'])}s" if "fill_window" in params else "60s"
+        fr     = params.get("fill_rate")
+        shr    = params.get("sell_hit_rate")
+        edge   = params.get("edge_per_session")
+        rob    = _robustness.get(asset, {})
+        shape  = _shape_label(rob.get("shape", "unknown"))
+        ratio  = _ratio(rob.get("robustness_ratio"))
+        nb     = _best_nb.get(asset, {})
+        agree  = _agree_label(nb.get("peak_vs_neighborhood", "—"))
         lines.append(
-            f"| {asset} | {buy} | {sell} | {fw} | {fr} | {shr} | {edge} "
-            f"| {n_nb} | {nb_mean} | {ratio} | {pct_pos} | {shape} |"
+            f"| {asset} | {n_sess} | {_price(buy)} | {_price(sell)} | {fw} "
+            f"| {_pct(fr)} | {_pct(shr)} | {_edge(edge)} | {shape} | {ratio} | {agree} |"
         )
 
-    # --- Estimated profit section ---
-    # Position sizing is fractional (always X% of current capital), so the bot
-    # can never go negative — losses shrink the next bet rather than producing
-    # a cash deficit.  We therefore express returns as % growth of capital and
-    # compute the compounded capital after N sessions using:
-    #   capital_after_n = capital_0 × (1 + pct_return_per_session)^n
-    # where pct_return_per_session = (net_edge_per_share / buy_price) × position_size_pct
-    import math as _math
+    # ── Best Neighborhood ─────────────────────────────────────────────────────
+    lines += [
+        "",
+        "---",
+        "",
+        "## Best Neighborhood per Asset",
+        "",
+        "> The region whose *average* surrounding edge is highest — more trustworthy than the raw peak when they disagree.",
+        "> Use these parameters instead of the peak when **Peak vs NB** shows diverge.",
+        "",
+        "| Asset | NB Buy | NB Sell | NB Fill Win | NB Mean Edge | % NB Positive | Peak Edge | Peak vs NB |",
+        "|-------|--------|---------|-------------|--------------|---------------|-----------|------------|",
+    ]
+    for asset in per_asset_best:
+        nb = _best_nb.get(asset, {})
+        if not nb:
+            lines.append(f"| {asset} | — | — | — | — | — | — | — |")
+            continue
+        nb_fw  = f"{nb['fill_window']}s"      if nb.get("fill_window")       is not None else "—"
+        pct_p  = _pct(nb.get("pct_positive"))
+        agree  = _agree_label(nb.get("peak_vs_neighborhood", "—"))
+        lines.append(
+            f"| {asset} | {_price(nb.get('buy'))} | {_price(nb.get('sell'))} | {nb_fw} "
+            f"| {_edge(nb.get('neighborhood_mean_edge'))} | {pct_p} "
+            f"| {_edge(nb.get('peak_edge'))} | {agree} |"
+        )
+
+    # ── ≥30% Fill Rate Constrained ────────────────────────────────────────────
+    lines += [
+        "",
+        "---",
+        "",
+        "## Optimal Parameters at ≥30% Fill Rate",
+        "",
+        "> Only combinations where fill_rate ≥ 30% are eligible.",
+        "> Low fill rates can produce high edge from a small lucky sample.",
+        "> This table forces the strategy to trigger regularly.",
+        "",
+        "| Asset | Buy | Sell | Fill Win | Fill Rate | Sell Hit% | Edge/Session |",
+        "|-------|-----|------|----------|-----------|-----------|--------------|",
+    ]
+    for asset in per_asset_best:
+        p30 = _best_30.get(asset, {})
+        if not p30:
+            lines.append(f"| {asset} | — | — | — | — | — | _no combo meets 30% fill rate_ |")
+            continue
+        fw30 = f"{int(p30['fill_window'])}s" if "fill_window" in p30 else "60s"
+        lines.append(
+            f"| {asset} | {_price(p30.get('buy'))} | {_price(p30.get('sell'))} | {fw30} "
+            f"| {_pct(p30.get('fill_rate'))} | {_pct(p30.get('sell_hit_rate'))} "
+            f"| {_edge(p30.get('edge_per_session'))} |"
+        )
+
+    # ── Estimated Profit ──────────────────────────────────────────────────────
     lines += [
         "",
         "---",
         "",
         "## Estimated Profit",
         "",
-        f"_Assumptions: ${capital:,.0f} starting capital, {position_size_pct:.0%} fractional "
-        f"position size, {SESSIONS_PER_DAY} windows/day._",
+        f"_Assumptions: ${capital:,.0f} starting capital, {position_size_pct:.0%} per trade, {SESSIONS_PER_DAY} windows/day._",
+        f"_Spread cost: {spread_cost:.3f}/share/crossing. Polymarket charges 0% maker/taker fees._",
         "",
-        f"_Fees: Polymarket charges 0% maker/taker. Spread cost = {spread_cost:.3f}/share/crossing._",
+        "> **These numbers are theoretical upper bounds.** They assume the in-sample edge holds",
+        "> perfectly out-of-sample, every session runs, and execution matches simulation exactly.",
+        "> Treat them as a relative ranking between assets, not a cash forecast.",
+        "> Assets with shape=spike are especially likely to underperform these estimates.",
         "",
-        f"> **Fractional sizing**: each bet is always {position_size_pct:.0%} of current capital — "
-        "losses shrink subsequent bets so capital can never go negative.",
-        "",
-        "| Asset | Buy | Sell | $/Session (net) | $/Day | $/Week | $/Month |",
-        "|-------|-----|------|-----------------|-------|--------|---------|",
+        "| Asset | Buy | Sell | Shape | $/Session (net) | $/Day | $/Week | $/Month |",
+        "|-------|-----|------|-------|-----------------|-------|--------|---------|",
     ]
 
     for asset, params in per_asset_best.items():
-        buy = params.get("buy")
-        sell = params.get("sell")
-        edge = params.get("edge_per_session")
+        buy       = params.get("buy")
+        sell      = params.get("sell")
+        edge      = params.get("edge_per_session")
         fill_rate = params.get("fill_rate", 0)
-        sell_hit_rate = params.get("sell_hit_rate", 0)
+        shr       = params.get("sell_hit_rate", 0)
+        shape     = _shape_label(_robustness.get(asset, {}).get("shape", "unknown"))
         if buy and sell and edge is not None and buy > 0:
-            shares = position_usdc / buy
-            gross_per_session = edge * shares
-            spread_per_session = fill_rate * spread_cost * shares + fill_rate * sell_hit_rate * spread_cost * shares
-            net_per_session = gross_per_session - spread_per_session
+            shares  = position_usdc / buy
+            gross   = edge * shares
+            spread_ = fill_rate * spread_cost * shares + fill_rate * shr * spread_cost * shares
+            net     = gross - spread_
             lines.append(
-                f"| {asset} | {buy} | {sell} "
-                f"| ${net_per_session:+.4f} "
-                f"| ${net_per_session * SESSIONS_PER_DAY:+.2f} "
-                f"| ${net_per_session * SESSIONS_PER_DAY * 7:+.2f} "
-                f"| ${net_per_session * SESSIONS_PER_DAY * 30:+.2f} |"
+                f"| {asset} | {_price(buy)} | {_price(sell)} | {shape} "
+                f"| ${net:+.4f} | ${net * SESSIONS_PER_DAY:+.2f} "
+                f"| ${net * SESSIONS_PER_DAY * 7:+.2f} "
+                f"| ${net * SESSIONS_PER_DAY * 30:+.2f} |"
             )
 
+    # ── Recommendation ────────────────────────────────────────────────────────
     lines += [
         "",
         "---",
@@ -221,120 +332,115 @@ def write_report(
         "",
     ]
 
-    if per_asset_best:
-        # Best overall: highest edge across all assets
-        best_asset = max(per_asset_best, key=lambda a: per_asset_best[a].get("edge_per_session", -999))
-        bp = per_asset_best[best_asset]
-        buy = bp.get("buy", current_buy)
-        sell = bp.get("sell", current_sell)
-        edge = bp.get("edge_per_session", 0)
+    if best_asset:
+        bp        = per_asset_best[best_asset]
+        buy       = bp.get("buy", current_buy)
+        sell      = bp.get("sell", current_sell)
+        edge      = bp.get("edge_per_session", 0)
         fill_rate = bp.get("fill_rate", 0)
-        sell_hit_rate = bp.get("sell_hit_rate", 0)
-        if buy:
-            shares = position_usdc / buy
-            gross = edge * shares
-            spread_cost_session = fill_rate * spread_cost * shares + fill_rate * sell_hit_rate * spread_cost * shares
-            net_session = gross - spread_cost_session
-            net_day = net_session * SESSIONS_PER_DAY
-        else:
-            net_session = 0.0
-            net_day = 0.0
-        best_fw = int(bp["fill_window"]) if "fill_window" in bp else 60
-        rob = _robustness.get(best_asset, {})
-        rob_ratio  = rob.get("robustness_ratio")
-        rob_shape  = rob.get("shape", "unknown")
-        rob_pct    = rob.get("pct_positive")
-        rob_mean   = rob.get("neighbor_mean_edge")
+        shr       = bp.get("sell_hit_rate", 0)
+        best_fw   = int(bp["fill_window"]) if "fill_window" in bp else 60
+        rob       = _robustness.get(best_asset, {})
+        shape     = rob.get("shape", "unknown")
+        rob_ratio = rob.get("robustness_ratio")
+        rob_pct   = rob.get("pct_positive")
+        rob_mean  = rob.get("neighbor_mean_edge")
+        nb        = _best_nb.get(best_asset, {})
+        agree     = nb.get("peak_vs_neighborhood", "")
+
+        def _net(b, e, fr, s):
+            if not b or e is None:
+                return 0.0, 0.0
+            sh = position_usdc / b
+            sp = fr * spread_cost * sh + fr * s * spread_cost * sh
+            ns = e * sh - sp
+            return ns, ns * SESSIONS_PER_DAY
+
+        net_session, net_day = _net(buy, edge, fill_rate, shr)
+
         rob_line = (
-            f"`{rob_shape}` — ratio={rob_ratio}, neighbor mean edge={rob_mean}, "
-            f"{rob_pct:.0%} of neighbors positive"
+            f"{_shape_label(shape)} — ratio={_ratio(rob_ratio)}, "
+            f"neighbor mean edge={_edge(rob_mean)}, "
+            f"{_pct(rob_pct)} of neighbors positive"
             if rob_ratio is not None and rob_pct is not None
             else "_not available_"
         )
+
+        # Flags (no emojis)
+        flags = []
+        if shape == "spike":
+            flags.append("> Note: shape is spike — the peak has weak neighborhood support. See Best Neighborhood recommendation below.")
+        if best_fw < 30:
+            flags.append(f"> Note: fill window is {best_fw}s — very short; verify this isn't a noise artifact.")
+
         lines += [
-            f"**Best asset:** `{best_asset}`",
-            f"**Recommended buy threshold:** `{buy}`",
-            f"**Recommended sell threshold:** `{sell}`",
-            f"**Recommended fill window:** `{best_fw}s`",
-            f"**Expected edge per session:** `{edge}`",
-            f"**Est. $/session (net, linear):** `${net_session:+.4f}`",
-            f"**Est. $/day (net, linear):** `${net_day:+.2f}` at ${capital:,.0f} capital",
-            f"**Robustness (±0.04 buy/sell, ±10s window):** {rob_line}",
+            f"**Best asset:** {best_asset}",
             "",
-            f"To update config, set in `skeptic/config.py`:",
-            f"```python",
-            f"BUY_PRICE = {buy}",
-            f"SELL_PRICE = {bp.get('sell', current_sell)}",
-            f"MONITOR_SECS = {best_fw}",
-            f"```",
+            "### Option A — Peak Threshold (highest raw edge)",
+            "",
+            f"| | Value |",
+            f"|---|---|",
+            f"| Buy | {_price(buy)} |",
+            f"| Sell | {_price(sell)} |",
+            f"| Fill window | {best_fw}s |",
+            f"| Edge/session | {_edge(edge)} |",
+            f"| Fill rate | {_pct(fill_rate)} |",
+            f"| Sell hit rate | {_pct(shr)} |",
+            f"| Est. $/session (net) | ${net_session:+.4f} |",
+            f"| Est. $/day | ${net_day:+.2f} |",
+            f"| Robustness | {rob_line} |",
+            "",
         ]
+        if flags:
+            lines += flags
+            lines.append("")
+
+        lines += [
+            "```python",
+            f"# Option A — config.py",
+            f"BUY_PRICE    = {buy}",
+            f"SELL_PRICE   = {sell}",
+            f"MONITOR_SECS = {best_fw}",
+            "```",
+            "",
+        ]
+
+        # Option B — best neighborhood
+        if nb:
+            nb_buy  = nb.get("buy")
+            nb_sell = nb.get("sell")
+            nb_fw   = nb.get("fill_window", best_fw)
+            nb_edge = nb.get("neighborhood_mean_edge")
+            nb_pct  = nb.get("pct_positive")
+            nb_ns, nb_nd = _net(nb_buy, nb_edge, fill_rate, shr)
+            nb_agree = nb.get("peak_vs_neighborhood", "—")
+
+            lines += [
+                "### Option B — Best Neighborhood (most robust region)",
+                "",
+                "> Uses the center of the region with the highest average surrounding edge.",
+                "> Prefer this when shape=spike or peak vs NB=diverge.",
+                "",
+                f"| | Value |",
+                f"|---|---|",
+                f"| Buy | {_price(nb_buy)} |",
+                f"| Sell | {_price(nb_sell)} |",
+                f"| Fill window | {nb_fw}s |",
+                f"| NB mean edge | {_edge(nb_edge)} |",
+                f"| % NB positive | {_pct(nb_pct)} |",
+                f"| Est. $/session (net, approx) | ${nb_ns:+.4f} |",
+                f"| Est. $/day (approx) | ${nb_nd:+.2f} |",
+                f"| Peak vs NB | {nb_agree} |",
+                "",
+                "```python",
+                f"# Option B — config.py",
+                f"BUY_PRICE    = {nb_buy}",
+                f"SELL_PRICE   = {nb_sell}",
+                f"MONITOR_SECS = {nb_fw}",
+                "```",
+            ]
     else:
         lines.append("_Insufficient data to make a recommendation._")
-
-    # --- Compounding profit section ---
-    # Each session one of three things happens (conditional on a fill):
-    #   1. Sell hits        → gain (sell - buy) / buy  × position_size_pct  of capital
-    #   2. Resolution win   → gain (1.0  - buy) / buy  × position_size_pct  of capital
-    #   3. Resolution loss  → lose position_size_pct of capital entirely
-    # No fill → capital unchanged.
-    #
-    # Per-session growth multiplier:
-    #   m = (1 - fill_rate)
-    #     + fill_rate × [ p_sell × (1 + pct×(sell-buy)/buy)
-    #                   + p_res_win  × (1 + pct×(1-buy)/buy)
-    #                   + p_res_loss × (1 - pct) ]
-    #
-    # After N sessions: capital × m^N   (true geometric compounding).
-    # lines += [
-    #     "",
-    #     "---",
-    #     "",
-    #     "## Compounding Profit Estimate",
-    #     "",
-    #     f"_Assumes {position_size_pct:.0%} of current capital deployed each filled session. "
-    #     f"Capital can never go negative (fractional sizing). "
-    #     f"{SESSIONS_PER_DAY} windows/day._",
-    #     "",
-    #     "| Asset | Buy | Sell | Session mult. | Capital/Day | Capital/Week | Capital/Month | Capital/Year |",
-    #     "|-------|-----|------|--------------|-------------|--------------|---------------|--------------|",
-    # ]
-
-    # for asset, params in per_asset_best.items():
-    #     buy = params.get("buy")
-    #     sell = params.get("sell")
-    #     fill_rate = params.get("fill_rate", 0)
-    #     n_fills = params.get("n_fills") or 0
-    #     n_sell_hits = params.get("n_sell_hits") or 0
-    #     n_res_wins = params.get("n_res_wins") or 0
-    #     n_res_losses = params.get("n_res_losses") or 0
-
-    #     if not (buy and sell and n_fills > 0):
-    #         continue
-
-    #     p_sell = n_sell_hits / n_fills
-    #     p_res_win = n_res_wins / n_fills
-    #     p_res_loss = n_res_losses / n_fills
-
-    #     mult_sell     = 1 + position_size_pct * (sell - buy) / buy
-    #     mult_res_win  = 1 + position_size_pct * (1.0 - buy) / buy
-    #     mult_res_loss = 1 - position_size_pct
-
-    #     fill_weighted = p_sell * mult_sell + p_res_win * mult_res_win + p_res_loss * mult_res_loss
-    #     session_mult  = (1 - fill_rate) * 1.0 + fill_rate * fill_weighted
-
-    #     cap_day   = capital * session_mult ** SESSIONS_PER_DAY
-    #     cap_week  = capital * session_mult ** (SESSIONS_PER_DAY * 7)
-    #     cap_month = capital * session_mult ** (SESSIONS_PER_DAY * 30)
-    #     cap_year  = capital * session_mult ** (SESSIONS_PER_DAY * 365)
-
-    #     lines.append(
-    #         f"| {asset} | {buy} | {sell} "
-    #         f"| {session_mult:.8f} "
-    #         f"| ${cap_day:,.2f} "
-    #         f"| ${cap_week:,.2f} "
-    #         f"| ${cap_month:,.2f} "
-    #         f"| ${cap_year:,.2f} |"
-    #     )
 
     content = "\n".join(lines)
     with open(path, "w") as f:

@@ -144,7 +144,7 @@ def optimize_thresholds(
     sessions: list[HistoricalSession],
     buy_range: tuple[float, float] = (0.20, 0.49),
     sell_range: tuple[float, float] = (0.51, 0.90),
-    step: float = 0.01,
+    step: float = 0.03,
     fill_window: int = 60,
 ) -> pd.DataFrame:
     """
@@ -177,11 +177,11 @@ def optimize_thresholds(
 
 def optimize_thresholds_3d(
     sessions: list[HistoricalSession],
-    buy_range: tuple[float, float] = (0.10, 0.55),
-    sell_range: tuple[float, float] = (0.45, 0.95),
-    step: float = 0.01,
-    fill_window_range: tuple[int, int] = (15, 120),
-    fill_window_step: int = 15,
+    buy_range: tuple[float, float] = (0.10, 0.50),
+    sell_range: tuple[float, float] = (0.45, 0.96),
+    step: float = 0.03,
+    fill_window_range: tuple[int, int] = (10, 90),
+    fill_window_step: int = 10,
 ) -> pd.DataFrame:
     """
     3D grid search over buy × sell × fill_window.
@@ -205,11 +205,21 @@ def best_params(df: pd.DataFrame) -> dict:
     return row.to_dict()
 
 
+def best_params_min_fill_rate(df: pd.DataFrame, min_fill_rate: float) -> dict:
+    """Return the best params row where fill_rate >= min_fill_rate."""
+    if df.empty:
+        return {}
+    filtered = df[df["fill_rate"] >= min_fill_rate - 1e-9]
+    if filtered.empty:
+        return {}
+    return filtered.iloc[0].to_dict()
+
+
 def neighborhood_robustness(
     df: pd.DataFrame,
     best: dict,
-    buy_radius: float = 0.04,
-    sell_radius: float = 0.04,
+    buy_radius: float = 0.03,
+    sell_radius: float = 0.03,
     fw_radius: int = 10,
 ) -> dict:
     """
@@ -271,6 +281,95 @@ def neighborhood_robustness(
         "robustness_ratio":   round(ratio, 3) if ratio is not None else None,
         "pct_positive":       round(pct_pos, 3),
         "shape":              shape,
+    }
+
+
+def best_neighborhood_params(
+    df: pd.DataFrame,
+    buy_radius: float = 0.03,
+    sell_radius: float = 0.03,
+    fw_radius: int = 10,
+) -> dict:
+    """
+    Scan every point in the grid and find the one whose *neighborhood average*
+    edge is highest — not just the single peak point.
+
+    This is the most robust parameter region: even if the exact center isn't the
+    global peak, the surrounding area consistently performs well.
+
+    When this differs significantly from best_params(), the peak is likely a
+    spike (overfit). When they agree, the peak sits on a genuine plateau.
+
+    Returns the same fields as neighborhood_robustness(), plus:
+        buy, sell, fill_window  — center of the best neighborhood
+        peak_buy, peak_sell     — best individual point for comparison
+        peak_vs_neighborhood    — "agree" / "nearby" / "diverge"
+    """
+    if df.empty:
+        return {}
+
+    has_fw = "fill_window" in df.columns
+
+    def _neighborhood_mean(row) -> float:
+        mask = (
+            ((df["buy"]  - row["buy"] ).abs() <= buy_radius  + 1e-9) &
+            ((df["sell"] - row["sell"]).abs() <= sell_radius + 1e-9)
+        )
+        if has_fw:
+            mask &= (df["fill_window"] - row["fill_window"]).abs() <= fw_radius + 1e-9
+        return df.loc[mask, "edge_per_session"].mean()
+
+    nb_means = df.apply(_neighborhood_mean, axis=1)
+    best_nb_idx  = nb_means.idxmax()
+    best_nb_row  = df.loc[best_nb_idx]
+    best_nb_mean = nb_means[best_nb_idx]
+
+    # Peak (best individual point) for comparison
+    peak_row  = df.iloc[0]  # df is pre-sorted descending by edge_per_session
+    peak_buy  = float(peak_row["buy"])
+    peak_sell = float(peak_row["sell"])
+    peak_fw   = int(peak_row["fill_window"]) if has_fw else None
+
+    nb_buy  = float(best_nb_row["buy"])
+    nb_sell = float(best_nb_row["sell"])
+    nb_fw   = int(best_nb_row["fill_window"]) if has_fw else None
+
+    buy_diff  = abs(nb_buy  - peak_buy)
+    sell_diff = abs(nb_sell - peak_sell)
+    fw_diff   = abs(nb_fw   - peak_fw) if (peak_fw is not None and nb_fw is not None) else 0
+
+    if buy_diff <= buy_radius and sell_diff <= sell_radius and fw_diff <= fw_radius:
+        agreement = "agree"
+    elif buy_diff <= buy_radius * 2 and sell_diff <= sell_radius * 2:
+        agreement = "nearby"
+    else:
+        agreement = "diverge"
+
+    # Neighborhood stats at the best-neighborhood center
+    mask = (
+        ((df["buy"]  - nb_buy ).abs() <= buy_radius  + 1e-9) &
+        ((df["sell"] - nb_sell).abs() <= sell_radius + 1e-9)
+    )
+    if has_fw and nb_fw is not None:
+        mask &= (df["fill_window"] - nb_fw).abs() <= fw_radius + 1e-9
+    exact = (df["buy"] == nb_buy) & (df["sell"] == nb_sell)
+    if has_fw and nb_fw is not None:
+        exact &= df["fill_window"] == nb_fw
+    neighbors = df[mask & ~exact]
+    pct_pos = float((neighbors["edge_per_session"] > 0).mean()) if not neighbors.empty else 0.0
+
+    return {
+        "buy":                  nb_buy,
+        "sell":                 nb_sell,
+        "fill_window":          nb_fw,
+        "neighborhood_mean_edge": round(float(best_nb_mean), 6),
+        "n_neighbors":          int(mask.sum()) - 1,
+        "pct_positive":         round(pct_pos, 3),
+        "peak_buy":             peak_buy,
+        "peak_sell":            peak_sell,
+        "peak_fill_window":     peak_fw,
+        "peak_edge":            round(float(peak_row["edge_per_session"]), 6),
+        "peak_vs_neighborhood": agreement,
     }
 
 

@@ -1,16 +1,16 @@
 python scripts/research.py --from-prices --capital 500 --position-size 0.05
-python scripts/research.py --from-prices --fill-window-min 10 --fill-window-max 120 --fill-window-step 10
-
-python scripts/collect_prices.py --assets BTC ETH SOL DOGE XRP BNB HYPE
+python scripts/research.py --from-prices --fill-window-min 10 --fill-window-max 60 --fill-window-step 10
 
 streamlit run scripts/dashboard/__main__.py
 
 python scripts/filter_incomplete_windows.py
 
-bash scripts/collect_loop.sh
-
-
 tmux new -s skeptic
 caffeinate -s bash scripts/collect_loop.sh
 # Ctrl+B, D to detach
 Reattach later with tmux attach -t skeptic.
+tmux kill-session -t skeptic
+
+
+python scripts/bootstrap.py --from-prices --fill-window-min 10 --fill-window-max 120 --step 0.02
+
