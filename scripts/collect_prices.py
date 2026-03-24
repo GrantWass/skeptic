@@ -65,13 +65,21 @@ async def collect_window(
     window_ts: int,
     interval: float,
     csv_path: Path,
+    flush_interval: float = 15.0,
 ) -> None:
-    """Log prices every `interval` seconds for the duration of a 5-minute window."""
+    """Log prices every `interval` seconds for the duration of a 5-minute window.
+
+    Rows are buffered in memory and flushed to disk every `flush_interval` seconds
+    (default 15s) to reduce I/O, rather than writing every row immediately.
+    """
     window_end = window_ts + config.WINDOW_SECS
     rows_written = 0
 
     last_log = time.time()
+    last_flush = time.time()
     log_interval = 15  # seconds
+
+    pending: list[list] = []
 
     with open(csv_path, "a", newline="") as f:
         writer = csv.writer(f)
@@ -87,7 +95,7 @@ async def collect_window(
                 down_price = market_ws.price_cache.get(market.down_token.token_id)
 
                 if up_price is not None or down_price is not None:
-                    writer.writerow([
+                    pending.append([
                         ts,
                         window_ts,
                         market.asset,
@@ -95,6 +103,13 @@ async def collect_window(
                         f"{down_price:.4f}" if down_price is not None else "",
                     ])
                     rows_written += 1
+
+            # Flush to disk every flush_interval seconds
+            if now - last_flush >= flush_interval and pending:
+                writer.writerows(pending)
+                f.flush()
+                pending.clear()
+                last_flush = now
 
             # Status log every 15 seconds
             if now - last_log >= log_interval:
@@ -116,7 +131,10 @@ async def collect_window(
             # Sleep to the next exact second boundary
             await asyncio.sleep(interval - (time.time() % interval))
 
-        f.flush()
+        # Final flush for any remaining rows
+        if pending:
+            writer.writerows(pending)
+            f.flush()
 
     return rows_written
 

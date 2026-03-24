@@ -52,17 +52,27 @@ def parse_args() -> argparse.Namespace:
                    help="Analyze session snapshots from sessions.db")
     p.add_argument("--assets", nargs="+", default=config.ASSETS, help="Assets to research")
     p.add_argument("--limit", type=int, default=200, help="Historical markets to fetch per asset (API mode)")
-    p.add_argument("--buy-min", type=float, default=0.20)
-    p.add_argument("--buy-max", type=float, default=0.49)
-    p.add_argument("--sell-min", type=float, default=0.51)
-    p.add_argument("--sell-max", type=float, default=0.90)
+    p.add_argument("--buy-min", type=float, default=0.10)
+    p.add_argument("--buy-max", type=float, default=0.50)
+    p.add_argument("--sell-min", type=float, default=0.45)
+    p.add_argument("--sell-max", type=float, default=0.95)
     p.add_argument("--step", type=float, default=0.01)
     p.add_argument("--capital", type=float, default=500.0, help="Starting capital in USDC for profit estimates")
     p.add_argument("--position-size", type=float, default=config.POSITION_SIZE_PCT,
                    help="Fraction of capital per trade (default: %(default)s)")
+    p.add_argument("--min-points", type=int, default=280,
+                   help="Minimum data points for a window to be included (default: 280)")
     p.add_argument("--spread-cost", type=float, default=0.002,
                    help="Estimated spread cost per share per crossing (default: 0.002). "
                         "Polymarket charges 0%% maker/taker fees; spread is the only cost.")
+    p.add_argument("--fill-window", type=int, default=60,
+                   help="Single fill window in seconds (default: 60). Ignored if --fill-window-min/max set.")
+    p.add_argument("--fill-window-min", type=int, default=None,
+                   help="Min fill window for 3D grid search (e.g. 15).")
+    p.add_argument("--fill-window-max", type=int, default=None,
+                   help="Max fill window for 3D grid search (e.g. 120).")
+    p.add_argument("--fill-window-step", type=int, default=15,
+                   help="Step size for fill window sweep (default: 15).")
     return p.parse_args()
 
 
@@ -155,7 +165,7 @@ async def main(args: argparse.Namespace) -> None:
 
     if args.from_prices:
         console.print(f"Mode: [green]Price CSV analysis[/green] (data/prices/)")
-        all_sessions = fetcher.load_from_price_files(args.assets)
+        all_sessions = fetcher.load_from_price_files(args.assets, min_points=args.min_points)
         total = sum(len(s) for s in all_sessions.values())
         console.print(f"Loaded {total} sessions from price CSVs\n")
 
@@ -202,30 +212,55 @@ async def main(args: argparse.Namespace) -> None:
                 f"Consider running paper mode first to accumulate more data.[/yellow]\n"
             )
 
+    # Determine whether to do a 3D sweep or a single fill-window search
+    _fw_min = args.fill_window_min
+    _fw_max = args.fill_window_max
+    _do_3d  = _fw_min is not None and _fw_max is not None and _fw_max > _fw_min
+
     # Grid search per asset
     per_asset_best: dict[str, dict] = {}
+    per_asset_robustness: dict[str, dict] = {}
     for asset, sessions in all_sessions.items():
         if not sessions:
             continue
-        console.print(f"[dim]Optimizing thresholds for {asset} ({len(sessions)} sessions)…[/dim]")
-        df = analyzer.optimize_thresholds(
-            sessions,
-            buy_range=(args.buy_min, args.buy_max),
-            sell_range=(args.sell_min, args.sell_max),
-            step=args.step,
-        )
+        if _do_3d:
+            console.print(
+                f"[dim]3D grid search for {asset} ({len(sessions)} sessions, "
+                f"fill window {_fw_min}–{_fw_max}s step {args.fill_window_step}s)…[/dim]"
+            )
+            df = analyzer.optimize_thresholds_3d(
+                sessions,
+                buy_range=(args.buy_min, args.buy_max),
+                sell_range=(args.sell_min, args.sell_max),
+                step=args.step,
+                fill_window_range=(_fw_min, _fw_max),
+                fill_window_step=args.fill_window_step,
+            )
+        else:
+            console.print(f"[dim]Optimizing thresholds for {asset} ({len(sessions)} sessions)…[/dim]")
+            df = analyzer.optimize_thresholds(
+                sessions,
+                buy_range=(args.buy_min, args.buy_max),
+                sell_range=(args.sell_min, args.sell_max),
+                step=args.step,
+                fill_window=args.fill_window,
+            )
         reporter.save_full_grid(asset, df)
         best = analyzer.best_params(df)
+        robustness = analyzer.neighborhood_robustness(df, best)
         per_asset_best[asset] = best
+        per_asset_robustness[asset] = robustness
         if best:
+            fw_str = f"  fill_window={int(best['fill_window'])}s" if "fill_window" in best else ""
+            shape_str = f"  [{robustness.get('shape', '?')}  ratio={robustness.get('robustness_ratio')}]" if robustness else ""
             console.print(
-                f"  {asset}: best buy={best['buy']:.2f}  sell={best['sell']:.2f}  "
-                f"edge={best['edge_per_session']:.4f}  fill_rate={best['fill_rate']:.2%}"
+                f"  {asset}: best buy={best['buy']:.2f}  sell={best['sell']:.2f}{fw_str}  "
+                f"edge={best['edge_per_session']:.4f}  fill_rate={best['fill_rate']:.2%}{shape_str}"
             )
 
     # Asset ranking at current thresholds (only shown if thresholds are configured)
     if config.BUY_PRICE is not None and config.SELL_PRICE is not None:
-        asset_ranking = analyzer.rank_assets(all_sessions, buy=config.BUY_PRICE, sell=config.SELL_PRICE)
+        asset_ranking = analyzer.rank_assets(all_sessions, buy=config.BUY_PRICE, sell=config.SELL_PRICE, fill_window=args.fill_window)
         reporter.save_asset_ranking(asset_ranking)
         table = Table(title=f"Asset Ranking (buy={config.BUY_PRICE:.2f}, sell={config.SELL_PRICE:.2f})")
         for col in asset_ranking.columns:
@@ -244,6 +279,7 @@ async def main(args: argparse.Namespace) -> None:
     reporter.save_optimal_params(per_asset_best, {})
     report_path = reporter.write_report(
         per_asset_best, asset_ranking,
+        per_asset_robustness=per_asset_robustness,
         data_source=data_source,
         capital=args.capital,
         position_size_pct=args.position_size,
