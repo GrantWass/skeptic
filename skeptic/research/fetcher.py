@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import httpx
 from py_clob_client.client import ClobClient
 
+from skeptic import config
 from skeptic.clients import gamma as gamma_client
 from skeptic.clients import clob as clob_client
 from skeptic.models.market import Market
@@ -126,7 +127,7 @@ async def _build_session(market: Market, clob: ClobClient) -> HistoricalSession 
                 continue
             if market.start_ts <= ts <= window_end:
                 session.up_trades_all.append((ts, price))
-                if ts <= market.start_ts + 60:
+                if ts <= market.start_ts + config.MONITOR_SECS:
                     session.up_trades_m1.append((ts, price))
 
         for trade in down_trades:
@@ -136,7 +137,7 @@ async def _build_session(market: Market, clob: ClobClient) -> HistoricalSession 
                 continue
             if market.start_ts <= ts <= window_end:
                 session.down_trades_all.append((ts, price))
-                if ts <= market.start_ts + 60:
+                if ts <= market.start_ts + config.MONITOR_SECS:
                     session.down_trades_m1.append((ts, price))
 
         # Resolution: derive from market outcomePrices or final trade prices
@@ -156,6 +157,7 @@ async def _build_session(market: Market, clob: ClobClient) -> HistoricalSession 
 def load_from_price_files(
     assets: list[str],
     prices_dir: str = "data/prices",
+    min_points: int = 280,
 ) -> dict[str, list[HistoricalSession]]:
     """
     Build HistoricalSession objects from the per-second price CSV files
@@ -204,7 +206,7 @@ def load_from_price_files(
             continue
         rows.sort(key=lambda r: r[0])  # sort by timestamp
 
-        m1_cutoff = window_ts + 60   # first 60 seconds
+        m1_cutoff = window_ts + config.MONITOR_SECS
         window_end = window_ts + 300
 
         session = HistoricalSession(
@@ -234,6 +236,9 @@ def load_from_price_files(
         if last_dn is not None:
             session.down_resolution = 1.0 if last_dn >= 0.9 else (0.0 if last_dn <= 0.1 else None)
 
+        if min_points > 0 and len(session.up_trades_all) < min_points:
+            log.debug("Skipping incomplete window %s/%s (%d points)", asset, window_ts, len(session.up_trades_all))
+            continue
         result[asset].append(session)
 
     for asset in assets:

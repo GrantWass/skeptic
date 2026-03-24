@@ -34,10 +34,27 @@ class ThresholdResult:
     edge_per_session: float # expected PnL per session
 
 
+def _fill_trades(s: HistoricalSession, fill_window: int) -> tuple[list, list]:
+    """Return (up_m1, dn_m1) trades filtered to the fill window."""
+    cutoff = s.window_start_ts + fill_window
+    return (
+        [(ts, p) for ts, p in s.up_trades_all if ts <= cutoff],
+        [(ts, p) for ts, p in s.down_trades_all if ts <= cutoff],
+    )
+
+
+def _max_after(trades_all: list, fill_ts: int | None) -> float | None:
+    if fill_ts is None:
+        return None
+    vals = [p for ts, p in trades_all if ts > fill_ts]
+    return max(vals) if vals else None
+
+
 def simulate(
     sessions: list[HistoricalSession],
     buy: float,
     sell: float,
+    fill_window: int = 60,
 ) -> ThresholdResult:
     n_fills = 0
     n_sell_hits = 0
@@ -45,9 +62,12 @@ def simulate(
     n_res_losses = 0
 
     for s in sessions:
-        # Check if either UP or DOWN touched the buy threshold in minute 1
-        up_fill = s.up_min_m1 is not None and s.up_min_m1 <= buy
-        down_fill = s.down_min_m1 is not None and s.down_min_m1 <= buy
+        up_m1, dn_m1 = _fill_trades(s, fill_window)
+
+        up_min  = min((p for _, p in up_m1), default=None)
+        dn_min  = min((p for _, p in dn_m1), default=None)
+        up_fill = up_min is not None and up_min <= buy
+        down_fill = dn_min is not None and dn_min <= buy
 
         if not up_fill and not down_fill:
             continue
@@ -59,19 +79,21 @@ def simulate(
             # is immediately cancelled. Determine which side triggered first.
             # UP+DOWN ≈ 1.0 in a binary market, so true ties are impossible, but we
             # default to UP as a tie-breaker for the rare edge case.
-            up_ts = s.up_first_fill_ts(buy)
-            down_ts = s.down_first_fill_ts(buy)
+            up_ts   = next((ts for ts, p in up_m1 if p <= buy), None)
+            down_ts = next((ts for ts, p in dn_m1 if p <= buy), None)
             if up_ts is not None and (down_ts is None or up_ts <= down_ts):
-                sell_hit = (s.up_max_after_fill(buy) or 0) >= sell
+                sell_hit = (_max_after(s.up_trades_all, up_ts) or 0) >= sell
                 filled_outcome_wins = sell_hit or (s.up_resolution or 0) >= 0.9
             else:
-                sell_hit = (s.down_max_after_fill(buy) or 0) >= sell
+                sell_hit = (_max_after(s.down_trades_all, down_ts) or 0) >= sell
                 filled_outcome_wins = sell_hit or (s.down_resolution or 0) >= 0.9
         elif up_fill:
-            sell_hit = (s.up_max_after_fill(buy) or 0) >= sell
+            up_ts   = next((ts for ts, p in up_m1 if p <= buy), None)
+            sell_hit = (_max_after(s.up_trades_all, up_ts) or 0) >= sell
             filled_outcome_wins = sell_hit or (s.up_resolution or 0) >= 0.9
         else:
-            sell_hit = (s.down_max_after_fill(buy) or 0) >= sell
+            dn_ts   = next((ts for ts, p in dn_m1 if p <= buy), None)
+            sell_hit = (_max_after(s.down_trades_all, dn_ts) or 0) >= sell
             filled_outcome_wins = sell_hit or (s.down_resolution or 0) >= 0.9
 
         if sell_hit:
@@ -123,9 +145,10 @@ def optimize_thresholds(
     buy_range: tuple[float, float] = (0.20, 0.49),
     sell_range: tuple[float, float] = (0.51, 0.90),
     step: float = 0.01,
+    fill_window: int = 60,
 ) -> pd.DataFrame:
     """
-    Grid search over (buy, sell) threshold pairs.
+    Grid search over (buy, sell) threshold pairs at a fixed fill window.
     Returns a DataFrame sorted by edge_per_session descending.
     """
     buys = np.arange(buy_range[0], buy_range[1] + step, step).round(2)
@@ -134,7 +157,7 @@ def optimize_thresholds(
     rows = []
     for buy in buys:
         for sell in sells:
-            r = simulate(sessions, float(buy), float(sell))
+            r = simulate(sessions, float(buy), float(sell), fill_window=fill_window)
             rows.append({
                 "buy": r.buy,
                 "sell": r.sell,
@@ -152,18 +175,110 @@ def optimize_thresholds(
     return df.sort_values("edge_per_session", ascending=False).reset_index(drop=True)
 
 
+def optimize_thresholds_3d(
+    sessions: list[HistoricalSession],
+    buy_range: tuple[float, float] = (0.10, 0.55),
+    sell_range: tuple[float, float] = (0.45, 0.95),
+    step: float = 0.01,
+    fill_window_range: tuple[int, int] = (15, 120),
+    fill_window_step: int = 15,
+) -> pd.DataFrame:
+    """
+    3D grid search over buy × sell × fill_window.
+    Returns a DataFrame with a fill_window column, sorted by edge_per_session descending.
+    """
+    fill_windows = list(range(fill_window_range[0], fill_window_range[1] + fill_window_step, fill_window_step))
+    slices = []
+    for fw in fill_windows:
+        df = optimize_thresholds(sessions, buy_range, sell_range, step, fill_window=fw)
+        df.insert(2, "fill_window", fw)
+        slices.append(df)
+    combined = pd.concat(slices, ignore_index=True)
+    return combined.sort_values("edge_per_session", ascending=False).reset_index(drop=True)
+
+
 def best_params(df: pd.DataFrame) -> dict:
-    """Return the best (buy, sell) pair from an optimize_thresholds result."""
+    """Return the best row from an optimize_thresholds or optimize_thresholds_3d result."""
     if df.empty:
         return {}
     row = df.iloc[0]
     return row.to_dict()
 
 
+def neighborhood_robustness(
+    df: pd.DataFrame,
+    best: dict,
+    buy_radius: float = 0.04,
+    sell_radius: float = 0.04,
+    fw_radius: int = 10,
+) -> dict:
+    """
+    Measures how robust the best parameter set is by evaluating its immediate
+    neighborhood in (buy, sell[, fill_window]) space.
+
+    A flat plateau around the best point → low overfitting risk.
+    A lone spike → likely overfit to the data.
+
+    Returns:
+        n_neighbors       — number of grid points within the radius
+        neighbor_mean_edge — mean edge_per_session of those neighbors
+        robustness_ratio  — neighbor_mean / best_edge  (1.0 = perfect plateau)
+        pct_positive      — fraction of neighbors with edge > 0
+        shape             — "plateau" / "moderate" / "spike" label
+    """
+    if df.empty or not best:
+        return {}
+
+    best_buy  = best["buy"]
+    best_sell = best["sell"]
+    best_edge = best.get("edge_per_session", 0)
+    best_fw   = best.get("fill_window")
+
+    mask = (
+        ((df["buy"]  - best_buy ).abs() <= buy_radius  + 1e-9) &
+        ((df["sell"] - best_sell).abs() <= sell_radius + 1e-9)
+    )
+    if "fill_window" in df.columns and best_fw is not None:
+        mask &= (df["fill_window"] - best_fw).abs() <= fw_radius + 1e-9
+
+    # exclude the best point itself
+    exact = (df["buy"] == best_buy) & (df["sell"] == best_sell)
+    if "fill_window" in df.columns and best_fw is not None:
+        exact &= df["fill_window"] == best_fw
+
+    neighbors = df[mask & ~exact]
+
+    if neighbors.empty:
+        return {"n_neighbors": 0, "neighbor_mean_edge": None,
+                "robustness_ratio": None, "pct_positive": None, "shape": "unknown"}
+
+    mean_edge = neighbors["edge_per_session"].mean()
+    pct_pos   = float((neighbors["edge_per_session"] > 0).mean())
+    ratio     = (mean_edge / best_edge) if best_edge and best_edge != 0 else None
+
+    if ratio is None:
+        shape = "unknown"
+    elif ratio >= 0.70:
+        shape = "plateau"
+    elif ratio >= 0.30:
+        shape = "moderate"
+    else:
+        shape = "spike"
+
+    return {
+        "n_neighbors":        len(neighbors),
+        "neighbor_mean_edge": round(mean_edge, 6),
+        "robustness_ratio":   round(ratio, 3) if ratio is not None else None,
+        "pct_positive":       round(pct_pos, 3),
+        "shape":              shape,
+    }
+
+
 def rank_assets(
     asset_sessions: dict[str, list[HistoricalSession]],
     buy: float,
     sell: float,
+    fill_window: int = 60,
 ) -> pd.DataFrame:
     """
     Compare assets at fixed (buy, sell) thresholds. Returns a DataFrame
@@ -173,7 +288,7 @@ def rank_assets(
     for asset, sessions in asset_sessions.items():
         if not sessions:
             continue
-        r = simulate(sessions, buy, sell)
+        r = simulate(sessions, buy, sell, fill_window=fill_window)
         rows.append({
             "asset": asset,
             "n_sessions": r.n_sessions,

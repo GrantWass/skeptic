@@ -85,7 +85,7 @@ class UserChannel:
         backoff = 1.0
         while self._running:
             try:
-                async with websockets.connect(config.WS_USER_URL, ping_interval=None, open_timeout=15) as ws:
+                async with websockets.connect(config.WS_USER_URL, ping_interval=20, ping_timeout=10, open_timeout=15) as ws:
                     self._ws = ws
                     backoff = 1.0
                     # Authenticate
@@ -197,7 +197,7 @@ class MarketChannel:
         backoff = 1.0
         while self._running:
             try:
-                async with websockets.connect(config.WS_MARKET_URL, ping_interval=None, open_timeout=15) as ws:
+                async with websockets.connect(config.WS_MARKET_URL, ping_interval=20, ping_timeout=10, open_timeout=15) as ws:
                     self._ws = ws
                     backoff = 1.0
                     # Re-subscribe to all tracked tokens
