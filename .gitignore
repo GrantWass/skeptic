@@ -3,6 +3,7 @@
 data/sessions.db
 data/reports/
 data/prices/
+data/collect_loop.log
 __pycache__/
 *.pyc
 *.pyo
