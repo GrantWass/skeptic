@@ -18,6 +18,9 @@ MAX_RESTARTS=100   # safety cap — stops after 100 crashes (implies a hard bug,
 
 mkdir -p "$ROOT_DIR/data"
 
+# Reset log file on each run
+> "$LOG_FILE"
+
 # Trap Ctrl+C and SIGTERM so the loop exits cleanly
 _stop=0
 trap '_stop=1' INT TERM
