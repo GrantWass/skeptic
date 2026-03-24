@@ -195,6 +195,7 @@ def make_window_chart(
     sell: float,
     outcome: str,
     profit: float,
+    fill_window: int = 60,
 ) -> go.Figure:
     """Build a compact time-series chart for a single 5-minute window."""
     fig = go.Figure()
@@ -226,10 +227,10 @@ def make_window_chart(
         annotation_text=f"sell {sell:.2f}", annotation_position="top right",
         annotation_font_size=9,
     )
-    fig.add_vrect(x0=0, x1=60, fillcolor="rgba(255,255,255,0.06)", line_width=0)
+    fig.add_vrect(x0=0, x1=fill_window, fillcolor="rgba(255,255,255,0.06)", line_width=0)
     fig.add_vline(
-        x=60, line_dash="dot", line_color="black", line_width=1,
-        annotation_text="1m", annotation_position="top",
+        x=fill_window, line_dash="dot", line_color="black", line_width=1,
+        annotation_text=f"{fill_window}s", annotation_position="top",
         annotation_font_size=8,
     )
 
