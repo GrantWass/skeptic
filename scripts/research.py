@@ -53,10 +53,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--assets", nargs="+", default=config.ASSETS, help="Assets to research")
     p.add_argument("--limit", type=int, default=200, help="Historical markets to fetch per asset (API mode)")
     p.add_argument("--buy-min", type=float, default=0.10)
-    p.add_argument("--buy-max", type=float, default=0.50)
+    p.add_argument("--buy-max", type=float, default=0.49)
     p.add_argument("--sell-min", type=float, default=0.45)
-    p.add_argument("--sell-max", type=float, default=0.95)
-    p.add_argument("--step", type=float, default=0.01)
+    p.add_argument("--sell-max", type=float, default=0.96)
+    p.add_argument("--step", type=float, default=0.03)
     p.add_argument("--capital", type=float, default=500.0, help="Starting capital in USDC for profit estimates")
     p.add_argument("--position-size", type=float, default=config.POSITION_SIZE_PCT,
                    help="Fraction of capital per trade (default: %(default)s)")
@@ -68,11 +68,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fill-window", type=int, default=60,
                    help="Single fill window in seconds (default: 60). Ignored if --fill-window-min/max set.")
     p.add_argument("--fill-window-min", type=int, default=None,
-                   help="Min fill window for 3D grid search (e.g. 15).")
+                   help="Min fill window for 3D grid search (e.g. 10).")
     p.add_argument("--fill-window-max", type=int, default=None,
-                   help="Max fill window for 3D grid search (e.g. 120).")
-    p.add_argument("--fill-window-step", type=int, default=15,
-                   help="Step size for fill window sweep (default: 15).")
+                   help="Max fill window for 3D grid search (e.g. 60).")
+    p.add_argument("--fill-window-step", type=int, default=10,
+                   help="Step size for fill window sweep (default: 10).")
     return p.parse_args()
 
 
@@ -220,6 +220,8 @@ async def main(args: argparse.Namespace) -> None:
     # Grid search per asset
     per_asset_best: dict[str, dict] = {}
     per_asset_robustness: dict[str, dict] = {}
+    per_asset_best_nb: dict[str, dict] = {}
+    per_asset_best_30pct: dict[str, dict] = {}
     for asset, sessions in all_sessions.items():
         if not sessions:
             continue
@@ -248,14 +250,24 @@ async def main(args: argparse.Namespace) -> None:
         reporter.save_full_grid(asset, df)
         best = analyzer.best_params(df)
         robustness = analyzer.neighborhood_robustness(df, best)
+        best_nb = analyzer.best_neighborhood_params(df)
+        best_30pct = analyzer.best_params_min_fill_rate(df, 0.30)
         per_asset_best[asset] = best
         per_asset_robustness[asset] = robustness
+        per_asset_best_nb[asset] = best_nb
+        per_asset_best_30pct[asset] = best_30pct
         if best:
             fw_str = f"  fill_window={int(best['fill_window'])}s" if "fill_window" in best else ""
             shape_str = f"  [{robustness.get('shape', '?')}  ratio={robustness.get('robustness_ratio')}]" if robustness else ""
+            nb_str = ""
+            if best_nb and best_nb.get("peak_vs_neighborhood") != "agree":
+                nb_str = (
+                    f"  [best neighborhood: buy={best_nb['buy']} sell={best_nb['sell']}"
+                    f"  mean={best_nb['neighborhood_mean_edge']}  {best_nb['peak_vs_neighborhood']}]"
+                )
             console.print(
                 f"  {asset}: best buy={best['buy']:.2f}  sell={best['sell']:.2f}{fw_str}  "
-                f"edge={best['edge_per_session']:.4f}  fill_rate={best['fill_rate']:.2%}{shape_str}"
+                f"edge={best['edge_per_session']:.4f}  fill_rate={best['fill_rate']:.2%}{shape_str}{nb_str}"
             )
 
     # Asset ranking at current thresholds (only shown if thresholds are configured)
@@ -280,6 +292,8 @@ async def main(args: argparse.Namespace) -> None:
     report_path = reporter.write_report(
         per_asset_best, asset_ranking,
         per_asset_robustness=per_asset_robustness,
+        per_asset_best_nb=per_asset_best_nb,
+        per_asset_best_30pct=per_asset_best_30pct,
         data_source=data_source,
         capital=args.capital,
         position_size_pct=args.position_size,
