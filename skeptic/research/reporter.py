@@ -202,13 +202,12 @@ def write_report(
         "## Optimal Parameters per Asset",
         "",
         "> Parameters with the highest edge across the full grid.",
+        "> **Peak vs NB** compares the peak to the best surrounding region — diverge means the peak may be a lucky outlier.",
         "> **Shape** measures whether the peak sits on a broad plateau or is a lone spike.",
         "> **NB Ratio** = neighbor mean edge / peak edge. How much of the peak's edge survives in the surrounding grid points (±1 step in each direction).",
         "> - 1.0 = neighbors match the peak exactly — pure plateau",
         "> - 0.6 = neighbors average 60% of peak edge — reasonably flat",
-        "> - 0.0 = neighbors have zero edge — lone spike",
-        "> - negative = neighbors average negative edge — the peak is an isolated island surrounded by losing combinations, strong overfitting signal",
-        "> **Peak vs NB** compares the peak to the best surrounding region — diverge means the peak may be a lucky outlier.",
+        "> - 0.0 or negative = neighbors have zero or negative edge — lone spike surrounded by losing combinations, strong overfitting signal",
         "",
         "| Asset | Sessions | Buy | Sell | Fill Win | Fill Rate | Sell Hit% | Edge/Session | Shape | NB Ratio | Peak vs NB |",
         "|-------|----------|-----|------|----------|-----------|-----------|--------------|-------|----------|------------|",
@@ -318,6 +317,41 @@ def write_report(
             net     = gross - spread_
             lines.append(
                 f"| {asset} | {_price(buy)} | {_price(sell)} | {shape} "
+                f"| ${net:+.4f} | ${net * SESSIONS_PER_DAY:+.2f} "
+                f"| ${net * SESSIONS_PER_DAY * 7:+.2f} "
+                f"| ${net * SESSIONS_PER_DAY * 30:+.2f} |"
+            )
+
+    # ── Estimated Profit — Best Neighborhood Params ───────────────────────────
+    lines += [
+        "",
+        "### Best Neighborhood Params",
+        "",
+        "_Uses the neighborhood mean edge (average of surrounding grid points) as the edge estimate._",
+        "_Fill rate is approximated from the peak params for each asset._",
+        "",
+        "| Asset | NB Buy | NB Sell | NB Fill Win | NB Mean Edge | $/Session (net) | $/Day | $/Week | $/Month |",
+        "|-------|--------|---------|-------------|-------------|-----------------|-------|--------|---------|",
+    ]
+
+    for asset, nb in _best_nb.items():
+        nb_buy  = nb.get("buy")
+        nb_sell = nb.get("sell")
+        nb_edge = nb.get("neighborhood_mean_edge")
+        nb_fw   = nb.get("fill_window")
+        # Use peak fill_rate as approximation
+        peak    = per_asset_best.get(asset, {})
+        fill_rate = peak.get("fill_rate", 0)
+        shr       = peak.get("sell_hit_rate", 0)
+        fw_str  = f"{int(nb_fw)}s" if nb_fw is not None else "—"
+        if nb_buy and nb_sell and nb_edge is not None and nb_buy > 0:
+            shares  = position_usdc / nb_buy
+            gross   = nb_edge * shares
+            spread_ = fill_rate * spread_cost * shares + fill_rate * shr * spread_cost * shares
+            net     = gross - spread_
+            lines.append(
+                f"| {asset} | {_price(nb_buy)} | {_price(nb_sell)} | {fw_str} "
+                f"| {_edge(nb_edge)} "
                 f"| ${net:+.4f} | ${net * SESSIONS_PER_DAY:+.2f} "
                 f"| ${net * SESSIONS_PER_DAY * 7:+.2f} "
                 f"| ${net * SESSIONS_PER_DAY * 30:+.2f} |"

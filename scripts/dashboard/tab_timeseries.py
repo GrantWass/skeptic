@@ -44,7 +44,7 @@ def render(
     sc6.metric(f"Est. P&L ({len(recent)} windows)", f"${total_pnl:+.2f}")
 
     st.caption(
-        f"buy={buy:.2f}  sell={sell:.2f}  "
+        f"buy={buy:.2f}  sell={sell:.2f}  fill window={fill_window}s  "
         f"position=${position_usdc:.2f}  spread={spread_cost:.3f}/crossing"
     )
     st.divider()
@@ -53,5 +53,5 @@ def render(
     for i, (s, (outcome, profit)) in enumerate(zip(recent, classified)):
         col = col_a if i % 2 == 0 else col_b
         with col:
-            fig = make_window_chart(s, buy, sell, outcome, profit)
+            fig = make_window_chart(s, buy, sell, outcome, profit, fill_window)
             st.plotly_chart(fig, width="stretch")
