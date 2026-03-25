@@ -50,9 +50,10 @@ restarts=0
 while [[ $_stop -eq 0 && $restarts -lt $MAX_RESTARTS ]]; do
     log "Starting collect_prices.py (attempt $((restarts + 1)))"
 
-    # caffeinate -s: prevent macOS sleep while this runs
+    # caffeinate -dims: prevent display sleep (-d), idle sleep (-i), disk sleep (-m), system sleep (-s)
+    # -d is key — it blocks lid-close sleep, which -s alone does not prevent
     # tee -a: echo stdout/stderr to terminal AND append to log file
-    if caffeinate -s python "$SCRIPT_DIR/collect_prices.py" "$@" 2>&1 | tee -a "$LOG_FILE"; then
+    if caffeinate -dims python "$SCRIPT_DIR/collect_prices.py" "$@" 2>&1 | tee -a "$LOG_FILE"; then
         # Clean exit (Ctrl+C inside the script exits 0 via KeyboardInterrupt handler)
         log "collect_prices.py exited cleanly."
         break

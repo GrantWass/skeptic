@@ -124,7 +124,7 @@ async def collect_window(
                     price_lines.append(f"{market.asset} ↑{up_str}/↓{dn_str}")
                 console.print(
                     f"  [dim]t+{elapsed:03d}s ({remaining}s left) | "
-                    f"{' | '.join(price_lines)} | {rows_written} rows[/dim]"
+                    f" {rows_written} rows[/dim]"
                 )
                 last_log = now
 

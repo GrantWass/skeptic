@@ -33,7 +33,7 @@ def render(
         hm_buy_max = st.number_input("Buy max", value=0.49, step=0.01, format="%.2f", key="hm_buy_max")
     with gc2:
         hm_sell_min = st.number_input("Sell min", value=0.45, step=0.01, format="%.2f", key="hm_sell_min")
-        hm_sell_max = st.number_input("Sell max", value=0.96, step=0.01, format="%.2f", key="hm_sell_max")
+        hm_sell_max = st.number_input("Sell max", value=0.99, step=0.01, format="%.2f", key="hm_sell_max")
     with gc3:
         hm_step = st.selectbox("Step size", [0.03, 0.04, 0.02, 0.01, 0.05], index=0, key="hm_step")
     with gc4:

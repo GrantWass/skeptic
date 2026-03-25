@@ -67,7 +67,7 @@ def main() -> None:
         buy_default = float(config.BUY_PRICE) if config.BUY_PRICE is not None else 0.35
         sell_default = float(config.SELL_PRICE) if config.SELL_PRICE is not None else 0.65
         buy = st.slider("Buy threshold", 0.10, 0.50, buy_default, 0.01, format="%.2f")
-        sell = st.slider("Sell threshold", 0.45, 0.96, sell_default, 0.01, format="%.2f")
+        sell = st.slider("Sell threshold", 0.45, 0.99, sell_default, 0.01, format="%.2f")
 
         st.header("Fill Window")
         fill_window = st.slider(
