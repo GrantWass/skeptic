@@ -5,11 +5,13 @@ streamlit run scripts/dashboard/__main__.py
 
 python scripts/filter_incomplete_windows.py
 
+sudo pmset -a disablesleep 1
 tmux new -s skeptic
-caffeinate -s bash scripts/collect_loop.sh
+bash scripts/collect_loop.sh
 # Ctrl+B, D to detach
 Reattach later with tmux attach -t skeptic.
 tmux kill-session -t skeptic
+sudo pmset -a disablesleep 0
 
 
 python scripts/bootstrap.py --from-prices --fill-window-min 10 --fill-window-max 120 --step 0.02
