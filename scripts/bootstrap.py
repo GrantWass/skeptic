@@ -17,7 +17,6 @@ Usage:
     python scripts/bootstrap.py --from-prices
     python scripts/bootstrap.py --from-prices --n 200 --step 0.02
     python scripts/bootstrap.py --from-prices --fill-window-min 10 --fill-window-max 120
-    python scripts/bootstrap.py --from-db --n 100
 """
 import argparse
 import asyncio
@@ -44,63 +43,6 @@ console = Console()
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
 
 REPORTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "reports")
-
-
-# ── Session loaders (mirrors research.py) ────────────────────────────────────
-
-def load_sessions_from_db(assets: list[str]) -> dict[str, list[HistoricalSession]]:
-    if not os.path.exists(config.DB_PATH):
-        return {}
-    result: dict[str, list[HistoricalSession]] = {}
-    conn = sqlite3.connect(config.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        for asset in assets:
-            rows = conn.execute(
-                """
-                SELECT s.*,
-                    ps1_up.price AS up_price_m1_snap,
-                    ps1_dn.price AS dn_price_m1_snap
-                FROM sessions s
-                LEFT JOIN price_snapshots ps1_up
-                    ON ps1_up.session_id = s.session_id AND ps1_up.outcome='UP' AND ps1_up.minute_mark=1
-                LEFT JOIN price_snapshots ps1_dn
-                    ON ps1_dn.session_id = s.session_id AND ps1_dn.outcome='DOWN' AND ps1_dn.minute_mark=1
-                WHERE s.asset = ?
-                ORDER BY s.window_start_ts
-                """,
-                (asset,),
-            ).fetchall()
-            sessions = []
-            for row in rows:
-                hs = HistoricalSession(
-                    asset=row["asset"],
-                    condition_id=row["condition_id"],
-                    window_start_ts=row["window_start_ts"],
-                    up_token_id="",
-                    down_token_id="",
-                )
-                up_m1 = row["up_price_m1_snap"] or row["up_price_m1"]
-                dn_m1 = row["dn_price_m1_snap"] or row["down_price_m1"]
-                if up_m1:
-                    hs.up_trades_m1 = [float(up_m1)]
-                if dn_m1:
-                    hs.down_trades_m1 = [float(dn_m1)]
-                res = row["resolution_price"]
-                if res is not None:
-                    hs.up_resolution = float(res)
-                    hs.down_resolution = 1.0 - float(res)
-                if row["sell_filled"] and row["sell_price_used"]:
-                    sell_p = float(row["sell_price_used"])
-                    if row["filled_outcome"] == "UP":
-                        hs.up_trades_all = [sell_p]
-                    elif row["filled_outcome"] == "DOWN":
-                        hs.down_trades_all = [sell_p]
-                sessions.append(hs)
-            result[asset] = sessions
-    finally:
-        conn.close()
-    return result
 
 
 # ── Core bootstrap logic ──────────────────────────────────────────────────────
@@ -353,7 +295,6 @@ def write_report(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Bootstrap stability analysis for threshold optimization")
     p.add_argument("--from-prices", action="store_true", help="Load from data/prices/ CSVs")
-    p.add_argument("--from-db",     action="store_true", help="Load from sessions.db")
     p.add_argument("--assets", nargs="+", default=config.ASSETS)
     p.add_argument("--n",    type=int,   default=100,  help="Number of bootstrap iterations (default: 100)")
     p.add_argument("--step", type=float, default=0.03, help="Grid step size (default: 0.03)")
@@ -377,11 +318,7 @@ def main() -> None:
     if args.from_prices:
         console.print("Mode: [green]Price CSV analysis[/green]")
         all_sessions = fetcher.load_from_price_files(args.assets, min_points=args.min_points)
-    elif args.from_db:
-        console.print("Mode: [green]DB analysis[/green]")
-        all_sessions = load_sessions_from_db(args.assets)
     else:
-        console.print("[red]Specify --from-prices or --from-db.[/red]")
         console.print("Bootstrap requires local session data (API mode has too few sessions).")
         raise SystemExit(1)
 

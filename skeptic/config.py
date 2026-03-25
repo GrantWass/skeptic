@@ -33,5 +33,4 @@ ASSETS: list[str] = ["BTC", "ETH", "SOL", "DOGE", "XRP", "BNB", "HYPE"]
 
 # --- Paths ---
 CREDS_FILE = ".creds.json"
-DB_PATH = "data/sessions.db"
 REPORTS_DIR = "data/reports"
