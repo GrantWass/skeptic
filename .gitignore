@@ -4,6 +4,7 @@ data/sessions.db
 data/reports/
 data/prices/
 data/collect_loop.log
+data/collect_and_sync.log
 __pycache__/
 *.pyc
 *.pyo
