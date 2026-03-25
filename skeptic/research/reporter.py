@@ -148,17 +148,6 @@ def write_report(
             "- Otherwise position goes to resolution (1.0 or 0.0)",
             "- **Edge per session** = fill_rate × expected_PnL_per_fill",
         ]
-    elif data_source == "db":
-        methodology_lines = [
-            "Session data was loaded from `data/sessions.db` recorded during paper/live trading.",
-            "Minute-1 price snapshots and fill data are used to simulate threshold outcomes.",
-            "",
-            "### Strategy simulation",
-            "- **Fill** occurs if the minute-1 snapshot price ≤ `buy_threshold`",
-            "- **Sell hit** occurs if the recorded sell price ≥ `sell_threshold`",
-            "- Otherwise position goes to resolution (1.0 or 0.0)",
-            "- **Edge per session** = fill_rate × expected_PnL_per_fill",
-        ]
     else:
         methodology_lines = [
             "Historical 5-minute UP/DOWN markets were fetched from the Polymarket Gamma API.",

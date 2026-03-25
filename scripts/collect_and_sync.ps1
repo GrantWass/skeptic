@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     1. Runs collect_prices.py continuously (auto-restarts on crash).
-    2. Every 30 minutes commits and pushes data/prices/ + data/sessions.db
+    2. Every 30 minutes commits and pushes data/prices/
        to GitHub via Git LFS.
     3. Keeps your PC awake using the Windows SetThreadExecutionState API.
     4. On Ctrl+C a final sync is always performed before exit.
@@ -120,7 +120,6 @@ function Initialize-GitLFS {
     try {
         git lfs install --local 2>&1 | Out-Null
         git lfs track "data/prices/*.csv" 2>&1 | Out-Null
-        git lfs track "data/sessions.db"  2>&1 | Out-Null
 
         # Commit .gitattributes if it changed
         $dirty = (git status --porcelain ".gitattributes" 2>&1) -ne ""
@@ -146,9 +145,6 @@ function Sync-Data([string]$label) {
         # Force-add even though data/ is in .gitignore; LFS filter intercepts large files.
         if (Test-Path "data\prices") {
             git add -f "data/prices/" 2>&1 | Out-Null
-        }
-        if (Test-Path "data\sessions.db") {
-            git add -f "data/sessions.db" 2>&1 | Out-Null
         }
 
         $changed = git diff --cached --name-only 2>&1
