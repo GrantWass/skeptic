@@ -67,6 +67,8 @@ def parse_args() -> argparse.Namespace:
                    help="Max fill window for 3D grid search (e.g. 60).")
     p.add_argument("--fill-window-step", type=int, default=10,
                    help="Step size for fill window sweep (default: 10).")
+    p.add_argument("--no-cache", action="store_true",
+                   help="Force re-run grid search even if a cached result exists.")
     return p.parse_args()
 
 
@@ -114,6 +116,14 @@ async def main(args: argparse.Namespace) -> None:
     _fw_max = args.fill_window_max
     _do_3d  = _fw_min is not None and _fw_max is not None and _fw_max > _fw_min
 
+    # Build a cache key from all args that affect the grid search
+    _args_key = (
+        f"buy={args.buy_min},{args.buy_max} sell={args.sell_min},{args.sell_max} "
+        f"step={args.step} fw={args.fill_window} "
+        f"fw3d={args.fill_window_min},{args.fill_window_max},{args.fill_window_step} "
+        f"minpts={args.min_points}"
+    )
+
     # Grid search per asset
     per_asset_best: dict[str, dict] = {}
     per_asset_robustness: dict[str, dict] = {}
@@ -122,28 +132,39 @@ async def main(args: argparse.Namespace) -> None:
     for asset, sessions in all_sessions.items():
         if not sessions:
             continue
-        if _do_3d:
-            console.print(
-                f"[dim]3D grid search for {asset} ({len(sessions)} sessions, "
-                f"fill window {_fw_min}–{_fw_max}s step {args.fill_window_step}s)…[/dim]"
-            )
-            df = analyzer.optimize_thresholds_3d(
-                sessions,
-                buy_range=(args.buy_min, args.buy_max),
-                sell_range=(args.sell_min, args.sell_max),
-                step=args.step,
-                fill_window_range=(_fw_min, _fw_max),
-                fill_window_step=args.fill_window_step,
-            )
+
+        # Try cache first
+        df = None
+        if not args.no_cache:
+            df = reporter.load_cached_grid(asset, _args_key)
+
+        if df is None:
+            if _do_3d:
+                console.print(
+                    f"[dim]3D grid search for {asset} ({len(sessions)} sessions, "
+                    f"fill window {_fw_min}–{_fw_max}s step {args.fill_window_step}s)…[/dim]"
+                )
+                df = analyzer.optimize_thresholds_3d(
+                    sessions,
+                    buy_range=(args.buy_min, args.buy_max),
+                    sell_range=(args.sell_min, args.sell_max),
+                    step=args.step,
+                    fill_window_range=(_fw_min, _fw_max),
+                    fill_window_step=args.fill_window_step,
+                )
+            else:
+                console.print(f"[dim]Optimizing thresholds for {asset} ({len(sessions)} sessions)…[/dim]")
+                df = analyzer.optimize_thresholds(
+                    sessions,
+                    buy_range=(args.buy_min, args.buy_max),
+                    sell_range=(args.sell_min, args.sell_max),
+                    step=args.step,
+                    fill_window=args.fill_window,
+                )
+            reporter.cache_grid(asset, df, _args_key)
         else:
-            console.print(f"[dim]Optimizing thresholds for {asset} ({len(sessions)} sessions)…[/dim]")
-            df = analyzer.optimize_thresholds(
-                sessions,
-                buy_range=(args.buy_min, args.buy_max),
-                sell_range=(args.sell_min, args.sell_max),
-                step=args.step,
-                fill_window=args.fill_window,
-            )
+            console.print(f"[dim]Using cached grid for {asset} ({len(sessions)} sessions)…[/dim]")
+
         reporter.save_full_grid(asset, df)
         best = analyzer.best_params(df)
         robustness = analyzer.neighborhood_robustness(df, best)
@@ -185,8 +206,11 @@ async def main(args: argparse.Namespace) -> None:
         )
 
     data_source = "prices" if args.from_prices else "api"
+
+    _report_fill_windows = [20, 40, 60]
+
     reporter.save_optimal_params(per_asset_best, {})
-    report_path = reporter.write_report(
+    report_paths = reporter.write_report(
         per_asset_best, asset_ranking,
         per_asset_robustness=per_asset_robustness,
         per_asset_best_nb=per_asset_best_nb,
@@ -195,8 +219,17 @@ async def main(args: argparse.Namespace) -> None:
         capital=args.capital,
         position_size_pct=args.position_size,
         spread_cost=args.spread_cost,
+        all_sessions=all_sessions,
+        fill_windows=_report_fill_windows,
+        buy_range=(args.buy_min, args.buy_max),
+        sell_range=(args.sell_min, args.sell_max),
+        step=args.step,
+        fill_window_range=(10, args.fill_window) if not _do_3d else (_fw_min, _fw_max),
+        fill_window_step=args.fill_window_step if _do_3d else 10,
     )
-    console.print(f"\n[bold green]Research complete! Report: {report_path}[/bold green]")
+    console.print("\n[bold green]Research complete![/bold green]")
+    for report_path in report_paths:
+        console.print(f"  Report: {report_path}")
 
 
 if __name__ == "__main__":

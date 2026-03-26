@@ -14,7 +14,7 @@ tmux kill-session -t skeptic
 sudo pmset -a disablesleep 0
 
 
-python scripts/bootstrap.py --from-prices --fill-window-min 10 --fill-window-max 120 --step 0.02
+python scripts/bootstrap.py --from-prices --fill-window-min 10 --fill-window-max 60 --step 0.03
 
 
 ./data/zip_prices.sh

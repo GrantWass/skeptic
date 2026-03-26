@@ -29,7 +29,7 @@ WINDOW_SECS: int = 300        # 5-minute windows
 
 # Available 5-min assets on Polymarket: BTC, ETH, SOL, DOGE, XRP, BNB, HYPE
 # --- Assets to trade/research ---
-ASSETS: list[str] = ["BTC", "ETH", "SOL", "DOGE", "XRP", "BNB", "HYPE"]
+ASSETS: list[str] = ["BTC", "ETH", "SOL", "DOGE", "HYPE"]
 
 # --- Paths ---
 CREDS_FILE = ".creds.json"
