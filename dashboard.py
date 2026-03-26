@@ -86,14 +86,16 @@ class TradingState:
         self.wins: int = 0
         self.losses: int = 0
         self.current_asset: Optional[str] = None
+        self.current_window_ts: int = 0
+        self.debug: dict = {}
 
     # ── writers (called from engine thread) ─────────────────────────────────
 
     def add_price(self, ts: float, up: Optional[float], down: Optional[float], window_ts: int) -> None:
         with self._lock:
             self.prices.append(PricePoint(ts=ts, up=up, down=down, window_ts=window_ts))
-            if len(self.prices) > 1800:           # keep ≤30 min of history
-                self.prices = self.prices[-1800:]
+            if len(self.prices) > 3100:           # 0.1s × 3100 ≈ 310s — full window
+                self.prices = self.prices[-3100:]
 
     def add_trade(self, trade: TradeRecord) -> None:
         with self._lock:
@@ -121,6 +123,10 @@ class TradingState:
         with self._lock:
             self.status_msg = msg
 
+    def set_debug(self, **kwargs) -> None:
+        with self._lock:
+            self.debug.update(kwargs)
+
     def set_error(self, msg: str) -> None:
         with self._lock:
             self.error = msg
@@ -147,6 +153,8 @@ class TradingState:
                 "wins": self.wins,
                 "losses": self.losses,
                 "current_asset": self.current_asset,
+                "current_window_ts": self.current_window_ts,
+                "debug": dict(self.debug),
             }
 
 
@@ -212,6 +220,25 @@ class TradingEngine:
     async def _main(self) -> None:
         self.state.set_status("Connecting…")
 
+        # ── Credential check ─────────────────────────────────────────────────
+        pk_set = bool(getattr(config, "PRIVATE_KEY", ""))
+        wa_set = bool(getattr(config, "WALLET_ADDRESS", ""))
+        self.state.set_debug(
+            dry_run=self.dry_run,
+            private_key_set=pk_set,
+            wallet_address_set=wa_set,
+            clob_api_key_set=bool(getattr(config, "CLOB_API_KEY", "")),
+            market_ws_connected=False,
+            user_ws_connected=False,
+            up_token_id=None,
+            down_token_id=None,
+            price_cache_up=None,
+            price_cache_down=None,
+            prices_recorded=0,
+            last_market_slug=None,
+            last_market_found=None,
+        )
+
         # ── CLOB client (skipped in dry-run) ────────────────────────────────
         clob = None
         if not self.dry_run:
@@ -219,12 +246,15 @@ class TradingEngine:
                 clob = clob_client.build_client()
                 balance = clob_client.get_usdc_balance(clob)
                 self.state.set_balance(balance)
+                self.state.set_debug(clob_connected=True, balance_fetched=balance)
                 with self.state._lock:
                     self.state.balance_start = balance
             except Exception as exc:
+                self.state.set_debug(clob_connected=False, clob_error=str(exc))
                 self.state.set_error(f"CLOB connect failed: {exc}")
                 return
         else:
+            self.state.set_debug(clob_connected="skipped (dry run)")
             with self.state._lock:
                 self.state.balance = PAPER_START_BALANCE
                 self.state.balance_start = PAPER_START_BALANCE
@@ -245,6 +275,13 @@ class TradingEngine:
             bg.append(asyncio.create_task(user_ws.run()))
         bg.append(asyncio.create_task(self._price_recorder(market_ws)))
 
+        # Give WebSockets a moment to connect
+        await asyncio.sleep(1.0)
+        self.state.set_debug(
+            market_ws_connected=market_ws._ws is not None,
+            user_ws_connected=(user_ws._ws is not None) if user_ws else "skipped (dry run)",
+        )
+
         try:
             async with httpx.AsyncClient() as http:
                 while self._is_running():
@@ -255,9 +292,13 @@ class TradingEngine:
                     )
 
                     # Fetch market while waiting for window boundary
+                    from skeptic.utils.time import market_slug
+                    slug = market_slug(self.asset, win_ts)
+                    self.state.set_debug(last_market_slug=slug, last_market_found=None)
                     market = await gamma_client.get_current_window_market(
                         self.asset, win_ts, http
                     )
+                    self.state.set_debug(last_market_found=market is not None)
 
                     # Sleep until window start (checking running every second)
                     if not await self._sleep_until(float(win_ts)):
@@ -272,26 +313,43 @@ class TradingEngine:
                             break
                         continue
 
-                    # Subscribe price feeds
+                    # New window opening — clear old prices and set new window ts
+                    with self.state._lock:
+                        self.state.prices = []
+                        self.state.current_window_ts = win_ts
                     self._up_token_id = market.up_token.token_id
                     self._down_token_id = market.down_token.token_id
                     self._current_window_ts = win_ts
+                    self.state.set_debug(
+                        up_token_id=market.up_token.token_id,
+                        down_token_id=market.down_token.token_id,
+                        condition_id=market.condition_id,
+                    )
                     await market_ws.subscribe(market.up_token.token_id, market.down_token.token_id)
+                    self.state.set_debug(market_ws_connected=market_ws._ws is not None)
 
                     if user_ws:
                         await user_ws.subscribe(market.condition_id)
+                        self.state.set_debug(user_ws_connected=user_ws._ws is not None)
 
                     # Refresh live balance
                     if clob:
                         try:
-                            self.state.set_balance(clob_client.get_usdc_balance(clob))
-                        except Exception:
-                            pass
+                            bal = clob_client.get_usdc_balance(clob)
+                            self.state.set_balance(bal)
+                            self.state.set_debug(balance_fetched=bal)
+                        except Exception as exc:
+                            self.state.set_debug(balance_error=str(exc))
 
                     await self._execute_window(clob, user_ws, market_ws, market)
 
                     if user_ws:
                         await user_ws.unsubscribe(market.condition_id)
+
+                    # Pause price recorder between windows; keep current_window_ts
+                    # so the chart keeps showing the last window's data.
+                    self._up_token_id = None
+                    self._down_token_id = None
 
         finally:
             for t in bg:
@@ -520,7 +578,8 @@ class TradingEngine:
     # ── price recorder ───────────────────────────────────────────────────────
 
     async def _price_recorder(self, market_ws: MarketChannel) -> None:
-        """Sample live prices into TradingState every second."""
+        """Sample live prices as fast as possible."""
+        n = 0
         while True:
             up_id = self._up_token_id
             dn_id = self._down_token_id
@@ -529,7 +588,14 @@ class TradingEngine:
                 up_p = market_ws.price_cache.get(up_id)
                 dn_p = market_ws.price_cache.get(dn_id)
                 self.state.add_price(time.time(), up_p, dn_p, wts)
-            await asyncio.sleep(1.0)
+                n += 1
+                self.state.set_debug(
+                    price_cache_up=up_p,
+                    price_cache_down=dn_p,
+                    prices_recorded=n,
+                    market_ws_connected=market_ws._ws is not None,
+                )
+            await asyncio.sleep(0.1)
 
     # ── utilities ────────────────────────────────────────────────────────────
 
@@ -596,7 +662,7 @@ def _render_sidebar(snap: dict) -> tuple[str, float, float, int, bool]:
     st.sidebar.markdown("---")
 
     if not running:
-        if st.sidebar.button("▶  Start Trading", type="primary", use_container_width=True):
+        if st.sidebar.button("▶  Start Trading", type="primary", width='stretch'):
             state: TradingState = st.session_state.state
             engine = TradingEngine(
                 state=state,
@@ -610,7 +676,7 @@ def _render_sidebar(snap: dict) -> tuple[str, float, float, int, bool]:
             engine.start()
             st.rerun()
     else:
-        if st.sidebar.button("■  Stop Trading", type="secondary", use_container_width=True):
+        if st.sidebar.button("■  Stop Trading", type="secondary", width='stretch'):
             if "engine" in st.session_state:
                 st.session_state.engine.stop()
             else:
@@ -640,39 +706,86 @@ def _render_metrics(snap: dict) -> None:
     c5.metric("Win Rate", f"{win_rate:.0f}%")
 
 
-def _render_chart(snap: dict) -> None:
+def _render_chart(snap: dict, fill_window: int) -> None:
     prices: list[PricePoint] = snap["prices"]
     trades: list[TradeRecord] = snap["trades"]
     asset = snap.get("current_asset") or "—"
+    window_ts = snap.get("current_window_ts", 0)
+    buy_th = st.session_state.get("_buy_th", 0.40)
+    sell_th = st.session_state.get("_sell_th", 0.93)
+
+    # Only show prices for the current window
+    window_prices = [p for p in prices if p.window_ts == window_ts and 0 <= (p.ts - window_ts) <= 305] if window_ts else []
+
+    now_elapsed = time.time() - window_ts if window_ts else 0
+    now_elapsed = max(0.0, min(now_elapsed, 300.0))
+
+    # Seconds remaining in fill window (clamp to 0)
+    fill_remaining = max(0.0, fill_window - now_elapsed)
+    in_fill_window = fill_remaining > 0
 
     fig = go.Figure()
 
-    if prices:
-        times = [datetime.fromtimestamp(p.ts) for p in prices]
-        up_vals = [p.up for p in prices]
-        dn_vals = [p.down for p in prices]
+    # ── Fill window shading ──────────────────────────────────────────────────
+    # Green zone: the fill window (0 → fill_window)
+    fig.add_vrect(
+        x0=0, x1=fill_window,
+        fillcolor="rgba(0,224,150,0.07)",
+        line_width=0,
+        layer="below",
+    )
+    # Fill window deadline — solid line, color shifts red as time runs out
+    urgency = 1.0 - (fill_remaining / fill_window) if fill_window > 0 else 1.0
+    r = int(255 * urgency)
+    g = int(224 * (1 - urgency))
+    deadline_color = f"rgba({r},{g},80,0.9)"
+    fig.add_vline(
+        x=fill_window,
+        line=dict(color=deadline_color, width=2, dash="solid"),
+        annotation_text=f"fill window",
+        annotation_position="top",
+        annotation_font=dict(size=10, color=deadline_color),
+    )
+
+    # ── "Now" cursor ────────────────────────────────────────────────────────
+    if window_ts and now_elapsed <= 300:
+        fig.add_vline(
+            x=now_elapsed,
+            line=dict(color="rgba(255,255,255,0.5)", width=1, dash="dot"),
+            annotation_text=f"{now_elapsed:.0f}s",
+            annotation_position="bottom",
+            annotation_font=dict(size=9, color="rgba(255,255,255,0.6)"),
+        )
+
+    # ── Price lines ──────────────────────────────────────────────────────────
+    if window_prices:
+        xs = [p.ts - window_ts for p in window_prices]
+        up_vals = [p.up for p in window_prices]
+        dn_vals = [p.down for p in window_prices]
 
         fig.add_trace(go.Scatter(
-            x=times, y=up_vals,
+            x=xs, y=up_vals,
             name="UP",
-            line=dict(color="#00e096", width=2),
+            line=dict(color="#00e096", width=3),
             connectgaps=False,
-            hovertemplate="%{y:.3f}<extra>UP</extra>",
+            hovertemplate="t+%{x:.0f}s  %{y:.3f}<extra>UP</extra>",
         ))
         fig.add_trace(go.Scatter(
-            x=times, y=dn_vals,
+            x=xs, y=dn_vals,
             name="DOWN",
-            line=dict(color="#ff4f6e", width=2),
+            line=dict(color="#ff4f6e", width=3),
             connectgaps=False,
-            hovertemplate="%{y:.3f}<extra>DOWN</extra>",
+            hovertemplate="t+%{x:.0f}s  %{y:.3f}<extra>DOWN</extra>",
         ))
 
-    # Buy fill markers
+    # ── Trade markers (current window only) ─────────────────────────────────
     for t in trades:
-        bdt = datetime.fromtimestamp(t.buy_time)
+        if t.window_ts != window_ts:
+            continue
+        bx = t.buy_time - window_ts
         color = "#00e096" if t.outcome == "UP" else "#ff4f6e"
         fig.add_trace(go.Scatter(
-            x=[bdt], y=[t.buy_price],
+            x=[bx], y=[t.buy_price],
             mode="markers+text",
             marker=dict(symbol="triangle-up", size=16, color=color,
                         line=dict(width=1, color="white")),
@@ -681,12 +794,11 @@ def _render_chart(snap: dict) -> None:
             showlegend=False,
             hovertemplate=f"BUY {t.outcome} @ {t.buy_price:.3f}<extra></extra>",
         ))
-
         if t.sell_time and t.sell_price is not None:
-            sdt = datetime.fromtimestamp(t.sell_time)
-            pnl_str = f"PnL ${t.pnl:+.3f}" if t.pnl is not None else "SELL"
+            sx = t.sell_time - window_ts
+            pnl_str = f"${t.pnl:+.3f}" if t.pnl is not None else "SELL"
             fig.add_trace(go.Scatter(
-                x=[sdt], y=[t.sell_price],
+                x=[sx], y=[t.sell_price],
                 mode="markers+text",
                 marker=dict(symbol="triangle-down", size=16, color="#ffd700",
                             line=dict(width=1, color="white")),
@@ -696,27 +808,49 @@ def _render_chart(snap: dict) -> None:
                 hovertemplate=f"SELL @ {t.sell_price:.3f}<extra></extra>",
             ))
 
-    # Buy/sell threshold lines
-    buy_th = st.session_state.get("_buy_th", 0.40)
-    sell_th = st.session_state.get("_sell_th", 0.93)
+    # ── Threshold lines ──────────────────────────────────────────────────────
     fig.add_hline(y=buy_th, line=dict(dash="dot", color="rgba(255,255,255,0.3)", width=1),
                   annotation_text=f"buy {buy_th:.2f}", annotation_position="right")
     fig.add_hline(y=sell_th, line=dict(dash="dot", color="rgba(255,215,0,0.4)", width=1),
                   annotation_text=f"sell {sell_th:.2f}", annotation_position="right")
 
+    # ── Title suffix ─────────────────────────────────────────────────────────
+    if not window_ts:
+        title_suffix = " — ⏳ waiting for next window"
+    elif now_elapsed > 300:
+        title_suffix = " — ⏳ window closed, waiting for next"
+    elif in_fill_window:
+        title_suffix = f" — ⏱ {fill_remaining:.0f}s until fill window closes"
+    else:
+        title_suffix = " — fill window closed"
+
     fig.update_layout(
-        title=dict(text=f"{asset} UP / DOWN — Live Prices", x=0),
-        xaxis_title=None,
-        yaxis=dict(title="Price", range=[0, 1], tickformat=".2f"),
+        title=dict(text=f"{asset} UP / DOWN{title_suffix}", x=0, font=dict(color="#e0e0e0")),
+        xaxis=dict(
+            title="seconds into window",
+            range=[0, 300],
+            tickvals=list(range(0, 301, 30)),
+            ticktext=[f"{s}s" for s in range(0, 301, 30)],
+            color="#aaaaaa",
+            gridcolor="#333333",
+        ),
+        yaxis=dict(
+            title="Price",
+            range=[0, 1],
+            tickformat=".2f",
+            color="#aaaaaa",
+            gridcolor="#333333",
+        ),
         height=380,
         margin=dict(l=10, r=80, t=40, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        template="plotly_dark",
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
+                    font=dict(color="#e0e0e0")),
+        plot_bgcolor="#1a1a2e",
+        paper_bgcolor="#0f0f1a",
+        font=dict(color="#e0e0e0"),
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 def _render_trade_log(snap: dict) -> None:
@@ -749,7 +883,7 @@ def _render_trade_log(snap: dict) -> None:
         })
 
     df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width='stretch', hide_index=True)
 
 
 # ────────────────────────────── App entrypoint ───────────────────────────────
@@ -798,13 +932,98 @@ def main() -> None:
 
     # ── Price chart ───────────────────────────────────────────────────────────
     st.subheader("Live Price Chart")
-    _render_chart(snap)
+    _render_chart(snap, fill_win)
 
     st.markdown("---")
 
     # ── Trade log ─────────────────────────────────────────────────────────────
     st.subheader("Trade Log")
     _render_trade_log(snap)
+
+    # ── Debug panel ───────────────────────────────────────────────────────────
+    with st.expander("🔧 Debug", expanded=not snap["running"]):
+        dbg = snap.get("debug", {})
+
+        if not dbg:
+            st.info("Start the engine to see debug info.")
+        else:
+            c1, c2 = st.columns(2)
+
+            with c1:
+                st.markdown("**Credentials (.env)**")
+                st.write({
+                    "PRIVATE_KEY set": dbg.get("private_key_set"),
+                    "WALLET_ADDRESS set": dbg.get("wallet_address_set"),
+                    "CLOB_API_KEY set": dbg.get("clob_api_key_set"),
+                    "dry_run": dbg.get("dry_run"),
+                })
+                st.markdown("**CLOB**")
+                st.write({
+                    "connected": dbg.get("clob_connected"),
+                    "balance fetched": dbg.get("balance_fetched"),
+                    "error": dbg.get("clob_error"),
+                    "balance_error": dbg.get("balance_error"),
+                })
+
+            with c2:
+                st.markdown("**WebSockets**")
+                st.write({
+                    "market WS connected": dbg.get("market_ws_connected"),
+                    "user WS connected": dbg.get("user_ws_connected"),
+                })
+                st.markdown("**Market**")
+                st.write({
+                    "slug fetched": dbg.get("last_market_slug"),
+                    "market found": dbg.get("last_market_found"),
+                    "condition_id": dbg.get("condition_id"),
+                    "up_token_id": (dbg.get("up_token_id") or "")[:20] + "…" if dbg.get("up_token_id") else None,
+                    "down_token_id": (dbg.get("down_token_id") or "")[:20] + "…" if dbg.get("down_token_id") else None,
+                })
+
+            n_prices = dbg.get("prices_recorded", 0)
+            up_p = dbg.get("price_cache_up")
+            dn_p = dbg.get("price_cache_down")
+
+            st.markdown("**Price Cache**")
+            st.write({
+                "UP price": round(up_p, 3) if up_p is not None else None,
+                "DOWN price": round(dn_p, 3) if dn_p is not None else None,
+                "prices recorded (total)": n_prices,
+            })
+
+            prices_in_snap = snap.get("prices", [])
+            win_ts_snap = snap.get("current_window_ts", 0)
+            matching = [p for p in prices_in_snap if p.window_ts == win_ts_snap and 0 <= (p.ts - win_ts_snap) <= 300] if win_ts_snap else []
+            st.markdown("**Chart diagnostics**")
+            st.write({
+                "prices in snapshot": len(prices_in_snap),
+                "current_window_ts": win_ts_snap,
+                "prices matching window+range": len(matching),
+                "now elapsed (s)": round(time.time() - win_ts_snap, 1) if win_ts_snap else None,
+            })
+
+            # ── Health diagnostics ───────────────────────────────────────────
+            if dbg.get("last_market_found") is False:
+                st.error(
+                    f"Market not found for slug `{dbg.get('last_market_slug')}`. "
+                    "The window may not have opened yet, or the asset isn't available."
+                )
+            elif n_prices > 0 and up_p is not None:
+                st.success(
+                    f"✓ Data flowing — {n_prices:,} price points recorded. "
+                    f"UP={up_p:.3f}  DOWN={dn_p:.3f}. "
+                    "If the chart looks flat, the market is genuinely near 50/50."
+                )
+            elif n_prices == 0 and dbg.get("market_ws_connected"):
+                st.warning(
+                    "Market WS connected but no prices yet. "
+                    "Waiting for the next window to open so tokens can be subscribed."
+                )
+
+            if not dbg.get("private_key_set") and not dbg.get("dry_run"):
+                st.error("PRIVATE_KEY is not set in .env — live trading will fail.")
+            if not dbg.get("wallet_address_set") and not dbg.get("dry_run"):
+                st.error("WALLET_ADDRESS is not set in .env — live trading will fail.")
 
     # ── Auto-refresh while engine is running ──────────────────────────────────
     if snap["running"]:
