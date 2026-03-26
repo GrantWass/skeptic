@@ -88,9 +88,7 @@ Log "Sleep prevention active (SetThreadExecutionState)."
 # Find Python 3  (prefers .venv)
 # ─────────────────────────────────────────────────────────────────────────────
 function Find-Python {
-    $venv = Join-Path $ROOT ".venv\Scripts\python.exe"
-    if (Test-Path $venv) { return $venv }
-    foreach ($cmd in "python", "python3") {
+      foreach ($cmd in "python", "python3") {
         try {
             if ((& $cmd --version 2>&1) -match "Python 3") { return $cmd }
         } catch {}
@@ -98,12 +96,38 @@ function Find-Python {
     return $null
 }
 
-$PY = Find-Python
+# Prefer the repo .venv explicitly, fall back to system python if needed
+$venvPython = Join-Path $ROOT ".venv\Scripts\python.exe"
+if (Test-Path $venvPython) {
+    $PY = $venvPython
+} else {
+    $PY = Find-Python
+}
+
 if (-not $PY) {
     Log "ERROR: Python 3 not found. Install Python 3 or run: python -m venv .venv"
     exit 1
 }
 Log "Python: $PY"
+
+# Helper to run git commands with redirected output to avoid PowerShell native-command exceptions.
+function Run-Git([string[]]$GitArgs) {
+    $tmpOut = [System.IO.Path]::GetTempFileName()
+    $tmpErr = [System.IO.Path]::GetTempFileName()
+    try {
+        $p = Start-Process -FilePath git -ArgumentList $GitArgs -WorkingDirectory $ROOT -NoNewWindow -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr -PassThru -Wait
+
+        $out = (Get-Content $tmpOut -Raw) -split "`r?`n"
+        $err = (Get-Content $tmpErr -Raw) -split "`r?`n"
+
+        foreach ($line in $out) { if ($line -ne '') { Log "git: $line" } }
+        foreach ($line in $err) { if ($line -ne '') { Log "git: $line" } }
+
+        return $p.ExitCode
+    } finally {
+        Remove-Item -ErrorAction SilentlyContinue $tmpOut, $tmpErr
+    }
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # One-time Git LFS initialisation (runs fast on subsequent calls)
@@ -125,8 +149,11 @@ function Initialize-GitLFS {
         $dirty = (git status --porcelain ".gitattributes" 2>&1) -ne ""
         if ($dirty) {
             git add ".gitattributes" | Out-Null
-            git commit -m "chore: track price data via Git LFS" | Out-Null
-            git push -u origin $Branch 2>&1 | ForEach-Object { Log "lfs-init: $_" }
+            # use Run-Git to capture/log output safely
+            $code = Run-Git @('commit','-m','lfs')
+            if ($code -ne 0) { Log "Git commit returned exit code $code" }
+            $code = Run-Git @('push','-u','origin',$Branch)
+            if ($code -ne 0) { Log "Git push returned exit code $code" }
             Log "Git LFS .gitattributes committed and pushed."
         } else {
             Log "Git LFS already configured."
@@ -142,18 +169,25 @@ function Initialize-GitLFS {
 function Sync-Data([string]$label) {
     Push-Location $ROOT
     try {
-        # Force-add even though data/ is in .gitignore; LFS filter intercepts large files.
+        # Always stage (add) all CSVs in data/prices/ before checking for changes
         if (Test-Path "data\prices") {
-            git add -f "data/prices/" 2>&1 | Out-Null
+            Run-Git @('add','-f','data/prices/*.csv') | Out-Null
         }
 
         $changed = git diff --cached --name-only 2>&1
-        if ($changed) {
-            $ts  = Get-Date -Format "yyyy-MM-dd HH:mm"
-            $msg = "data: $label $ts"
-            git commit -m $msg 2>&1 | ForEach-Object { Log "git: $_" }
-            git push -u origin $Branch 2>&1 | ForEach-Object { Log "git: $_" }
-            Log "Pushed $(@($changed).Count) file(s) to GitHub."
+        $changedFiles = @($changed | Where-Object { $_ -and $_.Trim() -ne "" })
+        if ($changedFiles.Count -gt 0) {
+            $commitCode = Run-Git @('commit','-m','data')
+            if ($commitCode -eq 0) {
+                $pushCode = Run-Git @('push','-u','origin',$Branch)
+                if ($pushCode -eq 0) {
+                    Log "Pushed $($changedFiles.Count) file(s) to GitHub."
+                } else {
+                    Log "Git push failed (exit code $pushCode)."
+                }
+            } else {
+                Log "Git commit failed (exit code $commitCode)."
+            }
         } else {
             Log "Sync: no new data to commit."
         }
