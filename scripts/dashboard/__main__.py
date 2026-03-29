@@ -22,6 +22,9 @@ from skeptic import config
 
 import tab_heatmap
 import tab_timeseries
+import tab_high_buy
+import tab_timing
+import tab_live
 from data_loader import get_sessions
 
 st.set_page_config(
@@ -76,29 +79,40 @@ def main() -> None:
     }
     total = sum(len(v) for v in all_sessions.values())
 
-    if total == 0:
-        st.warning(
-            "**No price CSV data found.**\n\n"
-            "Run the price collector first, then reload this dashboard:\n\n"
-            "```\npython scripts/collect_prices.py\n```"
-        )
-        return
-
-    if not selected_assets:
-        st.info("Select at least one asset in the sidebar.")
-        return
-
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab1, tab2 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🗺️ Threshold Heatmap",
         "📈 Time Series",
+        "🎯 High Buy",
+        "⏱️ Timing",
+        "🔴 Live",
     ])
 
-    with tab1:
-        tab_heatmap.render(all_sessions, selected_assets, buy, sell)
+    if total == 0:
+        with tab1, tab2, tab3:
+            st.warning(
+                "**No price CSV data found.**\n\n"
+                "Run the price collector first, then reload this dashboard:\n\n"
+                "```\npython scripts/collect_prices.py\n```"
+            )
+    elif not selected_assets:
+        with tab1, tab2, tab3:
+            st.info("Select at least one asset in the sidebar.")
+    else:
+        with tab1:
+            tab_heatmap.render(all_sessions, selected_assets, buy, sell)
 
-    with tab2:
-        tab_timeseries.render(all_sessions, selected_assets, buy, sell, capital, position_pct, spread_cost, fill_window)
+        with tab2:
+            tab_timeseries.render(all_sessions, selected_assets, buy, sell, capital, position_pct, spread_cost, fill_window)
+
+        with tab3:
+            tab_high_buy.render(all_sessions, selected_assets, capital, position_pct)
+
+        with tab4:
+            tab_timing.render(all_sessions, selected_assets)
+
+    with tab5:
+        tab_live.render()
 
 
 if __name__ == "__main__":

@@ -22,7 +22,9 @@ import pandas as pd
 from skeptic import config
 from skeptic.research.analyzer import (ThresholdResult, simulate, optimize_thresholds_sided,
                                         optimize_thresholds_sided_3d, group_by_prev_resolution,
-                                        neighborhood_robustness, best_neighborhood_params_min_fill_rate)
+                                        neighborhood_robustness, best_neighborhood_params_min_fill_rate,
+                                        sweep_high_buy, grid_search_high_buy, high_buy_hurst,
+                                        analyze_timing_buckets)
 
 log = logging.getLogger(__name__)
 
@@ -1179,4 +1181,506 @@ def write_report(
 
     written.append(_write("report_recommendation.md", "Recommendation", rec_lines))
 
+    if all_sessions:
+        written.append(write_high_buy_report(all_sessions))
+
     return written
+
+
+def _high_buy_section(all_sessions: dict) -> list[str]:
+    """
+    Sweep buy thresholds (0.65–0.95) for each asset, combining UP and DOWN fills.
+    Shows both anytime and last-2-min-only modes side by side.
+    5-cent slippage is baked in to all payoff calculations.
+    """
+    LAST2_SECS   = 180
+    EXCL_LAST_30 = 270  # exclude final 30 seconds (max_elapsed_secs=270)
+    SLIPPAGE     = 0.05
+
+    def _nb_mean_edge(df: "pd.DataFrame", t: float) -> "float | None":
+        neighbors = df[df["threshold"].between(round(t - 0.05, 2), round(t + 0.05, 2))]
+        return float(neighbors["edge_per_session"].mean()) if not neighbors.empty else None
+
+    def _sweep_with_nb(sessions: list, min_elapsed: int = 0, max_elapsed: int = 300) -> "pd.DataFrame":
+        df = sweep_high_buy(sessions, min_elapsed_secs=min_elapsed, max_elapsed_secs=max_elapsed, slippage=SLIPPAGE)
+        df["nb_mean_edge"] = df["threshold"].apply(lambda t: _nb_mean_edge(df, t))
+        return df
+
+    def _best_row(df: "pd.DataFrame") -> "pd.Series | None":
+        nb_sorted = df.dropna(subset=["nb_mean_edge"]).sort_values("nb_mean_edge", ascending=False)
+        return nb_sorted.iloc[0] if not nb_sorted.empty and nb_sorted.iloc[0]["n_fills"] > 0 else None
+
+    lines: list[str] = [
+        "## High-Probability Buy Sweep",
+        "",
+        "> Buys either UP or DOWN whenever that token's price touches the threshold (first trigger per session).",
+        "> Sweeps thresholds 0.65–0.95 in steps of 0.05.",
+        f"> **{int(SLIPPAGE * 100)}-cent slippage assumed**: effective fill price = T + {SLIPPAGE:.2f}.",
+        "> Payoff at effective price E: **+(1−E)** if that direction resolves, **−E** otherwise.",
+        "> Break-even win rate equals E (e.g. threshold=0.80 fills at 0.83, requires >83% wins).",
+        "> **NB Mean Edge** = average edge across T−0.05, T, T+0.05 — more robust than the raw peak.",
+        "> **Last 2 min** = only fills that trigger in the final 2 minutes of the window (≥180s elapsed).",
+        "> **−30s** = same as above but excluding triggers in the final 30 seconds (avoids thin-book spikes).",
+        "",
+        "### Best Threshold per Asset (by NB Mean Edge)",
+        "",
+        "| Asset | Mode | Best Buy | Fills | Fill Rate | Win Rate | Edge/Session | NB Mean Edge |",
+        "|-------|------|----------|-------|-----------|----------|--------------|--------------|",
+    ]
+
+    per_asset_any: dict[str, "pd.DataFrame"] = {}
+    per_asset_l2m: dict[str, "pd.DataFrame"] = {}
+    per_asset_any30: dict[str, "pd.DataFrame"] = {}
+    per_asset_l2m30: dict[str, "pd.DataFrame"] = {}
+
+    for asset, sessions in all_sessions.items():
+        if not sessions:
+            continue
+        df_any    = _sweep_with_nb(sessions, min_elapsed=0)
+        df_l2m    = _sweep_with_nb(sessions, min_elapsed=LAST2_SECS)
+        df_any30  = _sweep_with_nb(sessions, min_elapsed=0,          max_elapsed=EXCL_LAST_30)
+        df_l2m30  = _sweep_with_nb(sessions, min_elapsed=LAST2_SECS, max_elapsed=EXCL_LAST_30)
+        per_asset_any[asset]   = df_any
+        per_asset_l2m[asset]   = df_l2m
+        per_asset_any30[asset] = df_any30
+        per_asset_l2m30[asset] = df_l2m30
+
+        for label, df in [("Any time", df_any), ("Last 2 min", df_l2m),
+                          ("Any time −30s", df_any30), ("Last 2 min −30s", df_l2m30)]:
+            best = _best_row(df)
+            if best is None:
+                lines.append(f"| {asset} | {label} | — | — | — | — | — | — |")
+                continue
+            t = best["threshold"]
+            win_str = f"{best['win_rate']:.1%}" if best["win_rate"] is not None else "—"
+            nb_str  = f"{best['nb_mean_edge']:+.4f}" if pd.notna(best["nb_mean_edge"]) else "—"
+            lines.append(
+                f"| {asset} | {label} | **{t:.2f}** | {int(best['n_fills'])} "
+                f"| {best['fill_rate']:.1%} | {win_str} "
+                f"| {best['edge_per_session']:+.4f} | {nb_str} |"
+            )
+
+    lines += [""]
+
+    # ── Grid search: threshold × window cutoff ────────────────────────────────
+    lines += [
+        "---",
+        "",
+        "## Grid Search: Threshold × Entry Window (Edge/Session)",
+        "",
+        "> Rows = how far into the window before entering. Columns = buy threshold.",
+        "> Values = edge per session. Blank = no fills at that combination.",
+        "",
+    ]
+
+    cutoffs = list(range(0, 271, 30))
+    thresholds_grid = [round(t / 100, 2) for t in range(65, 97, 5)]
+
+    def _cutoff_label(c: int) -> str:
+        if c == 0:
+            return "Any time"
+        remaining = 300 - c
+        m, s = divmod(remaining, 60)
+        return f"Last {m}m" if s == 0 else f"Last {m}m{s}s"
+
+    for asset, sessions in all_sessions.items():
+        if not sessions:
+            continue
+        lines += [f"### {asset}", ""]
+        df_grid = grid_search_high_buy(sessions, thresholds=thresholds_grid, cutoffs=cutoffs, slippage=SLIPPAGE)
+        pivot = df_grid.pivot(index="cutoff_secs", columns="threshold", values="edge_per_session")
+
+        header = "| Entry point | " + " | ".join(f"T={t:.2f}" for t in thresholds_grid) + " |"
+        sep    = "|-------------|" + "|".join("--------" for _ in thresholds_grid) + "|"
+        lines += [header, sep]
+
+        for c in cutoffs:
+            row_label = _cutoff_label(c)
+            cells = []
+            for t in thresholds_grid:
+                val = pivot.loc[c, t] if c in pivot.index and t in pivot.columns else None
+                n_fills = df_grid[(df_grid["cutoff_secs"] == c) & (df_grid["threshold"] == t)]["n_fills"].values
+                if val is None or (len(n_fills) > 0 and n_fills[0] == 0):
+                    cells.append("—")
+                else:
+                    cells.append(f"{val:+.4f}")
+            lines.append(f"| {row_label} | " + " | ".join(cells) + " |")
+
+        lines += [""]
+
+    # ── Hurst exponent section ────────────────────────────────────────────────
+    lines += [
+        "---",
+        "",
+        "## Hurst Exponent Analysis",
+        "",
+        "> Measures whether price series within each 5-minute window are **trending** or **mean-reverting**.",
+        "> Computed on the combined UP+DOWN price series per session.",
+        "> **H > 0.5** → trending (momentum): prices that spike tend to stay high → good for high-buy.",
+        "> **H ≈ 0.5** → random walk: no memory.",
+        "> **H < 0.5** → mean-reverting: spikes tend to revert → bad for high-buy.",
+        "> **Filled H** = mean H for sessions where price touched the threshold.",
+        "> If Filled H > All H, the strategy is selectively entering trending sessions.",
+        "",
+        "### Any Time",
+        "",
+        "| Asset | All H | Filled H | Unfilled H | Filled − All | Interpretation |",
+        "|-------|-------|----------|------------|--------------|----------------|",
+    ]
+
+    def _hurst_interp(filled_h: "float | None", all_h: "float | None") -> str:
+        if filled_h is None or all_h is None:
+            return "—"
+        diff = filled_h - all_h
+        if filled_h > 0.55:
+            trend = "trending fills"
+        elif filled_h < 0.45:
+            trend = "mean-reverting fills ⚠️"
+        else:
+            trend = "random-walk fills"
+        if diff > 0.02:
+            return f"{trend} (selects high-momentum)"
+        elif diff < -0.02:
+            return f"{trend} (selects low-momentum)"
+        return f"{trend} (neutral selection)"
+
+    best_thresholds: dict[str, float] = {}
+    for asset, df in per_asset_any.items():
+        best = _best_row(df)
+        best_thresholds[asset] = best["threshold"] if best is not None else 0.80
+
+    for asset, sessions in all_sessions.items():
+        if not sessions:
+            continue
+        t = best_thresholds.get(asset, 0.80)
+        h = high_buy_hurst(sessions, threshold=t, min_elapsed_secs=0)
+        diff_str = f"{(h['filled_h'] or 0) - (h['all_h'] or 0):+.4f}" if h["filled_h"] and h["all_h"] else "—"
+        interp = _hurst_interp(h["filled_h"], h["all_h"])
+        lines.append(
+            f"| {asset} (T={t:.2f}) "
+            f"| {h['all_h'] or '—'} "
+            f"| {h['filled_h'] or '—'} "
+            f"| {h['unfilled_h'] or '—'} "
+            f"| {diff_str} "
+            f"| {interp} |"
+        )
+
+    lines += [
+        "",
+        "### Last 2 Min",
+        "",
+        "| Asset | All H | Filled H | Unfilled H | Filled − All | Interpretation |",
+        "|-------|-------|----------|------------|--------------|----------------|",
+    ]
+
+    for asset, sessions in all_sessions.items():
+        if not sessions:
+            continue
+        t = best_thresholds.get(asset, 0.80)
+        h = high_buy_hurst(sessions, threshold=t, min_elapsed_secs=LAST2_SECS)
+        diff_str = f"{(h['filled_h'] or 0) - (h['all_h'] or 0):+.4f}" if h["filled_h"] and h["all_h"] else "—"
+        interp = _hurst_interp(h["filled_h"], h["all_h"])
+        lines.append(
+            f"| {asset} (T={t:.2f}) "
+            f"| {h['all_h'] or '—'} "
+            f"| {h['filled_h'] or '—'} "
+            f"| {h['unfilled_h'] or '—'} "
+            f"| {diff_str} "
+            f"| {interp} |"
+        )
+
+    lines += [""]
+    return lines
+
+
+def write_high_buy_report(all_sessions: dict) -> str:
+    """Generate only report_high_buy.md. Skips all grid searches."""
+    _ensure_reports_dir()
+    lines = _high_buy_section(all_sessions)
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    header = ["# Skeptic Research Report — High-Probability Buy Sweep", f"_Generated: {now}_", ""]
+    content = "\n".join(header + lines)
+    path = os.path.join(config.REPORTS_DIR, "report_high_buy.md")
+    with open(path, "w") as fh:
+        fh.write(content)
+    log.info("Research report written to %s", path)
+    return path
+
+
+def _trigger_timing_section(all_sessions: dict) -> list[str]:
+    """
+    For key thresholds, show win rate and edge per fill bucketed by when the
+    trigger actually fires within the 5-minute window, plus cross-asset analysis.
+    """
+    THRESHOLDS  = [0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
+    SLIPPAGE    = 0.05
+    BUCKET_SECS = 60
+    MIN_FILLS   = 10  # minimum fills for a cell to count in analysis
+
+    bucket_labels = [f"{i*BUCKET_SECS}–{(i+1)*BUCKET_SECS}s" for i in range(5)]
+    header = "| Threshold | " + " | ".join(bucket_labels) + " | Best Window |"
+    sep    = "|-----------|" + "|".join(["----------"] * 5) + "|-------------|"
+
+    lines: list[str] = [
+        "## Trigger Timing Analysis",
+        "",
+        "> Win rate and fill count when the trigger fires in each 60-second bucket of the window.",
+        "> Format: `win% (N fills)`. **Best Window** = bucket with highest win rate (min 10 fills).",
+        f"> {int(SLIPPAGE * 100)}-cent slippage baked in to edge calculations.",
+        "",
+    ]
+
+    # Collect structured data for the analysis section
+    # records[asset][threshold][bucket_label] = {win_rate, edge, n_fills}
+    records: dict = {}
+
+    for asset, sessions in all_sessions.items():
+        if not sessions:
+            continue
+        total_sessions = len(sessions)
+        records[asset] = {}
+        lines += [f"### {asset} ({total_sessions} sessions)", "", header, sep]
+
+        for t in THRESHOLDS:
+            df = analyze_timing_buckets(sessions, threshold=t, bucket_secs=BUCKET_SECS, slippage=SLIPPAGE)
+            records[asset][t] = {}
+            cells: list[str] = []
+            best_win: float = -1.0
+            best_label: str = "—"
+            for _, row in df.iterrows():
+                n = int(row["n_fills"])
+                bl = str(row["bucket_label"])
+                epf = row["edge_per_fill"]
+                eps = (epf * n / total_sessions) if (epf is not None and total_sessions > 0) else None
+                records[asset][t][bl] = {
+                    "n_fills":        n,
+                    "win_rate":       row["win_rate"],
+                    "edge_per_fill":  epf,
+                    "edge_per_session": eps,
+                }
+                if n == 0:
+                    cells.append("—")
+                else:
+                    wr = row["win_rate"]
+                    cells.append(f"{wr:.1%} ({n})")
+                    if wr is not None and n >= MIN_FILLS and wr > best_win:
+                        best_win  = wr
+                        best_label = bl
+            lines.append("| " + f"{t:.2f}" + " | " + " | ".join(cells) + f" | {best_label} |")
+
+        # Edge-per-fill and edge-per-session tables
+        lines += ["", "_Edge/fill  |  Edge/session at each bucket (edge/session = edge/fill × fill_rate):_", ""]
+        edge_header = "| Threshold | " + " | ".join(bucket_labels) + " |"
+        edge_sep    = "|-----------|" + "|".join(["---------- "] * 5) + "|"
+        lines += ["_Edge/fill:_", "", edge_header, edge_sep]
+        for t in THRESHOLDS:
+            cells = []
+            for bl in bucket_labels:
+                e = records[asset][t].get(bl, {}).get("edge_per_fill")
+                n = records[asset][t].get(bl, {}).get("n_fills", 0)
+                cells.append(f"{e:+.4f}" if (e is not None and n >= MIN_FILLS) else "—")
+            lines.append("| " + f"{t:.2f}" + " | " + " | ".join(cells) + " |")
+        lines += ["", "_Edge/session:_", "", edge_header, edge_sep]
+        for t in THRESHOLDS:
+            cells = []
+            for bl in bucket_labels:
+                eps = records[asset][t].get(bl, {}).get("edge_per_session")
+                n   = records[asset][t].get(bl, {}).get("n_fills", 0)
+                cells.append(f"{eps:+.5f}" if (eps is not None and n >= MIN_FILLS) else "—")
+            lines.append("| " + f"{t:.2f}" + " | " + " | ".join(cells) + " |")
+        lines += [""]
+
+    # ── Cross-asset analysis ──────────────────────────────────────────────────
+    if not records:
+        return lines
+
+    # ── Helpers: neighbour-smoothed edge (fill and session) ──────────────────
+    # Averages the bucket with its immediate neighbours to reduce overfitting.
+    def _nb_edge(thresh_data: dict, t: float, idx: int) -> float | None:
+        """Smoothed edge/fill — quality per trade."""
+        indices = [i for i in (idx - 1, idx, idx + 1) if 0 <= i < len(bucket_labels)]
+        vals = []
+        for i in indices:
+            cell = thresh_data.get(t, {}).get(bucket_labels[i], {})
+            if cell.get("n_fills", 0) >= MIN_FILLS and cell.get("edge_per_fill") is not None:
+                vals.append(cell["edge_per_fill"])
+        return sum(vals) / len(vals) if vals else None
+
+    def _nb_edge_session(thresh_data: dict, t: float, idx: int) -> float | None:
+        """Smoothed edge/session — actual P&L impact per window (fill quality × fill rate)."""
+        indices = [i for i in (idx - 1, idx, idx + 1) if 0 <= i < len(bucket_labels)]
+        vals = []
+        for i in indices:
+            cell = thresh_data.get(t, {}).get(bucket_labels[i], {})
+            if cell.get("n_fills", 0) >= MIN_FILLS and cell.get("edge_per_session") is not None:
+                vals.append(cell["edge_per_session"])
+        return sum(vals) / len(vals) if vals else None
+
+    lines += [
+        "---",
+        "",
+        "## Analysis",
+        "",
+        "> All edge figures use **neighbour-smoothed** values: each bucket is averaged with its",
+        "> immediate neighbours (±60 s) to reduce single-bucket overfitting.",
+        "",
+    ]
+
+    # ── 1. Best threshold per bucket, per asset ───────────────────────────────
+    lines += [
+        "### Best Threshold per Bucket (neighbour-smoothed)",
+        "",
+        "> For each 60-second window bucket, which threshold produced the best smoothed edge?",
+        "",
+    ]
+
+    for asset, thresh_data in records.items():
+        lines += [f"#### {asset}", ""]
+        tbl_header = "| Bucket | Best Threshold | Smoothed Edge | Raw Edge | Win Rate | Fills |"
+        tbl_sep    = "|--------|---------------|--------------|----------|----------|-------|"
+        lines += [tbl_header, tbl_sep]
+
+        for idx, bl in enumerate(bucket_labels):
+            best_t_nb: float | None = None
+            best_nb_e: float = float("-inf")
+            for t in THRESHOLDS:
+                nb_e = _nb_edge(thresh_data, t, idx)
+                if nb_e is not None and nb_e > best_nb_e:
+                    best_nb_e = nb_e
+                    best_t_nb = t
+
+            if best_t_nb is None:
+                lines.append(f"| {bl} | — | — | — | — | — |")
+            else:
+                cell = thresh_data.get(best_t_nb, {}).get(bl, {})
+                raw_e = cell.get("edge_per_fill")
+                wr    = cell.get("win_rate")
+                n     = cell.get("n_fills", 0)
+                be    = best_t_nb + SLIPPAGE
+                raw_str = f"{raw_e:+.4f}" if raw_e is not None and n >= MIN_FILLS else "—"
+                wr_str  = f"{wr:.1%}" if wr is not None and n >= MIN_FILLS else "—"
+                lines.append(
+                    f"| {bl} | **T={best_t_nb:.2f}** | {best_nb_e:+.4f} "
+                    f"| {raw_str} | {wr_str} | {n} |"
+                )
+        lines += [""]
+
+    # ── 2. Buckets to avoid per asset ─────────────────────────────────────────
+    lines += [
+        "### Buckets to Avoid per Asset",
+        "",
+        "> A bucket is flagged as **avoid** when its best smoothed edge across all thresholds is",
+        "> still negative (no threshold is reliably profitable in that window).",
+        "",
+    ]
+
+    for asset, thresh_data in records.items():
+        avoid_buckets: list[str] = []
+        trade_buckets: list[tuple[str, float, float]] = []  # (bucket, best_t, smoothed_edge)
+
+        for idx, bl in enumerate(bucket_labels):
+            best_nb_e = float("-inf")
+            best_t_here: float | None = None
+            for t in THRESHOLDS:
+                nb_e = _nb_edge(thresh_data, t, idx)
+                if nb_e is not None and nb_e > best_nb_e:
+                    best_nb_e = nb_e
+                    best_t_here = t
+
+            if best_t_here is None or best_nb_e <= 0:
+                avoid_buckets.append(bl)
+            else:
+                trade_buckets.append((bl, best_t_here, best_nb_e))
+
+        if avoid_buckets:
+            lines.append(f"**{asset}** — avoid: {', '.join(f'`{b}`' for b in avoid_buckets)}")
+        else:
+            lines.append(f"**{asset}** — all buckets show positive smoothed edge (no avoid zones)")
+
+        if trade_buckets:
+            trade_strs = [f"`{bl}` T={t:.2f} ({e:+.4f})" for bl, t, e in trade_buckets]
+            lines.append(f"  Trade zones: {', '.join(trade_strs)}")
+        lines += [""]
+
+    # ── 3. Actionable trading recommendation per asset ───────────────────────
+    lines += [
+        "### Trading Recommendation per Asset",
+        "",
+        "> Plain-English strategy for each asset based on smoothed bucket analysis.",
+        "> Format: what threshold to use in each bucket, and which to skip.",
+        "",
+    ]
+
+    for asset, thresh_data in records.items():
+        lines += [f"#### {asset}", ""]
+
+        steps: list[str] = []
+        for idx, bl in enumerate(bucket_labels):
+            # Find best and worst thresholds for this bucket (smoothed)
+            bucket_nb: list[tuple[float, float]] = []  # (threshold, smoothed_edge)
+            for t in THRESHOLDS:
+                nb_e = _nb_edge(thresh_data, t, idx)
+                if nb_e is not None:
+                    bucket_nb.append((t, nb_e))
+
+            if not bucket_nb:
+                steps.append(f"- **{bl}** — Skip (no fills)")
+                continue
+
+            bucket_nb.sort(key=lambda x: x[1], reverse=True)
+            best_t_b, best_nb_e = bucket_nb[0]
+            worst_t_b, worst_nb_e = bucket_nb[-1]
+
+            if best_nb_e <= 0:
+                # Even best threshold is negative — skip
+                steps.append(
+                    f"- **{bl}** — ⛔ Skip  "
+                    f"(best smoothed edge is still {best_nb_e:+.4f} at T={best_t_b:.2f})"
+                )
+            else:
+                cell = thresh_data.get(best_t_b, {}).get(bl, {})
+                wr   = cell.get("win_rate")
+                n    = cell.get("n_fills", 0)
+                be   = best_t_b + SLIPPAGE
+                wr_str = f"{wr:.1%}" if wr is not None and n >= MIN_FILLS else "?"
+                delta_str = f"{best_nb_e:+.4f}"
+
+                # Warn if best and worst are far apart (cherry-pick risk)
+                spread = best_nb_e - worst_nb_e
+                note = ""
+                if spread > 0.04:
+                    note = "  ⚠️ High threshold sensitivity — smoothed edge varies widely"
+
+                steps.append(
+                    f"- **{bl}** — ✅ Use T={best_t_b:.2f}  "
+                    f"(smoothed edge {delta_str}, win {wr_str} vs {be:.0%} B/E, {n} fills){note}"
+                )
+
+                # Mention if a lower threshold is nearly as good (more fills, similar edge)
+                for t2, e2 in bucket_nb[1:]:
+                    if e2 > 0 and e2 >= best_nb_e * 0.85:
+                        cell2 = thresh_data.get(t2, {}).get(bl, {})
+                        n2 = cell2.get("n_fills", 0)
+                        if n2 > n * 1.5:  # meaningfully more fills
+                            steps.append(
+                                f"  _Alt: T={t2:.2f} gives similar smoothed edge ({e2:+.4f}) "
+                                f"with {n2} fills — better fill rate_"
+                            )
+                            break
+
+        lines += steps + [""]
+
+    return lines
+
+
+def write_trigger_timing_report(all_sessions: dict) -> str:
+    """Generate report_trigger_timing.md — win rate by elapsed seconds at trigger."""
+    _ensure_reports_dir()
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    header = ["# Skeptic Research Report — Trigger Timing Analysis", f"_Generated: {now}_", ""]
+    content = "\n".join(header + _trigger_timing_section(all_sessions))
+    path = os.path.join(config.REPORTS_DIR, "report_trigger_timing.md")
+    with open(path, "w") as fh:
+        fh.write(content)
+    log.info("Trigger timing report written to %s", path)
+    return path
