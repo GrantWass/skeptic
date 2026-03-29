@@ -28,7 +28,7 @@ from rich.console import Console
 
 from skeptic import config
 from skeptic.clients import gamma as gamma_client
-from skeptic.clients.ws import BookData, MarketChannel
+from skeptic.clients.ws import MarketChannel
 from skeptic.models.market import Market
 from skeptic.utils.time import (
     current_window_start,
@@ -96,8 +96,8 @@ async def collect_window(
 
             ts = int(now)
             for market in markets:
-                up_price = market_ws.price_cache.get(market.up_token.token_id)
-                down_price = market_ws.price_cache.get(market.down_token.token_id)
+                up_price = market_ws.price_cache.get_mid(market.up_token.token_id)
+                down_price = market_ws.price_cache.get_mid(market.down_token.token_id)
 
                 if up_price is not None or down_price is not None:
                     up_book = market_ws.price_cache.get_book(market.up_token.token_id)
@@ -139,8 +139,8 @@ async def collect_window(
                 remaining = int(window_end - now)
                 price_lines = []
                 for market in markets:
-                    up = market_ws.price_cache.get(market.up_token.token_id)
-                    dn = market_ws.price_cache.get(market.down_token.token_id)
+                    up = market_ws.price_cache.get_mid(market.up_token.token_id)
+                    dn = market_ws.price_cache.get_mid(market.down_token.token_id)
                     up_str = f"{up:.3f}" if up is not None else "?"
                     dn_str = f"{dn:.3f}" if dn is not None else "?"
                     price_lines.append(f"{market.asset} ↑{up_str}/↓{dn_str}")
@@ -265,18 +265,8 @@ async def _seed_price(token_id: str, http: httpx.AsyncClient, market_ws: MarketC
         data = resp.json()
         bids = data.get("bids") or []
         asks = data.get("asks") or []
-        bid = float(bids[-1]["price"]) if bids else None
-        ask = float(asks[-1]["price"]) if asks else None
-        if bid and ask:
-            market_ws.price_cache.update(token_id, (bid + ask) / 2)
-        elif bid:
-            market_ws.price_cache.update(token_id, bid)
-        elif ask:
-            market_ws.price_cache.update(token_id, ask)
         if bids or asks:
-            bid_vol = sum(float(b.get("size", 0)) for b in bids)
-            ask_vol = sum(float(a.get("size", 0)) for a in asks)
-            market_ws.price_cache.update_book(token_id, BookData(bid, ask, bid_vol, ask_vol))
+            market_ws.price_cache.snapshot(token_id, bids, asks)
     except Exception:
         pass
 
