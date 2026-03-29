@@ -69,6 +69,8 @@ def parse_args() -> argparse.Namespace:
                    help="Step size for fill window sweep (default: 10).")
     p.add_argument("--no-cache", action="store_true",
                    help="Force re-run grid search even if a cached result exists.")
+    p.add_argument("--high-buy-only", action="store_true",
+                   help="Generate only report_high_buy.md (fast — skips all grid searches).")
     return p.parse_args()
 
 
@@ -110,6 +112,15 @@ async def main(args: argparse.Namespace) -> None:
                 f"[yellow]Warning: only {total} sessions. Results may not be statistically meaningful.\n"
                 f"Consider running paper mode first to accumulate more data.[/yellow]\n"
             )
+
+    # ── Fast path: high-buy report only ──────────────────────────────────────
+    if args.high_buy_only:
+        report_path = reporter.write_high_buy_report(all_sessions)
+        timing_path = reporter.write_trigger_timing_report(all_sessions)
+        console.print("\n[bold green]Done![/bold green]")
+        console.print(f"  Report:  {report_path}")
+        console.print(f"  Timing:  {timing_path}")
+        return
 
     # Determine whether to do a 3D sweep or a single fill-window search
     _fw_min = args.fill_window_min
