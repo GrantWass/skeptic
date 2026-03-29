@@ -28,7 +28,7 @@ from rich.console import Console
 
 from skeptic import config
 from skeptic.clients import gamma as gamma_client
-from skeptic.clients.ws import MarketChannel
+from skeptic.clients.ws import BookData, MarketChannel
 from skeptic.models.market import Market
 from skeptic.utils.time import (
     current_window_start,
@@ -54,7 +54,12 @@ def ensure_csv(path: Path) -> bool:
     if not path.exists():
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["ts", "window_ts", "asset", "up_price", "down_price"])
+            writer.writerow([
+                "ts", "window_ts", "asset",
+                "up_price", "down_price",
+                "up_bid", "up_ask", "up_spread", "up_imbalance",
+                "dn_bid", "dn_ask", "dn_spread", "dn_imbalance",
+            ])
         return True
     return False
 
@@ -95,12 +100,29 @@ async def collect_window(
                 down_price = market_ws.price_cache.get(market.down_token.token_id)
 
                 if up_price is not None or down_price is not None:
+                    up_book = market_ws.price_cache.get_book(market.up_token.token_id)
+                    dn_book = market_ws.price_cache.get_book(market.down_token.token_id)
+
+                    def _fmt(v) -> str:
+                        return f"{v:.4f}" if v is not None else ""
+
+                    def _imbalance(book) -> str:
+                        if book is None:
+                            return ""
+                        total = book.bid_volume + book.ask_volume
+                        return f"{book.bid_volume / total:.4f}" if total > 0 else ""
+
                     pending.append([
-                        ts,
-                        window_ts,
-                        market.asset,
-                        f"{up_price:.4f}" if up_price is not None else "",
-                        f"{down_price:.4f}" if down_price is not None else "",
+                        ts, window_ts, market.asset,
+                        _fmt(up_price), _fmt(down_price),
+                        _fmt(up_book.bid if up_book else None),
+                        _fmt(up_book.ask if up_book else None),
+                        _fmt((up_book.ask - up_book.bid) if up_book and up_book.bid and up_book.ask else None),
+                        _imbalance(up_book),
+                        _fmt(dn_book.bid if dn_book else None),
+                        _fmt(dn_book.ask if dn_book else None),
+                        _fmt((dn_book.ask - dn_book.bid) if dn_book and dn_book.bid and dn_book.ask else None),
+                        _imbalance(dn_book),
                     ])
                     rows_written += 1
 
@@ -251,6 +273,10 @@ async def _seed_price(token_id: str, http: httpx.AsyncClient, market_ws: MarketC
             market_ws.price_cache.update(token_id, bid)
         elif ask:
             market_ws.price_cache.update(token_id, ask)
+        if bids or asks:
+            bid_vol = sum(float(b.get("size", 0)) for b in bids)
+            ask_vol = sum(float(a.get("size", 0)) for a in asks)
+            market_ws.price_cache.update_book(token_id, BookData(bid, ask, bid_vol, ask_vol))
     except Exception:
         pass
 

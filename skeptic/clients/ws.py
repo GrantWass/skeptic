@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, NamedTuple
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -25,17 +25,31 @@ logger = logging.getLogger(__name__)
 FillCallback = Callable[[Fill], Awaitable[None]]
 
 
+class BookData(NamedTuple):
+    bid: float | None
+    ask: float | None
+    bid_volume: float   # sum of all bid sizes in the book
+    ask_volume: float   # sum of all ask sizes in the book
+
+
 class PriceCache:
     """Thread-safe (asyncio-safe) price cache keyed by token_id."""
 
     def __init__(self) -> None:
         self._prices: dict[str, float] = {}
+        self._books: dict[str, BookData] = {}
 
     def update(self, token_id: str, price: float) -> None:
         self._prices[token_id] = price
 
+    def update_book(self, token_id: str, book: BookData) -> None:
+        self._books[token_id] = book
+
     def get(self, token_id: str) -> float | None:
         return self._prices.get(token_id)
+
+    def get_book(self, token_id: str) -> BookData | None:
+        return self._books.get(token_id)
 
     def midpoint(self, token_id: str, bid: float | None, ask: float | None) -> float | None:
         if bid is not None and ask is not None:
@@ -258,6 +272,15 @@ class MarketChannel:
                     self.price_cache.update(asset_id, mid)
                 elif price is not None:
                     self.price_cache.update(asset_id, price)
+
+                # Store book depth for spread / imbalance whenever full book arrives
+                if bids or asks:
+                    try:
+                        bid_vol = sum(float(b.get("size", 0)) for b in bids)
+                        ask_vol = sum(float(a.get("size", 0)) for a in asks)
+                        self.price_cache.update_book(asset_id, BookData(bid, ask, bid_vol, ask_vol))
+                    except Exception:
+                        pass
 
     def stop(self) -> None:
         self._running = False
