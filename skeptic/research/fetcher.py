@@ -158,6 +158,7 @@ def load_from_price_files(
     assets: list[str],
     prices_dir: str = "data/prices",
     min_points: int = 280,
+    last_days: int | None = None,
 ) -> dict[str, list[HistoricalSession]]:
     """
     Build HistoricalSession objects from the per-second price CSV files
@@ -177,6 +178,8 @@ def load_from_price_files(
         return result
 
     csv_files = sorted(prices_path.glob("prices_*.csv"))
+    if last_days is not None:
+        csv_files = csv_files[-last_days:]
     if not csv_files:
         log.warning("No price CSV files found in %s", prices_dir)
         return result
