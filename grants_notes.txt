@@ -1,5 +1,6 @@
 python scripts/research.py --from-prices --capital 500 --position-size 0.05
 python scripts/research.py --from-prices --fill-window-min 10 --fill-window-max 60 --fill-window-step 10
+python scripts/research.py --from-prices --high-buy-only
 
 streamlit run scripts/dashboard/__main__.py
 
@@ -18,3 +19,13 @@ python scripts/bootstrap.py --from-prices --fill-window-min 10 --fill-window-max
 
 
 ./data/zip_prices.sh
+
+
+python scripts/live_high_buy.py --threshold 0.78 --assets DOGE --name doge
+python scripts/live_high_buy.py --threshold 0.74 --assets BTC  --name btc
+
+python scripts/audit_slippage.py
+
+# Last 2 minutes only
+python scripts/live_high_buy.py --threshold 0.74 --assets BTC --cutoff 180 --name btchigh
+

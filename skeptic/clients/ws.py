@@ -33,28 +33,64 @@ class BookData(NamedTuple):
 
 
 class PriceCache:
-    """Thread-safe (asyncio-safe) price cache keyed by token_id."""
+    """
+    Per-token order book maintained from book snapshots + price_change deltas.
+
+    _bids / _asks: token_id → {price_float → size_float}
+    Size == 0 means the level is removed from the book.
+    """
 
     def __init__(self) -> None:
-        self._prices: dict[str, float] = {}
-        self._books: dict[str, BookData] = {}
+        self._bids: dict[str, dict[float, float]] = {}
+        self._asks: dict[str, dict[float, float]] = {}
 
-    def update(self, token_id: str, price: float) -> None:
-        self._prices[token_id] = price
+    def snapshot(self, token_id: str, bids: list[dict], asks: list[dict]) -> None:
+        """Replace the full book from a book snapshot message."""
+        self._bids[token_id] = {
+            float(b["price"]): float(b["size"])
+            for b in bids
+            if float(b.get("size", 0)) > 0
+        }
+        self._asks[token_id] = {
+            float(a["price"]): float(a["size"])
+            for a in asks
+            if float(a.get("size", 0)) > 0
+        }
 
-    def update_book(self, token_id: str, book: BookData) -> None:
-        self._books[token_id] = book
+    def apply_change(self, token_id: str, side: str, price: str, size: float) -> None:
+        """Apply a single price-level delta from a price_change message."""
+        book = self._bids if side.upper() == "BUY" else self._asks
+        levels = book.setdefault(token_id, {})
+        fp = float(price)
+        if size <= 0:
+            levels.pop(fp, None)
+        else:
+            levels[fp] = size
 
-    def get(self, token_id: str) -> float | None:
-        return self._prices.get(token_id)
+    def get_bid(self, token_id: str) -> float | None:
+        levels = self._bids.get(token_id)
+        return max(levels) if levels else None
 
-    def get_book(self, token_id: str) -> BookData | None:
-        return self._books.get(token_id)
+    def get_ask(self, token_id: str) -> float | None:
+        levels = self._asks.get(token_id)
+        return min(levels) if levels else None
 
-    def midpoint(self, token_id: str, bid: float | None, ask: float | None) -> float | None:
+    def get_mid(self, token_id: str) -> float | None:
+        bid = self.get_bid(token_id)
+        ask = self.get_ask(token_id)
         if bid is not None and ask is not None:
             return (bid + ask) / 2.0
-        return bid or ask or self._prices.get(token_id)
+        return ask or bid
+
+    def get_book(self, token_id: str) -> BookData | None:
+        """Return BookData with best bid/ask and total depth, or None if no book yet."""
+        bids = self._bids.get(token_id, {})
+        asks = self._asks.get(token_id, {})
+        if not bids and not asks:
+            return None
+        bid = max(bids) if bids else None
+        ask = min(asks) if asks else None
+        return BookData(bid, ask, sum(bids.values()), sum(asks.values()))
 
 
 class UserChannel:
@@ -168,7 +204,7 @@ class UserChannel:
 class MarketChannel:
     """
     Subscribes to the Polymarket market WebSocket channel for live price data.
-    Maintains a PriceCache with the latest mid-prices per token.
+    Maintains a PriceCache with the full order book per token.
     """
 
     def __init__(self) -> None:
@@ -176,6 +212,14 @@ class MarketChannel:
         self._subscribed_tokens: set[str] = set()
         self._ws = None
         self._running = False
+
+    def get_price(self, token_id: str) -> float | None:
+        """Return book mid-price (for display)."""
+        return self.price_cache.get_mid(token_id)
+
+    def get_ask(self, token_id: str) -> float | None:
+        """Return best ask (what you'd actually pay to buy)."""
+        return self.price_cache.get_ask(token_id)
 
     async def subscribe(self, *token_ids: str) -> None:
         for tid in token_ids:
@@ -247,40 +291,30 @@ class MarketChannel:
                 continue
 
             event_type = msg.get("event_type") or msg.get("type", "")
+            asset_id = msg.get("asset_id", "")
 
-            if event_type in ("book", "price_change", "last_trade_price"):
-                asset_id = msg.get("asset_id", "")
+            if event_type == "book":
                 if not asset_id:
                     continue
-
-                def to_float(v) -> float | None:
-                    try:
-                        return float(v) if v not in (None, "", "0") else None
-                    except (ValueError, TypeError):
-                        return None
-
-                # "book" messages send full bids/asks arrays sorted ascending by price.
-                # Best bid = highest bid = last element; best ask = lowest ask = last element.
                 bids = msg.get("bids") or []
                 asks = msg.get("asks") or []
-                bid = to_float(bids[-1]["price"]) if bids else to_float(msg.get("best_bid"))
-                ask = to_float(asks[-1]["price"]) if asks else to_float(msg.get("best_ask"))
-                price = to_float(msg.get("price") or msg.get("last_trade_price"))
+                self.price_cache.snapshot(asset_id, bids, asks)
 
-                mid = self.price_cache.midpoint(asset_id, bid, ask)
-                if mid is not None:
-                    self.price_cache.update(asset_id, mid)
-                elif price is not None:
-                    self.price_cache.update(asset_id, price)
-
-                # Store book depth for spread / imbalance whenever full book arrives
-                if bids or asks:
+            elif event_type == "price_change":
+                if not asset_id:
+                    continue
+                for change in msg.get("changes") or []:
+                    price = change.get("price", "")
+                    side  = change.get("side", "")
                     try:
-                        bid_vol = sum(float(b.get("size", 0)) for b in bids)
-                        ask_vol = sum(float(a.get("size", 0)) for a in asks)
-                        self.price_cache.update_book(asset_id, BookData(bid, ask, bid_vol, ask_vol))
-                    except Exception:
-                        pass
+                        size = float(change.get("size", 0))
+                    except (ValueError, TypeError):
+                        size = 0.0
+                    if price and side:
+                        self.price_cache.apply_change(asset_id, side, price, size)
+
+            # last_trade_price is ignored: arrives independently for each token at
+            # different times, causing UP+DOWN sums far from 1.0.
 
     def stop(self) -> None:
         self._running = False

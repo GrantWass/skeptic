@@ -10,8 +10,9 @@ WS_USER_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 # --- Auth ---
-PRIVATE_KEY: str = os.environ["PRIVATE_KEY"]
-WALLET_ADDRESS: str = os.environ["WALLET_ADDRESS"]
+# Prefer TRADING_* keys if present (separate trading wallet), else fall back to PRIVATE_KEY/WALLET_ADDRESS
+PRIVATE_KEY: str = os.environ.get("TRADING_PRIVATE_KEY") or os.environ["PRIVATE_KEY"]
+WALLET_ADDRESS: str = os.environ.get("TRADING_ADDRESS") or os.environ["WALLET_ADDRESS"]
 CLOB_API_KEY: str = os.getenv("CLOB_API_KEY", "")
 CLOB_SECRET: str = os.getenv("CLOB_SECRET", "")
 CLOB_PASSPHRASE: str = os.getenv("CLOB_PASSPHRASE", "")
@@ -29,7 +30,7 @@ WINDOW_SECS: int = 300        # 5-minute windows
 
 # Available 5-min assets on Polymarket: BTC, ETH, SOL, DOGE, XRP, BNB, HYPE
 # --- Assets to trade/research ---
-ASSETS: list[str] = ["BTC", "ETH", "SOL", "DOGE", "HYPE"]
+ASSETS: list[str] = ["BTC", "ETH", "SOL", "DOGE", "HYPE", "XRP", "BNB"]
 
 # --- Paths ---
 CREDS_FILE = ".creds.json"

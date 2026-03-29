@@ -20,6 +20,8 @@ from skeptic.research.fetcher import HistoricalSession
 log = logging.getLogger(__name__)
 
 
+
+
 @dataclass
 class ThresholdResult:
     buy: float
@@ -601,64 +603,355 @@ def best_neighborhood_params(
 def analyze_high_buy(
     sessions: list[HistoricalSession],
     threshold: float = 0.90,
+    min_elapsed_secs: int = 0,
+    max_elapsed_secs: int = 300,
+    slippage: float = 0.03,
 ) -> dict:
     """
-    For sessions where UP or DOWN price ever traded at or above `threshold`,
+    For sessions where UP or DOWN price traded at or above `threshold`,
     compute fill rate, win rate, and edge.
 
-    Payoff model: buy at `threshold`, win (1 - threshold) if that side resolves,
-    lose `threshold` otherwise.
-    """
-    win_payout = round(1.0 - threshold, 6)
-    lose_payout = -threshold
+    min_elapsed_secs: only consider touches that occur >= this many seconds
+    into the window (e.g. 180 = last 2 minutes of a 5-minute window).
 
-    up_fills = up_wins = up_losses = 0
-    dn_fills = dn_wins = dn_losses = 0
+    max_elapsed_secs: ignore touches that occur >= this many seconds into
+    the window (e.g. 270 = exclude last 30 seconds). Default 300 = no cap.
+
+    slippage: assumed fill cost above threshold (default 0.03 = 3 cents).
+
+    Payoff model (per share):
+      - Any-time mode (min_elapsed_secs=0): effective fill = threshold + slippage.
+        Slippage covers the gap between threshold and actual fill.
+      - Late-window mode (min_elapsed_secs>0): effective fill = actual trigger price.
+        The price is already elevated at the cutoff; use it directly, no extra slippage.
+      Win: +(1 - effective_price)   Lose: -effective_price
+    """
+    late_window = min_elapsed_secs > 0
+    fills = wins = losses = 0
+    total_pnl = 0.0
 
     for s in sessions:
         if not s.up_trades_all:
             continue
 
-        up_touched = any(p >= threshold for _, p in s.up_trades_all)
-        dn_touched = any(p >= threshold for _, p in s.down_trades_all)
+        cutoff_ts = s.window_start_ts + min_elapsed_secs
+        max_ts    = s.window_start_ts + max_elapsed_secs
 
-        if up_touched and s.up_resolution is not None:
-            up_fills += 1
-            if s.up_resolution >= 0.9:
-                up_wins += 1
-            else:
-                up_losses += 1
+        up_hit = next(((ts, p) for ts, p in s.up_trades_all   if p >= threshold and cutoff_ts <= ts < max_ts), None)
+        dn_hit = next(((ts, p) for ts, p in s.down_trades_all if p >= threshold and cutoff_ts <= ts < max_ts), None)
 
-        if dn_touched and s.down_resolution is not None:
-            dn_fills += 1
-            if s.down_resolution >= 0.9:
-                dn_wins += 1
-            else:
-                dn_losses += 1
+        if up_hit is None and dn_hit is None:
+            continue
+
+        # Was price already above threshold before the late-window cutoff?
+        up_pre = late_window and any(p >= threshold for ts, p in s.up_trades_all   if ts < cutoff_ts)
+        dn_pre = late_window and any(p >= threshold for ts, p in s.down_trades_all if ts < cutoff_ts)
+
+        # Take whichever side triggers first; if tied, take UP
+        if up_hit is not None and (dn_hit is None or up_hit[0] <= dn_hit[0]):
+            resolution    = s.up_resolution
+            trigger_price = up_hit[1]
+            already_above = up_pre
+        else:
+            assert dn_hit is not None
+            resolution    = s.down_resolution
+            trigger_price = dn_hit[1]
+            already_above = dn_pre
+
+        if resolution is None:
+            continue
+
+        # Use actual trigger price only when price was already elevated at cutoff;
+        # fresh crossings during the late window get threshold + slippage like any-time.
+        effective_price = round(trigger_price if already_above else threshold + slippage, 6)
+        pnl = round(1.0 - effective_price if resolution >= 0.9 else -effective_price, 6)
+
+        fills     += 1
+        total_pnl += pnl
+        if resolution >= 0.9:
+            wins += 1
+        else:
+            losses += 1
 
     n = len(sessions)
 
-    def _stats(fills: int, wins: int, losses: int) -> dict:
-        if fills == 0:
-            return {"fill_rate": 0.0, "win_rate": None, "edge_per_fill": None, "edge_per_session": 0.0}
-        win_rate = wins / fills
-        edge_per_fill = win_rate * win_payout + (1 - win_rate) * lose_payout
+    if fills == 0:
         return {
-            "fill_rate": round(fills / n, 4),
-            "win_rate": round(win_rate, 4),
-            "edge_per_fill": round(edge_per_fill, 6),
-            "edge_per_session": round(edge_per_fill * fills / n, 6),
-            "n_fills": fills,
-            "n_wins": wins,
-            "n_losses": losses,
+            "n_sessions": n, "threshold": threshold,
+            "fill_rate": 0.0, "win_rate": None,
+            "edge_per_fill": None, "edge_per_session": 0.0,
+            "n_fills": 0, "n_wins": 0, "n_losses": 0,
         }
 
     return {
-        "n_sessions": n,
-        "threshold": threshold,
-        "up": _stats(up_fills, up_wins, up_losses),
-        "down": _stats(dn_fills, dn_wins, dn_losses),
+        "n_sessions":      n,
+        "threshold":       threshold,
+        "n_fills":         fills,
+        "n_wins":          wins,
+        "n_losses":        losses,
+        "fill_rate":       round(fills / n, 4),
+        "win_rate":        round(wins / fills, 4),
+        "edge_per_fill":   round(total_pnl / fills, 6),
+        "edge_per_session": round(total_pnl / n, 6),
     }
+
+
+def sweep_high_buy(
+    sessions: list[HistoricalSession],
+    thresholds: list[float] | None = None,
+    min_elapsed_secs: int = 0,
+    max_elapsed_secs: int = 300,
+    slippage: float = 0.03,
+) -> pd.DataFrame:
+    """
+    Sweep analyze_high_buy over a range of thresholds (both UP and DOWN combined).
+    Returns a DataFrame with one row per threshold, sorted by edge_per_session desc.
+    """
+    if thresholds is None:
+        thresholds = [round(t / 100, 2) for t in range(65, 97, 5)]
+
+    rows = []
+    for t in thresholds:
+        r = analyze_high_buy(sessions, threshold=t, min_elapsed_secs=min_elapsed_secs, max_elapsed_secs=max_elapsed_secs, slippage=slippage)
+        rows.append({
+            "threshold": t,
+            "n_sessions": r["n_sessions"],
+            "n_fills": r.get("n_fills", 0),
+            "fill_rate": r["fill_rate"],
+            "win_rate": r["win_rate"],
+            "edge_per_fill": r["edge_per_fill"],
+            "edge_per_session": r["edge_per_session"],
+        })
+
+    df = pd.DataFrame(rows)
+    return df.sort_values("edge_per_session", ascending=False).reset_index(drop=True)
+
+
+def grid_search_high_buy(
+    sessions: list[HistoricalSession],
+    thresholds: list[float] | None = None,
+    cutoffs: list[int] | None = None,
+    slippage: float = 0.05,
+) -> pd.DataFrame:
+    """
+    2-D grid search over threshold × window-cutoff (min_elapsed_secs).
+    Returns a DataFrame with columns: threshold, cutoff_secs, edge_per_session,
+    win_rate, fill_rate, n_fills — one row per (threshold, cutoff) pair.
+    """
+    if thresholds is None:
+        thresholds = [round(t / 100, 2) for t in range(65, 97, 5)]
+    if cutoffs is None:
+        cutoffs = list(range(0, 271, 30))  # 0s, 30s, 60s … 270s
+
+    rows = []
+    for cutoff in cutoffs:
+        for t in thresholds:
+            r = analyze_high_buy(sessions, threshold=t, min_elapsed_secs=cutoff, slippage=slippage)
+            rows.append({
+                "threshold":       t,
+                "cutoff_secs":     cutoff,
+                "edge_per_session": r["edge_per_session"],
+                "win_rate":        r["win_rate"],
+                "fill_rate":       r["fill_rate"],
+                "n_fills":         r.get("n_fills", 0),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def high_buy_time_series(
+    sessions: list[HistoricalSession],
+    threshold: float,
+) -> pd.DataFrame:
+    """
+    Run the high-buy strategy at `threshold` chronologically and return a day-by-day DataFrame.
+
+    Columns: date, n_sessions, n_fills, n_wins, n_losses, pnl, cumulative_pnl
+    One fill per session max (first side to touch threshold).
+    """
+    from datetime import datetime, timezone as _tz
+
+    win_payout  =  round(1.0 - threshold, 6)
+    lose_payout = -threshold
+
+    rows = []
+    for s in sorted(sessions, key=lambda s: s.window_start_ts):
+        date = datetime.fromtimestamp(s.window_start_ts, tz=_tz.utc).strftime("%Y-%m-%d")
+        up_ts = next((ts for ts, p in s.up_trades_all   if p >= threshold), None)
+        dn_ts = next((ts for ts, p in s.down_trades_all if p >= threshold), None)
+
+        if up_ts is None and dn_ts is None:
+            rows.append({"date": date, "fill": False, "win": None, "pnl": 0.0})
+            continue
+
+        if up_ts is not None and (dn_ts is None or up_ts <= dn_ts):
+            resolution = s.up_resolution
+        else:
+            resolution = s.down_resolution
+
+        if resolution is None:
+            rows.append({"date": date, "fill": False, "win": None, "pnl": 0.0})
+            continue
+
+        win = resolution >= 0.9
+        rows.append({"date": date, "fill": True, "win": win, "pnl": win_payout if win else lose_payout})
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "n_sessions", "n_fills", "n_wins", "n_losses", "pnl", "cumulative_pnl"])
+
+    df = pd.DataFrame(rows)
+    daily = (
+        df.groupby("date")
+        .agg(
+            n_sessions=("fill", "count"),
+            n_fills=("fill", "sum"),
+            n_wins=("win", lambda x: (x == True).sum()),   # noqa: E712
+            n_losses=("win", lambda x: (x == False).sum()),
+            pnl=("pnl", "sum"),
+        )
+        .reset_index()
+    )
+    daily["cumulative_pnl"] = daily["pnl"].cumsum()
+    return daily
+
+
+def hurst_exponent(prices: list[float]) -> float | None:
+    """
+    Estimate the Hurst exponent via R/S analysis.
+
+    H > 0.5  →  trending (momentum): high prices beget higher prices
+    H ≈ 0.5  →  random walk: no memory
+    H < 0.5  →  mean-reverting: prices return to the mean
+
+    Returns None if the series is too short or constant.
+    """
+    n = len(prices)
+    if n < 10:
+        return None
+    arr = np.array(prices, dtype=float)
+    s = arr.std()
+    if s == 0:
+        return None
+    cumdev = np.cumsum(arr - arr.mean())
+    rs = (cumdev.max() - cumdev.min()) / s
+    if rs <= 0:
+        return None
+    return float(np.log(rs) / np.log(n))
+
+
+def high_buy_hurst(
+    sessions: list[HistoricalSession],
+    threshold: float,
+    min_elapsed_secs: int = 0,
+) -> dict:
+    """
+    Compute mean Hurst exponent for UP and DOWN price series, split by whether
+    the session triggered a high-buy fill at `threshold`.
+
+    Returns a dict with keys:
+        all_h, filled_h, unfilled_h  (mean H across sessions in each group)
+        n_all, n_filled, n_unfilled
+    Interpretation: if filled_h > unfilled_h the strategy is catching trending
+    sessions; if filled_h < all_h prices are mean-reverting when they spike.
+    """
+    all_h: list[float] = []
+    filled_h: list[float] = []
+    unfilled_h: list[float] = []
+
+    for s in sessions:
+        prices = [p for _, p in s.up_trades_all] + [p for _, p in s.down_trades_all]
+        h = hurst_exponent(prices)
+        if h is None:
+            continue
+        all_h.append(h)
+
+        cutoff_ts = s.window_start_ts + min_elapsed_secs
+        up_ts = next((ts for ts, p in s.up_trades_all   if p >= threshold and ts >= cutoff_ts), None)
+        dn_ts = next((ts for ts, p in s.down_trades_all if p >= threshold and ts >= cutoff_ts), None)
+        filled = up_ts is not None or dn_ts is not None
+
+        if filled:
+            filled_h.append(h)
+        else:
+            unfilled_h.append(h)
+
+    def _mean(lst: list[float]) -> float | None:
+        return round(float(np.mean(lst)), 4) if lst else None
+
+    return {
+        "n_all":      len(all_h),
+        "n_filled":   len(filled_h),
+        "n_unfilled": len(unfilled_h),
+        "all_h":      _mean(all_h),
+        "filled_h":   _mean(filled_h),
+        "unfilled_h": _mean(unfilled_h),
+    }
+
+
+def analyze_timing_buckets(
+    sessions: list[HistoricalSession],
+    threshold: float,
+    bucket_secs: int = 60,
+    slippage: float = 0.05,
+) -> pd.DataFrame:
+    """
+    For sessions where a trigger fires at `threshold`, bucket by elapsed seconds
+    at trigger time and compute win rate / edge per bucket.
+
+    Returns a DataFrame with columns:
+      bucket_start, bucket_end, bucket_label, n_fills, n_wins,
+      fill_rate, win_rate, edge_per_fill
+    """
+    n_buckets = 300 // bucket_secs
+    counts = [{"n_fills": 0, "n_wins": 0} for _ in range(n_buckets)]
+
+    for s in sessions:
+        max_ts = s.window_start_ts + 300  # stay within the 5-minute window
+        up_ts = next((ts for ts, p in s.up_trades_all   if p >= threshold and ts < max_ts), None)
+        dn_ts = next((ts for ts, p in s.down_trades_all if p >= threshold and ts < max_ts), None)
+
+        if up_ts is None and dn_ts is None:
+            continue
+
+        if up_ts is not None and (dn_ts is None or up_ts <= dn_ts):
+            trigger_ts: int = up_ts
+            resolution = s.up_resolution
+        else:
+            assert dn_ts is not None
+            trigger_ts = dn_ts
+            resolution = s.down_resolution
+
+        if resolution is None:
+            continue  # match analyze_high_buy: skip unresolvable sessions
+
+        elapsed = trigger_ts - s.window_start_ts
+        idx = min(int(elapsed // bucket_secs), n_buckets - 1)
+        counts[idx]["n_fills"] += 1
+        if resolution >= 0.9:
+            counts[idx]["n_wins"] += 1
+
+    total = len(sessions)
+    rows = []
+    for i, c in enumerate(counts):
+        n_fills = c["n_fills"]
+        n_wins  = c["n_wins"]
+        win_rate = n_wins / n_fills if n_fills > 0 else None
+        eff = threshold + slippage
+        if win_rate is not None:
+            edge = win_rate * (1.0 - eff) + (1.0 - win_rate) * (-eff)
+        else:
+            edge = None
+        rows.append({
+            "bucket_start": i * bucket_secs,
+            "bucket_end":   (i + 1) * bucket_secs,
+            "bucket_label": f"{i * bucket_secs}–{(i + 1) * bucket_secs}s",
+            "n_fills":      n_fills,
+            "n_wins":       n_wins,
+            "fill_rate":    n_fills / total if total > 0 else 0.0,
+            "win_rate":     win_rate,
+            "edge_per_fill": edge,
+        })
+    return pd.DataFrame(rows)
 
 
 def rank_assets(

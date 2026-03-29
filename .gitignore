@@ -1,8 +1,10 @@
 .env
 .creds.json
+.creds_*.json
 data/sessions.db
 data/reports/
 data/prices/
+data/cache/
 data/collect_loop.log
 data/collect_and_sync.log
 __pycache__/
@@ -15,3 +17,6 @@ build/
 *.egg-info/
 .pytest_cache/
 .DS_Store
+data/live/
+data/live/*.json
+data/live/*.csv
