@@ -1528,40 +1528,41 @@ def _trigger_timing_section(all_sessions: dict) -> list[str]:
 
     # ── 1. Best threshold per bucket, per asset ───────────────────────────────
     lines += [
-        "### Best Threshold per Bucket (neighbour-smoothed)",
+        "### Best Threshold per Bucket (neighbour-smoothed, ranked by Edge/Session)",
         "",
-        "> For each 60-second window bucket, which threshold produced the best smoothed edge?",
+        "> For each 60-second window bucket, which threshold produced the best smoothed edge/session?",
+        "> Edge/session = edge/fill × fill_rate. A bucket with great edge/fill but 0.5% fill rate",
+        "> barely moves your P&L — edge/session captures actual impact per window.",
         "",
     ]
 
     for asset, thresh_data in records.items():
         lines += [f"#### {asset}", ""]
-        tbl_header = "| Bucket | Best Threshold | Smoothed Edge | Raw Edge | Win Rate | Fills |"
-        tbl_sep    = "|--------|---------------|--------------|----------|----------|-------|"
+        tbl_header = "| Bucket | Best T | Sm. Edge/Session | Sm. Edge/Fill | Win Rate | Fills |"
+        tbl_sep    = "|--------|--------|-----------------|--------------|----------|-------|"
         lines += [tbl_header, tbl_sep]
 
         for idx, bl in enumerate(bucket_labels):
             best_t_nb: float | None = None
-            best_nb_e: float = float("-inf")
+            best_nb_eps: float = float("-inf")
             for t in THRESHOLDS:
-                nb_e = _nb_edge(thresh_data, t, idx)
-                if nb_e is not None and nb_e > best_nb_e:
-                    best_nb_e = nb_e
+                nb_eps = _nb_edge_session(thresh_data, t, idx)
+                if nb_eps is not None and nb_eps > best_nb_eps:
+                    best_nb_eps = nb_eps
                     best_t_nb = t
 
             if best_t_nb is None:
                 lines.append(f"| {bl} | — | — | — | — | — |")
             else:
-                cell = thresh_data.get(best_t_nb, {}).get(bl, {})
-                raw_e = cell.get("edge_per_fill")
+                cell  = thresh_data.get(best_t_nb, {}).get(bl, {})
+                nb_epf = _nb_edge(thresh_data, best_t_nb, idx)
                 wr    = cell.get("win_rate")
                 n     = cell.get("n_fills", 0)
-                be    = best_t_nb + SLIPPAGE
-                raw_str = f"{raw_e:+.4f}" if raw_e is not None and n >= MIN_FILLS else "—"
+                epf_str = f"{nb_epf:+.4f}" if nb_epf is not None else "—"
                 wr_str  = f"{wr:.1%}" if wr is not None and n >= MIN_FILLS else "—"
                 lines.append(
-                    f"| {bl} | **T={best_t_nb:.2f}** | {best_nb_e:+.4f} "
-                    f"| {raw_str} | {wr_str} | {n} |"
+                    f"| {bl} | **T={best_t_nb:.2f}** | {best_nb_eps:+.5f} "
+                    f"| {epf_str} | {wr_str} | {n} |"
                 )
         lines += [""]
 
@@ -1569,36 +1570,40 @@ def _trigger_timing_section(all_sessions: dict) -> list[str]:
     lines += [
         "### Buckets to Avoid per Asset",
         "",
-        "> A bucket is flagged as **avoid** when its best smoothed edge across all thresholds is",
-        "> still negative (no threshold is reliably profitable in that window).",
+        "> A bucket is flagged as **avoid** when the best smoothed edge/session across all",
+        "> thresholds is still ≤ 0 (no threshold is reliably profitable in that window).",
         "",
     ]
 
     for asset, thresh_data in records.items():
         avoid_buckets: list[str] = []
-        trade_buckets: list[tuple[str, float, float]] = []  # (bucket, best_t, smoothed_edge)
+        trade_buckets: list[tuple[str, float, float, float]] = []  # (bucket, best_t, sm_eps, sm_epf)
 
         for idx, bl in enumerate(bucket_labels):
-            best_nb_e = float("-inf")
+            best_nb_eps = float("-inf")
             best_t_here: float | None = None
             for t in THRESHOLDS:
-                nb_e = _nb_edge(thresh_data, t, idx)
-                if nb_e is not None and nb_e > best_nb_e:
-                    best_nb_e = nb_e
+                nb_eps = _nb_edge_session(thresh_data, t, idx)
+                if nb_eps is not None and nb_eps > best_nb_eps:
+                    best_nb_eps = nb_eps
                     best_t_here = t
 
-            if best_t_here is None or best_nb_e <= 0:
+            if best_t_here is None or best_nb_eps <= 0:
                 avoid_buckets.append(bl)
             else:
-                trade_buckets.append((bl, best_t_here, best_nb_e))
+                nb_epf = _nb_edge(thresh_data, best_t_here, idx) or 0.0
+                trade_buckets.append((bl, best_t_here, best_nb_eps, nb_epf))
 
         if avoid_buckets:
             lines.append(f"**{asset}** — avoid: {', '.join(f'`{b}`' for b in avoid_buckets)}")
         else:
-            lines.append(f"**{asset}** — all buckets show positive smoothed edge (no avoid zones)")
+            lines.append(f"**{asset}** — all buckets show positive edge/session (no avoid zones)")
 
         if trade_buckets:
-            trade_strs = [f"`{bl}` T={t:.2f} ({e:+.4f})" for bl, t, e in trade_buckets]
+            trade_strs = [
+                f"`{bl}` T={t:.2f} (eps={eps:+.5f}, epf={epf:+.4f})"
+                for bl, t, eps, epf in trade_buckets
+            ]
             lines.append(f"  Trade zones: {', '.join(trade_strs)}")
         lines += [""]
 
@@ -1606,8 +1611,8 @@ def _trigger_timing_section(all_sessions: dict) -> list[str]:
     lines += [
         "### Trading Recommendation per Asset",
         "",
-        "> Plain-English strategy for each asset based on smoothed bucket analysis.",
-        "> Format: what threshold to use in each bucket, and which to skip.",
+        "> Ranked by **edge/session** (actual P&L per window). Edge/fill shown for context.",
+        "> ⚠️ sensitivity warning fires when the spread between best/worst threshold edge/session > 0.0005.",
         "",
     ]
 
@@ -1616,26 +1621,26 @@ def _trigger_timing_section(all_sessions: dict) -> list[str]:
 
         steps: list[str] = []
         for idx, bl in enumerate(bucket_labels):
-            # Find best and worst thresholds for this bucket (smoothed)
-            bucket_nb: list[tuple[float, float]] = []  # (threshold, smoothed_edge)
+            # Rank thresholds by smoothed edge/session
+            bucket_nb: list[tuple[float, float, float]] = []  # (threshold, sm_eps, sm_epf)
             for t in THRESHOLDS:
-                nb_e = _nb_edge(thresh_data, t, idx)
-                if nb_e is not None:
-                    bucket_nb.append((t, nb_e))
+                nb_eps = _nb_edge_session(thresh_data, t, idx)
+                nb_epf = _nb_edge(thresh_data, t, idx)
+                if nb_eps is not None:
+                    bucket_nb.append((t, nb_eps, nb_epf or 0.0))
 
             if not bucket_nb:
                 steps.append(f"- **{bl}** — Skip (no fills)")
                 continue
 
             bucket_nb.sort(key=lambda x: x[1], reverse=True)
-            best_t_b, best_nb_e = bucket_nb[0]
-            worst_t_b, worst_nb_e = bucket_nb[-1]
+            best_t_b, best_nb_eps, best_nb_epf = bucket_nb[0]
+            worst_nb_eps = bucket_nb[-1][1]
 
-            if best_nb_e <= 0:
-                # Even best threshold is negative — skip
+            if best_nb_eps <= 0:
                 steps.append(
                     f"- **{bl}** — ⛔ Skip  "
-                    f"(best smoothed edge is still {best_nb_e:+.4f} at T={best_t_b:.2f})"
+                    f"(best edge/session still {best_nb_eps:+.5f} at T={best_t_b:.2f})"
                 )
             else:
                 cell = thresh_data.get(best_t_b, {}).get(bl, {})
@@ -1643,28 +1648,27 @@ def _trigger_timing_section(all_sessions: dict) -> list[str]:
                 n    = cell.get("n_fills", 0)
                 be   = best_t_b + SLIPPAGE
                 wr_str = f"{wr:.1%}" if wr is not None and n >= MIN_FILLS else "?"
-                delta_str = f"{best_nb_e:+.4f}"
 
-                # Warn if best and worst are far apart (cherry-pick risk)
-                spread = best_nb_e - worst_nb_e
+                spread = best_nb_eps - worst_nb_eps
                 note = ""
-                if spread > 0.04:
-                    note = "  ⚠️ High threshold sensitivity — smoothed edge varies widely"
+                if spread > 0.0005:
+                    note = "  ⚠️ High threshold sensitivity"
 
                 steps.append(
                     f"- **{bl}** — ✅ Use T={best_t_b:.2f}  "
-                    f"(smoothed edge {delta_str}, win {wr_str} vs {be:.0%} B/E, {n} fills){note}"
+                    f"(edge/session {best_nb_eps:+.5f}, edge/fill {best_nb_epf:+.4f}, "
+                    f"win {wr_str} vs {be:.0%} B/E, {n} fills){note}"
                 )
 
-                # Mention if a lower threshold is nearly as good (more fills, similar edge)
-                for t2, e2 in bucket_nb[1:]:
-                    if e2 > 0 and e2 >= best_nb_e * 0.85:
+                # Alt: lower threshold with similar edge/session but more fills
+                for t2, eps2, epf2 in bucket_nb[1:]:
+                    if eps2 > 0 and eps2 >= best_nb_eps * 0.85:
                         cell2 = thresh_data.get(t2, {}).get(bl, {})
                         n2 = cell2.get("n_fills", 0)
-                        if n2 > n * 1.5:  # meaningfully more fills
+                        if n2 > n * 1.5:
                             steps.append(
-                                f"  _Alt: T={t2:.2f} gives similar smoothed edge ({e2:+.4f}) "
-                                f"with {n2} fills — better fill rate_"
+                                f"  _Alt: T={t2:.2f} — edge/session {eps2:+.5f}, "
+                                f"edge/fill {epf2:+.4f}, {n2} fills (better fill rate)_"
                             )
                             break
 

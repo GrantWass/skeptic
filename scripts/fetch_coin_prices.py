@@ -91,6 +91,21 @@ def _fetch_klines_chunk(
     return resp.json()
 
 
+def _last_ts_in_file(path: str) -> int | None:
+    """Return the last 'ts' value in an existing CSV, or None if file is empty/missing."""
+    if not os.path.exists(path):
+        return None
+    last_ts = None
+    with open(path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            try:
+                last_ts = int(row["ts"])
+            except (KeyError, ValueError):
+                continue
+    return last_ts
+
+
 def fetch_and_save(
     symbol: str,
     start_ts: int,
@@ -98,11 +113,24 @@ def fetch_and_save(
     output_path: str,
 ) -> int:
     """
-    Fetch 1s Binance klines for [start_ts, end_ts] and write to output_path.
+    Fetch 1s Binance klines for [start_ts, end_ts] and append to output_path.
+    Skips data already present by resuming from the last recorded timestamp.
     Returns total candles written.
     """
     total = 0
     write_header = not os.path.exists(output_path)
+
+    # Resume from where we left off
+    last_ts = _last_ts_in_file(output_path)
+    if last_ts is not None:
+        resume_ts = last_ts + 1
+        if resume_ts > end_ts:
+            log.info("%s: already up-to-date (last ts %d), skipping", symbol, last_ts)
+            return 0
+        if resume_ts > start_ts:
+            log.info("%s: resuming from ts %d (skipping %d already-fetched seconds)",
+                     symbol, resume_ts, resume_ts - start_ts)
+            start_ts = resume_ts
 
     with httpx.Client() as client, open(output_path, "a", newline="") as fh:
         writer = csv.writer(fh)

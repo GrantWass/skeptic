@@ -26,6 +26,22 @@ python scripts/live_high_buy.py --threshold 0.74 --assets BTC  --name btc
 
 python scripts/audit_slippage.py
 
-# Last 2 minutes only
 python scripts/live_high_buy.py --threshold 0.74 --assets BTC --cutoff 180 --name btchigh
+python scripts/live_high_buy.py --threshold 0.78 --assets DOGE --cutoff 60 --name dogehigh
 
+python scripts/fetch_coin_prices.py
+python scripts/threshold_edge.py --assets BTC DOGE 
+
+python scripts/live_momentum_buy.py \
+  --asset DOGE \
+  --sigma-value 0.00014810474 \
+  --sigma-entry 0.5 \
+  --max-pm-price 0.87 \
+  --dry-run
+
+python scripts/live_momentum_buy.py \
+  --asset BTC \
+  --sigma-value 86.423079 \
+  --sigma-entry 0.5 \
+  --max-pm-price 0.82 \
+  --dry-run
