@@ -1,0 +1,35 @@
+# Per-asset strategy configuration for live_momentum_buy.py
+#
+# Required fields per asset:
+#   sigma_value  - std dev of 5-min window moves (in asset price units)
+#   sigma_entry  - number of sigmas needed to trigger a trade
+#   max_pm_price - max Polymarket ask price to accept (edge threshold)
+#
+# Optional fields (fall back to CLI defaults if omitted):
+#   direction    - "up", "down", or "both" (default: both)
+#   wallet_pct   - percent of wallet to deploy per trade (default: from config.py)
+#   name         - instance name for trades/status files (default: momentum)
+
+BTC:  # best entry: 0.5σ  |  edge/fill: +9.6%  |  edge/session: +9.56%
+  sigma_value: 90.683081
+  sigma_entry: 0.5
+  max_pm_price: 0.78
+  wallet_pct: 0.05
+
+DOGE:  # best entry: 0.5σ  |  edge/fill: +20.7%  |  edge/session: +20.73%
+  sigma_value: 0.00015531532
+  sigma_entry: 0.5
+  max_pm_price: 0.78
+  wallet_pct: 0.05
+
+ETH:  # best entry: 0.5σ  |  edge/fill: +7.9%  |  edge/session: +7.93%
+  sigma_value: 3.4549562
+  sigma_entry: 0.5
+  max_pm_price: 0.80
+  wallet_pct: 0.05
+
+SOL:  # best entry: 0.5σ  |  edge/fill: +8.9%  |  edge/session: +8.89%
+  sigma_value: 0.15212417
+  sigma_entry: 0.5
+  max_pm_price: 0.78
+  wallet_pct: 0.05
