@@ -8,15 +8,16 @@ Buys when:
   2. Polymarket ask for that side is <= max_pm_price
 
 Usage:
-    python scripts/live_momentum_buy.py --asset BTC --sigma-value 150.0 --sigma-entry 1.0 --max-pm-price 0.72
-    python scripts/live_momentum_buy.py --asset DOGE --sigma-value 0.005 --sigma-entry 0.5 --max-pm-price 0.65 --direction up
-    python scripts/live_momentum_buy.py --asset BTC --sigma-value 150.0 --sigma-entry 1.0 --max-pm-price 0.72 --dry-run
+    python scripts/live_momentum_buy.py --asset SOL                           # loads from config/assets.yaml
+    python scripts/live_momentum_buy.py --asset SOL --dry-run                 # dry-run using config
+    python scripts/live_momentum_buy.py --asset BTC --sigma-value 150.0 --sigma-entry 1.0 --max-pm-price 0.72  # CLI override
 """
 import argparse
 import asyncio
 import logging
 import os
 import sys
+import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -30,25 +31,57 @@ logging.basicConfig(
 )
 
 
+def _load_asset_config(config_path: str, asset: str) -> dict:
+    """Load per-asset params from YAML config file. Returns {} if not found."""
+    try:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+        return cfg.get(asset.upper(), {})
+    except FileNotFoundError:
+        return {}
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Live coin-momentum buy executor")
     p.add_argument("--asset",        required=True,
                    help="Asset to trade (e.g. BTC, DOGE, ETH)")
-    p.add_argument("--sigma-value",  type=float, required=True,
-                   help="Sigma (std dev of 5-min window moves in USD) for the asset")
-    p.add_argument("--sigma-entry",  type=float, required=True,
-                   help="Number of sigmas the coin must move to trigger (e.g. 1.0)")
-    p.add_argument("--max-pm-price", type=float, required=True,
-                   help="Max Polymarket ask price to accept (our edge threshold, e.g. 0.72)")
-    p.add_argument("--direction",    default="both", choices=["up", "down", "both"],
+    p.add_argument("--config",       default="config/assets.yaml",
+                   help="Path to per-asset YAML config (default: config/assets.yaml)")
+    p.add_argument("--sigma-value",  type=float, default=None,
+                   help="Sigma (std dev of 5-min window moves) — overrides config file")
+    p.add_argument("--sigma-entry",  type=float, default=None,
+                   help="Number of sigmas needed to trigger — overrides config file")
+    p.add_argument("--max-pm-price", type=float, default=None,
+                   help="Max Polymarket ask price to accept — overrides config file")
+    p.add_argument("--direction",    default=None, choices=["up", "down", "both"],
                    help="Which direction to trade (default: both)")
-    p.add_argument("--wallet-pct",   type=float, default=float(config.POSITION_SIZE_PCT) * 100,
-                   help="Percent of wallet to deploy per trade (default: %(default)s%%)")
+    p.add_argument("--wallet-pct",   type=float, default=None,
+                   help="Percent of wallet to deploy per trade (default: from config or POSITION_SIZE_PCT)")
     p.add_argument("--dry-run",      action="store_true",
                    help="Log intended trades without placing real orders")
     p.add_argument("--name",         default="momentum",
                    help="Instance name for trades/status files")
-    return p.parse_args()
+
+    args = p.parse_args()
+
+    # Fill unset args from config file
+    asset_cfg = _load_asset_config(args.config, args.asset)
+    if args.sigma_value  is None: args.sigma_value  = asset_cfg.get("sigma_value")
+    if args.sigma_entry  is None: args.sigma_entry  = asset_cfg.get("sigma_entry")
+    if args.max_pm_price is None: args.max_pm_price = asset_cfg.get("max_pm_price")
+    if args.direction    is None: args.direction    = asset_cfg.get("direction", "both")
+    if args.wallet_pct   is None:
+        args.wallet_pct = asset_cfg.get("wallet_pct", float(config.POSITION_SIZE_PCT)) * 100
+
+    missing = [name for name, val in [
+        ("--sigma-value",  args.sigma_value),
+        ("--sigma-entry",  args.sigma_entry),
+        ("--max-pm-price", args.max_pm_price),
+    ] if val is None]
+    if missing:
+        p.error(f"{', '.join(missing)} required (pass as CLI args or set in {args.config})")
+
+    return args
 
 
 async def main() -> None:
