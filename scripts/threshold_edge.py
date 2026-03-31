@@ -80,15 +80,15 @@ def load_coin_prices(coin_dir: str, asset: str) -> pd.Series | None:
 # ── resolution ────────────────────────────────────────────────────────────────
 
 def _resolve_window(pm_window: pd.DataFrame) -> bool | None:
-    """Last up_price >= 0.9 → UP won, <= 0.1 → DOWN won. Mirrors fetcher.py."""
+    """Last up_price >= 0.95 → UP won, <= 0.05 → DOWN won. Returns None if ambiguous."""
     if pm_window.empty or "up_price" not in pm_window.columns:
         return None
     last_up = pm_window.sort_values("ts")["up_price"].iloc[-1]
     if pd.isna(last_up):
         return None
-    if last_up >= 0.9:
+    if last_up >= 0.95:
         return True
-    if last_up <= 0.1:
+    if last_up <= 0.05:
         return False
     return None
 
@@ -145,8 +145,14 @@ def analyze_asset(
             continue
         resolved_up = _resolve_window(pm_window_df)
         if resolved_up is None:
-            n_unresolved += 1
-            continue
+            # PM price didn't reach 0.95/0.05 — fall back to coin price direction
+            if window_move > 0:
+                resolved_up = True
+            elif window_move < 0:
+                resolved_up = False
+            else:
+                n_unresolved += 1
+                continue  # truly flat window, skip
 
         pm_window_idx = pm_window_df.set_index("ts").sort_index()
 
@@ -255,6 +261,167 @@ def analyze_asset(
                 "resolved_up":    resolved_up,
                 "won":            won,
                 **vels,
+            })
+
+    return pd.DataFrame(records), n_unresolved
+
+
+# ── EWMA sigma ─────────────────────────────────────────────────────────────────
+
+EWMA_WARMUP = 20  # windows to skip before the EWMA estimate is considered reliable
+
+
+def compute_ewma_sigmas(
+    windows_sorted: list[int],
+    coin_series: pd.Series,
+    lambda_: float,
+) -> dict[int, float]:
+    """
+    Walk-forward EWMA variance estimator (RiskMetrics-style).
+
+    For window t, returns sigma_t = sqrt(ewma_var) estimated ONLY from moves in
+    windows 0 … t-1, so the returned value is safe to use for window t with no
+    lookahead bias.
+
+        ewma_var_t = λ · ewma_var_{t-1} + (1-λ) · move_{t-1}²
+        sigma_t    = sqrt(ewma_var_t)
+
+    Windows with fewer than 280 coin-price points are skipped and do not update
+    the EWMA.  The very first eligible window initialises ewma_var = move_0² but
+    is excluded from the returned map (no prior estimate available).
+    """
+    ewma_var: float | None = None
+    result: dict[int, float] = {}
+
+    for wts in windows_sorted:
+        mask = (coin_series.index >= wts) & (coin_series.index < wts + WINDOW_SECS)
+        prices = coin_series[mask]
+        if len(prices) < 280:
+            continue
+        move = float(prices.iloc[-1]) - float(prices.iloc[0])
+
+        # Sigma available to TRADE this window = what was known before it started
+        if ewma_var is not None:
+            result[wts] = float(np.sqrt(ewma_var))
+
+        # Update EWMA with this window's realised move
+        if ewma_var is None:
+            ewma_var = move ** 2          # seed with first observed move²
+        else:
+            ewma_var = lambda_ * ewma_var + (1.0 - lambda_) * move ** 2
+
+    return result
+
+
+def analyze_asset_ewma(
+    asset: str,
+    pm_df: pd.DataFrame,
+    coin_series: pd.Series,
+    sigma_multiples: list[float],
+    lambda_: float,
+) -> tuple[pd.DataFrame, int]:
+    """
+    Walk-forward version of analyze_asset().
+
+    Uses a per-window EWMA sigma (estimated from all prior windows only) as the
+    volatility baseline instead of the global static std-dev.  The first
+    EWMA_WARMUP windows are excluded so the estimate has time to stabilise.
+
+    Returns (records_df, n_unresolved).  records_df has the same core schema as
+    analyze_asset() output, plus two extra columns: ``ewma_sigma`` and ``lambda``.
+    """
+    asset_pm = pm_df[pm_df["asset"] == asset].copy()
+    windows = sorted(asset_pm["window_ts"].unique())
+
+    ewma_sigmas = compute_ewma_sigmas(windows, coin_series, lambda_)
+
+    records = []
+    n_unresolved = 0
+
+    for i, wts in enumerate(windows):
+        ewma_sigma = ewma_sigmas.get(wts)
+        if ewma_sigma is None or ewma_sigma <= 0:
+            continue
+        if i < EWMA_WARMUP:
+            continue
+
+        mask = (coin_series.index >= wts) & (coin_series.index < wts + WINDOW_SECS)
+        prices = coin_series[mask]
+        if len(prices) < 280:
+            continue
+
+        open_price  = float(prices.iloc[0])
+        window_move = float(prices.iloc[-1]) - open_price
+        hour_utc = datetime.fromtimestamp(wts, tz=timezone.utc).hour
+
+        pm_window_df = asset_pm[asset_pm["window_ts"] == wts]
+        if len(pm_window_df) < 280:
+            continue
+        resolved_up = _resolve_window(pm_window_df)
+        if resolved_up is None:
+            # PM price didn't reach 0.95/0.05 — fall back to coin price direction
+            if window_move > 0:
+                resolved_up = True
+            elif window_move < 0:
+                resolved_up = False
+            else:
+                n_unresolved += 1
+                continue  # truly flat window, skip
+
+        pm_window_idx = pm_window_df.set_index("ts").sort_index()
+
+        for sig in sigma_multiples:
+            up_thresh   = open_price + sig * ewma_sigma
+            down_thresh = open_price - sig * ewma_sigma
+
+            up_trig = down_trig = None
+            for ts, price in prices.items():
+                if up_trig is None and price >= up_thresh:
+                    up_trig = int(ts)
+                if down_trig is None and price <= down_thresh:
+                    down_trig = int(ts)
+                if up_trig and down_trig:
+                    break
+
+            if up_trig is None and down_trig is None:
+                continue
+            if up_trig is not None and (down_trig is None or up_trig <= down_trig):
+                trigger_ts  = up_trig
+                trigger_dir = "up"
+                price_col   = "up_price"
+                won         = bool(resolved_up)
+            else:
+                trigger_ts  = down_trig
+                trigger_dir = "down"
+                price_col   = "down_price"
+                won         = not bool(resolved_up)
+
+            pm_before = pm_window_idx[pm_window_idx.index <= trigger_ts]
+            if pm_before.empty:
+                pm_before = pm_window_idx
+            if pm_before.empty or price_col not in pm_before.columns:
+                continue
+
+            pm_row = pm_before.iloc[-1]
+            if pd.isna(pm_row.get(price_col)):
+                continue
+            pm_price = float(pm_row[price_col])
+
+            records.append({
+                "asset":          asset,
+                "window_ts":      wts,
+                "hour_utc":       hour_utc,
+                "window_move":    window_move,
+                "sigma":          sig,
+                "sigma_abs":      sig * ewma_sigma,
+                "ewma_sigma":     ewma_sigma,
+                "lambda":         lambda_,
+                "trigger_dir":    trigger_dir,
+                "trigger_ts":     trigger_ts,
+                "trigger_second": trigger_ts - wts,
+                "pm_price":       pm_price,
+                "resolved_up":    resolved_up,
+                "won":            won,
             })
 
     return pd.DataFrame(records), n_unresolved
@@ -407,17 +574,30 @@ def section_trigger_timing(df: pd.DataFrame) -> str:
     return "\n".join(out)
 
 
+def _utc_to_cst(utc_hour: int) -> int:
+    """Convert UTC hour to CST hour (UTC-6)."""
+    return (utc_hour - 6) % 24
+
+
+def _cst_range_label(utc_start: int, utc_end: int) -> str:
+    """Return 'HH–HH CST' label for a UTC hour range."""
+    cst_start = _utc_to_cst(utc_start)
+    cst_end   = _utc_to_cst(utc_end % 24)
+    return f"{cst_start:02d}–{cst_end:02d} CST"
+
+
 def section_hour_of_day(df: pd.DataFrame) -> str:
     """
     Edge by UTC hour — session buckets, ASCII bar chart, top/bottom hours.
+    CST equivalents shown alongside UTC (CST = UTC-6).
     """
     SESSION_BUCKETS = [
-        ("00–04 UTC", range(0, 4)),
-        ("04–08 UTC", range(4, 8)),
-        ("08–12 UTC", range(8, 12)),
-        ("12–16 UTC", range(12, 16)),
-        ("16–20 UTC", range(16, 20)),
-        ("20–24 UTC", range(20, 24)),
+        ("00–04 UTC", _cst_range_label(0,  4),  range(0, 4)),
+        ("04–08 UTC", _cst_range_label(4,  8),  range(4, 8)),
+        ("08–12 UTC", _cst_range_label(8,  12), range(8, 12)),
+        ("12–16 UTC", _cst_range_label(12, 16), range(12, 16)),
+        ("16–20 UTC", _cst_range_label(16, 20), range(16, 20)),
+        ("20–24 UTC", _cst_range_label(20, 24), range(20, 24)),
     ]
 
     out = []
@@ -428,17 +608,17 @@ def section_hour_of_day(df: pd.DataFrame) -> str:
 
         # --- session bucket summary ---
         out.append("\n**By trading session** (avg edge across all sigma):\n")
-        out.append("| Session | n | avg edge |")
-        out.append("|---|---|---|")
-        for label, hours in SESSION_BUCKETS:
+        out.append("| Session (UTC) | Session (CST) | n | avg edge |")
+        out.append("|---|---|---|---|")
+        for utc_label, cst_label, hours in SESSION_BUCKETS:
             grp = adf[adf["hour_utc"].isin(hours)]
             if grp.empty:
                 continue
             avg_edge = float((grp["won"] - grp["pm_price"]).mean())
-            out.append(f"| {label} | {len(grp)} | {avg_edge:+.4f} |")
+            out.append(f"| {utc_label} | {cst_label} | {len(grp)} | {avg_edge:+.4f} |")
 
         # --- ASCII bar chart ---
-        out.append("\n**Edge by hour (UTC)** — each █ ≈ 1% edge:\n")
+        out.append("\n**Edge by hour** — each █ ≈ 1% edge:\n")
         out.append("```")
         hour_edges = {}
         for hour in range(24):
@@ -454,7 +634,8 @@ def section_hour_of_day(df: pd.DataFrame) -> str:
             bar_len = max(0, int(abs(e) * 100))
             bar  = ("█" * bar_len) if e >= 0 else ("░" * bar_len)
             sign = "+" if e >= 0 else "-"
-            out.append(f"  {hour:02d}h  {sign}{abs(e):.3f}  {bar}")
+            cst  = _utc_to_cst(hour)
+            out.append(f"  {hour:02d}h UTC / {cst:02d}h CST  {sign}{abs(e):.3f}  {bar}")
         out.append("```")
 
         # --- top/bottom hours ---
@@ -462,8 +643,8 @@ def section_hour_of_day(df: pd.DataFrame) -> str:
             sorted_hours = sorted(hour_edges.items(), key=lambda x: x[1], reverse=True)
             top3    = sorted_hours[:3]
             bottom3 = sorted_hours[-3:]
-            top_str    = "  ".join(f"{h:02d}h ({e:+.3f})" for h, e in top3)
-            bottom_str = "  ".join(f"{h:02d}h ({e:+.3f})" for h, e in bottom3)
+            top_str    = "  ".join(f"{h:02d}h UTC/{_utc_to_cst(h):02d}h CST ({e:+.3f})" for h, e in top3)
+            bottom_str = "  ".join(f"{h:02d}h UTC/{_utc_to_cst(h):02d}h CST ({e:+.3f})" for h, e in bottom3)
             out.append(f"\n**Best hours:**  {top_str}")
             out.append(f"**Worst hours:** {bottom_str}\n")
 
@@ -592,19 +773,27 @@ def section_half_day(df: pd.DataFrame) -> str:
     """
     Edge and win rate split by half-day (AM = 00–11 UTC, PM = 12–23 UTC),
     further broken down by sigma level. One table per asset.
+    CST (UTC-6) date and half shown alongside UTC.
     """
     df = df.copy()
     df["date"]     = df["window_ts"].apply(lambda ts: datetime.fromtimestamp(ts, tz=timezone.utc).date())
     df["half"]     = df["hour_utc"].apply(lambda h: "AM" if h < 12 else "PM")
     df["half_day"] = df["date"].astype(str) + " " + df["half"]
 
+    CST_OFFSET = -6
+    df["cst_hour"] = (df["hour_utc"] + CST_OFFSET) % 24
+    df["cst_date"] = df["window_ts"].apply(
+        lambda ts: datetime.fromtimestamp(ts - 6 * 3600, tz=timezone.utc).date()
+    )
+    df["cst_half"] = df["cst_hour"].apply(lambda h: "AM" if h < 12 else "PM")
+
     out = []
     for asset in sorted(df["asset"].unique()):
         adf = df[df["asset"] == asset]
 
         out.append(f"### {asset}\n")
-        out.append("| date | half | σ (std dev) | n | win% | avg_pm | edge |")
-        out.append("|---|---|---:|---:|---:|---:|---:|")
+        out.append("| UTC date | UTC half | CST date | CST half | σ (std dev) | n | win% | avg_pm | edge |")
+        out.append("|---|---|---|---|---:|---:|---:|---:|---:|")
 
         for half_day in sorted(adf["half_day"].unique()):
             hdf  = adf[adf["half_day"] == half_day]
@@ -617,16 +806,177 @@ def section_half_day(df: pd.DataFrame) -> str:
             edge = win - pm
             flag = " ⚠" if edge < 0 else ""
             sigma_str = f"{sigma:.6g}" if not np.isnan(sigma) else "—"
-            out.append(f"| {date} | {half} | {sigma_str} | {len(moves)} | {win*100:.0f}% | {pm:.3f} | {edge:+.3f}{flag} |")
+            # CST label: take modal CST date/half for windows in this group
+            cst_date_val = hdf.drop_duplicates("window_ts")["cst_date"].mode().iloc[0]
+            cst_half_val = hdf.drop_duplicates("window_ts")["cst_half"].mode().iloc[0]
+            out.append(
+                f"| {date} | {half} | {cst_date_val} | {cst_half_val} | "
+                f"{sigma_str} | {len(moves)} | {win*100:.0f}% | {pm:.3f} | {edge:+.3f}{flag} |"
+            )
 
         out.append("")
 
     return "\n".join(out)
 
 
+def section_ewma_comparison(
+    static_df: pd.DataFrame,
+    ewma_dfs: dict[float, pd.DataFrame],
+) -> str:
+    """
+    Side-by-side comparison of static sigma vs EWMA sigma (one or more λ values).
+
+    For each asset × sigma-multiplier:
+      static   — global std-dev computed over the full history
+      EWMA λ   — walk-forward per-window threshold (first EWMA_WARMUP windows excluded)
+
+    Three sub-tables:
+      1. Full detail (fills, win%, avg_pm, edge, edge/session) per method
+      2. Sigma magnitude: how much the adaptive sigma deviates from static
+      3. Edge/session advantage: EWMA minus static (positive = EWMA better)
+    """
+    if not ewma_dfs:
+        return "_No EWMA data available._"
+
+    lambdas = sorted(ewma_dfs.keys())
+    out = []
+
+    # ── 1. Per-asset detail ─────────────────────────────────────────────────
+    for asset in sorted(static_df["asset"].unique()):
+        out.append(f"### {asset}\n")
+        out.append("| sigma | method | n_windows | n_fills | fill% | win% | avg_pm | edge | edge/session |")
+        out.append("|---|---|---:|---:|---:|---:|---:|---:|---:|")
+
+        s_df    = static_df[static_df["asset"] == asset]
+        s_total = s_df["window_ts"].nunique()
+
+        ewma_totals = {
+            lam: ewma_dfs[lam][ewma_dfs[lam]["asset"] == asset]["window_ts"].nunique()
+            for lam in lambdas
+        }
+
+        for sig in sorted(s_df["sigma"].unique()):
+            s_grp = s_df[s_df["sigma"] == sig]
+            if not s_grp.empty:
+                win    = s_grp["won"].mean()
+                avg_pm = s_grp["pm_price"].mean()
+                edge   = win - avg_pm
+                fills  = s_grp["window_ts"].nunique()
+                fr     = fills / s_total if s_total else 0.0
+                out.append(
+                    f"| {sig}σ | static | {s_total} | {fills} | {fr*100:.1f}% | "
+                    f"{win*100:.1f}% | {avg_pm:.4f} | {edge:+.4f} | {edge*fr:+.4f} |"
+                )
+
+            for lam in lambdas:
+                e_df    = ewma_dfs[lam][ewma_dfs[lam]["asset"] == asset]
+                e_total = ewma_totals[lam]
+                if e_total == 0:
+                    continue
+                e_grp = e_df[e_df["sigma"] == sig]
+                if e_grp.empty:
+                    out.append(
+                        f"| {sig}σ | EWMA λ={lam} | {e_total} | 0 | 0.0% | — | — | — | — |"
+                    )
+                    continue
+                win    = e_grp["won"].mean()
+                avg_pm = e_grp["pm_price"].mean()
+                edge   = win - avg_pm
+                fills  = e_grp["window_ts"].nunique()
+                fr     = fills / e_total
+                out.append(
+                    f"| {sig}σ | EWMA λ={lam} | {e_total} | {fills} | {fr*100:.1f}% | "
+                    f"{win*100:.1f}% | {avg_pm:.4f} | {edge:+.4f} | {edge*fr:+.4f} |"
+                )
+
+        out.append("")
+
+    # ── 2. Sigma magnitude ──────────────────────────────────────────────────
+    out.append("### Sigma magnitude: static vs EWMA\n")
+    hdr = (
+        ["asset", "static σ"]
+        + [f"EWMA λ={lam} mean" for lam in lambdas]
+        + [f"EWMA λ={lam} std"  for lam in lambdas]
+    )
+    out.append("| " + " | ".join(hdr) + " |")
+    out.append("|" + "|".join(["---"] * len(hdr)) + "|")
+
+    for asset in sorted(static_df["asset"].unique()):
+        s_df = static_df[static_df["asset"] == asset]
+        if s_df.empty:
+            continue
+        ref          = s_df[s_df["sigma"] > 0].iloc[0]
+        static_sigma = ref["sigma_abs"] / ref["sigma"]
+
+        ewma_means, ewma_stds = [], []
+        for lam in lambdas:
+            e_df = ewma_dfs[lam][ewma_dfs[lam]["asset"] == asset]
+            if "ewma_sigma" in e_df.columns and not e_df.empty:
+                vals = e_df.drop_duplicates("window_ts")["ewma_sigma"]
+                ewma_means.append(f"{vals.mean():.4g}")
+                ewma_stds.append(f"{vals.std():.4g}")
+            else:
+                ewma_means.append("—")
+                ewma_stds.append("—")
+
+        out.append(
+            f"| {asset} | {static_sigma:.4g} | "
+            + " | ".join(ewma_means) + " | "
+            + " | ".join(ewma_stds) + " |"
+        )
+
+    out.append("")
+
+    # ── 3. Edge/session advantage ───────────────────────────────────────────
+    out.append("### Edge/session advantage: EWMA − static (positive = EWMA better)\n")
+    hdr2 = ["asset", "sigma"] + [f"EWMA λ={lam}" for lam in lambdas]
+    out.append("| " + " | ".join(hdr2) + " |")
+    out.append("|" + "|".join(["---"] * len(hdr2)) + "|")
+
+    for asset in sorted(static_df["asset"].unique()):
+        s_df    = static_df[static_df["asset"] == asset]
+        s_total = s_df["window_ts"].nunique()
+
+        for sig in sorted(s_df["sigma"].unique()):
+            s_grp = s_df[s_df["sigma"] == sig]
+            if s_grp.empty:
+                continue
+            s_edge = s_grp["won"].mean() - s_grp["pm_price"].mean()
+            s_eps  = s_edge * (s_grp["window_ts"].nunique() / s_total)
+
+            adv_cells = []
+            for lam in lambdas:
+                e_df    = ewma_dfs[lam][ewma_dfs[lam]["asset"] == asset]
+                e_total = e_df["window_ts"].nunique()
+                e_grp   = e_df[e_df["sigma"] == sig]
+                if e_grp.empty or e_total == 0:
+                    adv_cells.append("—")
+                    continue
+                e_edge = e_grp["won"].mean() - e_grp["pm_price"].mean()
+                e_eps  = e_edge * (e_grp["window_ts"].nunique() / e_total)
+                diff   = e_eps - s_eps
+                adv_cells.append(f"{diff:+.4f}")
+
+            out.append(f"| {asset} | {sig}σ | " + " | ".join(adv_cells) + " |")
+
+    out.append("")
+    out.append(
+        f"_Static sigma: single value over entire history. "
+        f"EWMA: walk-forward, updated each window, no lookahead. "
+        f"First {EWMA_WARMUP} windows excluded from EWMA results (warmup). "
+        f"Edge advantage = EWMA edge/session − static edge/session on their respective sample sets._"
+    )
+    return "\n".join(out)
+
+
 # ── report builder ────────────────────────────────────────────────────────────
 
-def build_report(df: pd.DataFrame, sigma_levels: list[float], unresolved: dict[str, int] | None = None) -> str:
+def build_report(
+    df: pd.DataFrame,
+    sigma_levels: list[float],
+    unresolved: dict[str, int] | None = None,
+    ewma_dfs: dict[float, pd.DataFrame] | None = None,
+) -> str:
     # compute actual win rates per bucket for reprice analysis
     target_win_rates = {}
     for key, grp in df.groupby(["asset", "sigma"]):
@@ -663,7 +1013,11 @@ def build_report(df: pd.DataFrame, sigma_levels: list[float], unresolved: dict[s
         "**Edge** = actual win rate − avg Polymarket price at trigger moment (filled sessions only).",
         "**Edge/session** = edge × fill_rate — expected value per session regardless of whether a trigger fires.",
         "",
-        "**Unresolved windows** (last PM price not ≥ 0.9 or ≤ 0.1 — excluded from all analysis):",
+        "**Resolution**: last PM price ≥ 0.95 → UP won; ≤ 0.05 → DOWN won. "
+        "If PM price is ambiguous, the coin price direction (close vs open) determines the outcome. "
+        "Only windows with a flat coin move (close == open) remain unresolved.",
+        "",
+        "**Unresolved windows** (coin move exactly flat — excluded from all analysis):",
         "",
         unresolved_table,
         "",
@@ -725,6 +1079,19 @@ def build_report(df: pd.DataFrame, sigma_levels: list[float], unresolved: dict[s
         "Rows sorted oldest → newest. Negative edge rows are highlighted with `[!]`.",
         "",
         section_half_day(df),
+        "",
+        "---",
+        "",
+        "## 8. EWMA vs Static Sigma — Adaptive Volatility Comparison",
+        "",
+        "Static sigma is a single value computed over the entire history. "
+        "EWMA (Exponentially Weighted Moving Average) sigma adapts after each session, "
+        "giving more weight to recent moves (λ closer to 1 = slower decay = longer memory). "
+        "The EWMA sigma used for window *t* is estimated from windows 0…t−1 only "
+        "(strict walk-forward — no lookahead). "
+        f"First {EWMA_WARMUP} windows are excluded while the estimate warms up.",
+        "",
+        section_ewma_comparison(df, ewma_dfs or {}),
         "",
         "---",
         "",
@@ -844,6 +1211,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sigma",      nargs="+", type=float, default=[0.5, 1.0, 1.5, 2.0])
     p.add_argument("--out-csv",    default="data/reports/threshold_edge.csv")
     p.add_argument("--out-report", default="data/reports/threshold_edge.md")
+    p.add_argument(
+        "--lambda", dest="lambda_vals", nargs="+", type=float, default=[0.95, 0.97],
+        metavar="LAM",
+        help="EWMA decay factors to evaluate (default: 0.95 0.97)",
+    )
     return p.parse_args()
 
 
@@ -853,10 +1225,16 @@ def main() -> None:
 
     pm_df = load_prices(args.prices_dir)
 
+    # Load coin data once per asset to avoid re-reading CSVs for each EWMA lambda
+    coin_data: dict[str, pd.Series | None] = {
+        asset: load_coin_prices(args.coin_dir, asset)
+        for asset in args.assets
+    }
+
     all_records = []
     unresolved: dict[str, int] = {}
     for asset in args.assets:
-        coin = load_coin_prices(args.coin_dir, asset)
+        coin = coin_data[asset]
         if coin is None:
             continue
         recs, n_unresolved = analyze_asset(asset, pm_df, coin, args.sigma)
@@ -880,7 +1258,23 @@ def main() -> None:
     full.to_csv(args.out_csv, index=False)
     log.info("Raw records → %s", args.out_csv)
 
-    report = build_report(full, args.sigma, unresolved)
+    # EWMA analysis — one pass per lambda, reusing cached coin data
+    ewma_dfs: dict[float, pd.DataFrame] = {}
+    for lam in args.lambda_vals:
+        lam_records = []
+        for asset in args.assets:
+            coin = coin_data[asset]
+            if coin is None:
+                continue
+            recs, _ = analyze_asset_ewma(asset, pm_df, coin, args.sigma, lam)
+            if not recs.empty:
+                lam_records.append(recs)
+        ewma_dfs[lam] = (
+            pd.concat(lam_records, ignore_index=True) if lam_records else pd.DataFrame()
+        )
+        log.info("EWMA λ=%.2f: %d records", lam, len(ewma_dfs[lam]))
+
+    report = build_report(full, args.sigma, unresolved, ewma_dfs)
 
     with open(args.out_report, "w") as f:
         f.write(report)
