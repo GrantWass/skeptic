@@ -410,8 +410,8 @@ class MomentumBuyExecutor:
         trade.resolution = resolution
         trade.pnl_usdc   = round(pnl, 4)
         trade.status     = "won" if win else "lost"
-        log.info("RESOLVED  %s %s  %s  PnL=$%.4f",
-                 self.asset, trade.side, trade.status.upper(), pnl)
+        log.info("RESOLVED  %s %s  PnL=$%.4f", self.asset, trade.side, pnl)
+        log.info("**** %s ****", trade.status.upper())
         _write_trade(trade, self._trades_csv)
 
     # ── Binance price fetch ───────────────────────────────────────────────────
@@ -471,10 +471,10 @@ class MomentumBuyExecutor:
             # Compute decimal places once from window open magnitude
             if _coin_dp is None:
                 mag = abs(self._coin_open)
-                if mag >= 1000:   _coin_dp = 2
-                elif mag >= 1:    _coin_dp = 4
-                elif mag >= 0.01: _coin_dp = 6
-                else:             _coin_dp = 8
+                if mag >= 1000:   _coin_dp = 1
+                elif mag >= 1:    _coin_dp = 3
+                elif mag >= 0.01: _coin_dp = 5
+                else:             _coin_dp = 7
 
             now       = time.time()
             elapsed   = int(now - self._window_start)
@@ -493,7 +493,7 @@ class MomentumBuyExecutor:
             def _side_str(mid, ask):
                 if mid is None or ask is None:
                     return "——/——/——"
-                return f"{mid:.3f}/{ask:.3f}(+{ask-mid:.3f})"
+                return f"{mid:.2f}/{ask:.2f}(+{ask-mid:.2f})"
 
             up_str = _side_str(up_mid, up_ask)
             dn_str = _side_str(dn_mid, dn_ask)
@@ -502,7 +502,7 @@ class MomentumBuyExecutor:
             if trade and trade.status in ("won", "lost"):
                 status_tag = f"✓{trade.status.upper()} ${trade.pnl_usdc:+.2f}"
             elif trade and trade.status == "open":
-                status_tag = f"FILLED {trade.side}@{trade.fill_price:.3f}"
+                status_tag = f"FILLED {trade.side}@{trade.fill_price:.2f}"
             elif self._filled:
                 status_tag = "filled"
             else:

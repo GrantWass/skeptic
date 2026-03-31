@@ -32,6 +32,11 @@ python scripts/live_high_buy.py --threshold 0.78 --assets DOGE --cutoff 60 --nam
 python scripts/fetch_coin_prices.py
 python scripts/threshold_edge.py --assets BTC DOGE 
 
+## MOMENTUM ##
+
+python scripts/slippage_report.py
+python scripts/threshold_edge.py
+
 python scripts/live_momentum_buy.py \
   --asset DOGE \
   --sigma-value 0.00014810474 \
@@ -39,9 +44,3 @@ python scripts/live_momentum_buy.py \
   --max-pm-price 0.87 \
   --dry-run
 
-python scripts/live_momentum_buy.py \
-  --asset BTC \
-  --sigma-value 86.423079 \
-  --sigma-entry 0.5 \
-  --max-pm-price 0.82 \
-  --dry-run
