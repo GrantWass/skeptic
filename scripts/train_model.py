@@ -7,8 +7,8 @@ Features computed at each second t in each window:
   vel_2s, vel_5s, vel_10s, acc_4s, acc_10s,
   vel_ratio, vel_decay, acc_positive, vol_10s_log
 
-Resolution: last up_price >= 0.95 → UP, <= 0.05 → DOWN, else fallback to coin direction.
-Train/test split: chronological 80/20 at the window level per asset.
+Resolution: coin-price move direction only (positive=UP, negative=DOWN).
+Train/test split: train on coin-only windows, test on windows with market data.
 
 Usage:
     python scripts/train_model.py
@@ -37,7 +37,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 WINDOW_SECS   = 300
-TRAIN_FRAC    = 0.80
 MIN_COIN_ROWS = 280
 VOL_LOOKBACK  = 10
 
@@ -133,24 +132,32 @@ def compute_sigma(windows: list[int], close_series: pd.Series) -> float:
 
 # ── Resolution ─────────────────────────────────────────────────────────────────
 
-def resolve_window(pm_window: pd.DataFrame, window_move: float) -> bool | None:
-    """
-    0.95/0.05 PM threshold, fallback to coin direction.
-    Returns None if window_move == 0 and PM is ambiguous.
-    """
-    if not pm_window.empty and "up_price" in pm_window.columns:
-        last_up = pm_window.sort_values("ts")["up_price"].dropna()
-        if not last_up.empty:
-            v = float(last_up.iloc[-1])
-            if v >= 0.95:
-                return True
-            if v <= 0.05:
-                return False
+def resolve_window(window_move: float) -> bool | None:
+    """Resolve window direction from coin price move only."""
     if window_move > 0:
         return True
     if window_move < 0:
         return False
     return None
+
+
+def build_coin_windows(close_series: pd.Series) -> list[int]:
+    """Build window start timestamps aligned to real 5-minute UTC boundaries."""
+    ts_idx = close_series.index.values
+    if len(ts_idx) == 0:
+        return []
+    first_ts = int(ts_idx[0])
+    last_ts  = int(ts_idx[-1])
+
+    # Align to real 5-minute boundaries (epoch multiples of WINDOW_SECS)
+    start = (first_ts // WINDOW_SECS) * WINDOW_SECS
+    if first_ts % WINDOW_SECS != 0:
+        start += WINDOW_SECS
+    end = (last_ts // WINDOW_SECS) * WINDOW_SECS
+
+    if start > end:
+        return []
+    return list(range(start, end + 1, WINDOW_SECS))
 
 
 # ── Per-window feature computation ────────────────────────────────────────────
@@ -249,9 +256,10 @@ def build_asset_dataset(
     sigma:         float,
 ) -> pd.DataFrame:
     """Build the full per-second dataset for one asset across all resolvable windows."""
-    windows      = sorted(pm_df["window_ts"].unique())
-    split_idx    = int(len(windows) * TRAIN_FRAC)
-    train_set    = set(windows[:split_idx])
+    windows = build_coin_windows(close_series)
+    market_windows = set(pm_df["window_ts"].unique()) if not pm_df.empty else set()
+    train_set = {w for w in windows if w not in market_windows}
+    test_set  = {w for w in windows if w in market_windows}
 
     ts_idx = close_series.index.values
     vals   = close_series.values
@@ -268,8 +276,7 @@ def build_asset_dataset(
             continue
 
         window_move = float(vals[hi - 1]) - float(vals[lo])
-        pm_window   = pm_df[pm_df["window_ts"] == wts]
-        label       = resolve_window(pm_window, window_move)
+        label       = resolve_window(window_move)
         if label is None:
             skipped_resolution += 1
             continue
@@ -282,7 +289,12 @@ def build_asset_dataset(
 
         feat_df["window_ts"]   = wts
         feat_df["resolved_up"] = int(label)
-        feat_df["split"]       = "train" if wts in train_set else "test"
+        if wts in test_set:
+            feat_df["split"] = "test"
+        elif wts in train_set:
+            feat_df["split"] = "train"
+        else:
+            feat_df["split"] = "train"
         all_frames.append(feat_df)
 
     if not all_frames:
