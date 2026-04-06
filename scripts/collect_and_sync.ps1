@@ -176,7 +176,7 @@ function Sync-Data([string]$label) {
 
         $changed = git diff --cached --name-only 2>&1
         $changedFiles = @($changed | Where-Object { $_ -and $_.Trim() -ne "" })
-        if ($changedFiles.Count -gt 0) {
+        if ($changedFiles.Count -gt 0) {    
             $commitCode = Run-Git @('commit','-m','data')
             if ($commitCode -eq 0) {
                 $pushCode = Run-Git @('push','-u','origin',$Branch)
