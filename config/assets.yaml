@@ -10,26 +10,42 @@
 #   wallet_pct   - percent of wallet to deploy per trade (default: from config.py)
 #   name         - instance name for trades/status files (default: momentum)
 
-BTC:  # best entry: 0.5σ  |  edge/fill: +9.6%  |  edge/session: +9.56%
-  sigma_value: 90.683081
-  sigma_entry: 0.5
+BTC:  # best entry: 0.2σ  |  edge/fill: +4.4%  |  edge/session: +4.37%
+  sigma_value: 95.239643
+  sigma_entry: 0.2
+  max_pm_price: 0.9 # lets try this, seems like it resolves consistently when passing according to our data
+  wallet_pct: 0.05
+  name: mom_btc
+  fixed_usdc: 1.75
+
+DOGE:  # best entry: 0.3σ  |  edge/fill: +9.2%  |  edge/session: +8.99%
+  sigma_value: 0.00015629591
+  sigma_entry: 0.3
+  max_pm_price: 0.72
+  wallet_pct: 0.05
+  name: mom_doge
+  fixed_usdc: 1.75
+
+ETH:  # best entry: 0.4σ  |  edge/fill: +1.1%  |  edge/session: +0.91%
+  sigma_value: 3.6357477
+  sigma_entry: 0.4
   max_pm_price: 0.78
   wallet_pct: 0.05
+  name: mom_eth
+  fixed_usdc: 1.75
 
-DOGE:  # best entry: 0.5σ  |  edge/fill: +20.7%  |  edge/session: +20.73%
-  sigma_value: 0.00015531532
-  sigma_entry: 0.5
-  max_pm_price: 0.78
+SOL:  # best entry: 0.4σ  |  edge/fill: +5.1%  |  edge/session: +4.51%
+  sigma_value: 0.15563089
+  sigma_entry: 0.4
+  max_pm_price: 0.79
   wallet_pct: 0.05
+  name: mom_sol
+  fixed_usdc: 1.75
 
-ETH:  # best entry: 0.5σ  |  edge/fill: +7.9%  |  edge/session: +7.93%
-  sigma_value: 3.4549562
-  sigma_entry: 0.5
-  max_pm_price: 0.80
-  wallet_pct: 0.05
-
-SOL:  # best entry: 0.5σ  |  edge/fill: +8.9%  |  edge/session: +8.89%
-  sigma_value: 0.15212417
-  sigma_entry: 0.5
-  max_pm_price: 0.78
-  wallet_pct: 0.05
+MODEL:
+  enabled: false          # set to false to disable model trading entirely
+  window_start: 0
+  window_end: 270
+  edge_threshold: .25
+  early_threshold: .30   # higher threshold for trades before second 30
+  fixed_usdc: 1.25

@@ -85,7 +85,7 @@ def main() -> None:
         "📈 Time Series",
         "🎯 High Buy",
         "⏱️ Timing",
-        "🔴 Live",
+        "🤖 Live Bots",
     ])
 
     if total == 0:

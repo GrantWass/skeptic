@@ -7,6 +7,7 @@ import logging
 import os
 import time
 
+import httpx
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     ApiCreds,
@@ -18,7 +19,11 @@ from py_clob_client.clob_types import (
     TradeParams,
     OpenOrderParams,
 )
+from py_clob_client.endpoints import POST_ORDER
+from py_clob_client.headers.headers import create_level_2_headers
+from py_clob_client.clob_types import RequestArgs
 from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client.utilities import order_to_json
 
 from skeptic import config
 from skeptic.models.order import Order
@@ -155,11 +160,16 @@ def _parse_fill(resp: dict, usdc_amount: float) -> tuple[float, float]:
     (shares received, 6 decimals). Fall back to 0 if absent so the caller can
     substitute the trigger price.
     """
-    making = float(resp.get("makingAmount") or 0)  # USDC in micro-units
-    taking = float(resp.get("takingAmount") or 0)  # shares in micro-units
-    if making > 0 and taking > 0:
-        fill_usdc  = making / 1e6
-        fill_size  = taking / 1e6
+    making = float(resp.get("makingAmount") or 0)
+    taking = float(resp.get("takingAmount") or 0)
+    # If values are too small, assume they're in normal units and need scaling up
+    if 0 < making < 1e-3 and 0 < taking < 1e-3:
+        fill_usdc = making * 1e6
+        fill_size = taking * 1e6
+    else:
+        fill_usdc = making / 1e6 if making > 1000 else making
+        fill_size = taking / 1e6 if taking > 1000 else taking
+    if fill_usdc > 0 and fill_size > 0:
         fill_price = round(fill_usdc / fill_size, 4)
         return fill_price, fill_size
     # Legacy fields
@@ -181,6 +191,104 @@ def post_presigned_order(
     if not order_id:
         raise RuntimeError(f"Market order failed: {resp}")
     fill_price, fill_size = _parse_fill(resp, usdc_amount)
+    logger.info("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f",
+                order_id, outcome, usdc_amount, fill_price, fill_size)
+    return Order(
+        order_id=order_id,
+        token_id=token_id,
+        outcome=outcome,
+        side="BUY",
+        price=fill_price,
+        size=fill_size,
+        status="FILLED",
+        placed_at=time.time(),
+        updated_at=time.time(),
+    )
+
+
+async def sign_and_post_async(
+    http: httpx.AsyncClient,
+    client: ClobClient,
+    token_id: str,
+    outcome: str,
+    usdc_amount: float,
+    price_cap: float = 0.85,
+) -> Order:
+    """
+    Sign and POST a FOK market order in the event loop.
+    sign (~3ms CPU) + POST (network) — no thread handoff.
+    Used for Kelly sizing where the amount isn't known until trigger time.
+    """
+    args = MarketOrderArgs(
+        token_id=token_id,
+        amount=usdc_amount,
+        side=BUY,
+        price=price_cap,
+        order_type=OrderType.FOK,
+    )
+    signed = client.create_market_order(args)
+    body = order_to_json(signed, client.creds.api_key, OrderType.FOK)
+    serialized = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+    request_args = RequestArgs(
+        method="POST",
+        request_path=POST_ORDER,
+        body=body,
+        serialized_body=serialized,
+    )
+    headers = create_level_2_headers(client.signer, client.creds, request_args)
+    url = f"{client.host}{POST_ORDER}"
+    resp = await http.post(url, content=serialized.encode(), headers=headers)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Order POST {resp.status_code}: {resp.text}")
+    data = resp.json()
+    order_id = data.get("orderID") or data.get("order_id", "")
+    if not order_id:
+        raise RuntimeError(f"Market order failed: {data}")
+    fill_price, fill_size = _parse_fill(data, usdc_amount)
+    logger.info("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f",
+                order_id, outcome, usdc_amount, fill_price, fill_size)
+    return Order(
+        order_id=order_id,
+        token_id=token_id,
+        outcome=outcome,
+        side="BUY",
+        price=fill_price,
+        size=fill_size,
+        status="FILLED",
+        placed_at=time.time(),
+        updated_at=time.time(),
+    )
+
+
+async def post_presigned_order_async(
+    http: httpx.AsyncClient,
+    client: ClobClient,
+    signed,
+    token_id: str,
+    outcome: str,
+    usdc_amount: float,
+) -> Order:
+    """
+    POST a pre-signed order using an async HTTP client — no thread handoff.
+    Identical semantics to post_presigned_order but runs in the event loop.
+    """
+    body = order_to_json(signed, client.creds.api_key, OrderType.FOK)
+    serialized = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+    request_args = RequestArgs(
+        method="POST",
+        request_path=POST_ORDER,
+        body=body,
+        serialized_body=serialized,
+    )
+    headers = create_level_2_headers(client.signer, client.creds, request_args)
+    url = f"{client.host}{POST_ORDER}"
+    resp = await http.post(url, content=serialized.encode(), headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
+    order_id = data.get("orderID") or data.get("order_id", "")
+    if not order_id:
+        raise RuntimeError(f"Market order failed: {data}")
+    fill_price, fill_size = _parse_fill(data, usdc_amount)
     logger.info("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f",
                 order_id, outcome, usdc_amount, fill_price, fill_size)
     return Order(
@@ -266,6 +374,18 @@ def get_usdc_balance(client: ClobClient) -> float:
         return float(result.get("balance", 0)) / 1e6  # micro-USDC → USDC
     except Exception as e:
         logger.error("get_usdc_balance failed: %s", e)
+        print("FULL ERROR:", repr(e))
+        return 0.0
+
+
+def get_token_balance(client: ClobClient, token_id: str) -> float:
+    """Return the conditional token balance (shares) for a given token ID."""
+    try:
+        params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+        result = client.get_balance_allowance(params)
+        return float(result.get("balance", 0)) / 1e6
+    except Exception as e:
+        logger.error("get_token_balance(%s) failed: %s", token_id[:16], e)
         return 0.0
 
 

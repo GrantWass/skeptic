@@ -31,14 +31,14 @@ logging.basicConfig(
 )
 
 
-def _load_asset_config(config_path: str, asset: str) -> dict:
-    """Load per-asset params from YAML config file. Returns {} if not found."""
+def _load_asset_config(config_path: str, asset: str) -> tuple[dict, dict]:
+    """Load per-asset params and MODEL section from YAML config file."""
     try:
         with open(config_path) as f:
             cfg = yaml.safe_load(f) or {}
-        return cfg.get(asset.upper(), {})
+        return cfg.get(asset.upper(), {}), cfg.get("MODEL", {})
     except FileNotFoundError:
-        return {}
+        return {}, {}
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +57,8 @@ def parse_args() -> argparse.Namespace:
                    help="Which direction to trade (default: both)")
     p.add_argument("--wallet-pct",   type=float, default=None,
                    help="Percent of wallet to deploy per trade (default: from config or POSITION_SIZE_PCT)")
+    p.add_argument("--fixed-usdc",   type=float, default=None,
+                   help="Fixed dollar amount per trade in USDC (overrides --wallet-pct)")
     p.add_argument("--dry-run",      action="store_true",
                    help="Log intended trades without placing real orders")
     p.add_argument("--name",         default="momentum",
@@ -65,11 +67,14 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
 
     # Fill unset args from config file
-    asset_cfg = _load_asset_config(args.config, args.asset)
+    asset_cfg, model_cfg = _load_asset_config(args.config, args.asset)
+    args.model_cfg = model_cfg
     if args.sigma_value  is None: args.sigma_value  = asset_cfg.get("sigma_value")
     if args.sigma_entry  is None: args.sigma_entry  = asset_cfg.get("sigma_entry")
     if args.max_pm_price is None: args.max_pm_price = asset_cfg.get("max_pm_price")
     if args.direction    is None: args.direction    = asset_cfg.get("direction", "both")
+    if args.name == "momentum":   args.name         = asset_cfg.get("name", args.name)
+    if args.fixed_usdc   is None: args.fixed_usdc = asset_cfg.get("fixed_usdc")
     if args.wallet_pct   is None:
         args.wallet_pct = asset_cfg.get("wallet_pct", float(config.POSITION_SIZE_PCT)) * 100
 
@@ -92,6 +97,11 @@ async def main() -> None:
     balance = clob_client.get_usdc_balance(client)
     threshold_move = args.sigma_entry * args.sigma_value
 
+    if args.fixed_usdc is not None:
+        per_trade_str = f"${args.fixed_usdc:.2f} (fixed)"
+    else:
+        per_trade_str = f"{wallet_pct:.1%} of wallet (~${balance * wallet_pct:,.2f})"
+
     print(f"\nSkeptic Live Momentum-Buy Executor")
     print(f"  Asset         : {args.asset}")
     print(f"  Sigma value   : {args.sigma_value}")
@@ -100,7 +110,7 @@ async def main() -> None:
     print(f"  Direction     : {args.direction}")
     print(f"  Wallet        : {config.WALLET_ADDRESS}")
     print(f"  Balance       : ${balance:,.2f} USDC")
-    print(f"  Per trade     : {wallet_pct:.1%} of wallet (~${balance * wallet_pct:,.2f})")
+    print(f"  Per trade     : {per_trade_str}")
     print(f"  Dry run       : {args.dry_run}\n")
 
     if not args.dry_run:
@@ -116,8 +126,10 @@ async def main() -> None:
         max_pm_price=args.max_pm_price,
         direction=args.direction,
         wallet_pct=wallet_pct,
+        fixed_usdc=args.fixed_usdc,
         dry_run=args.dry_run,
         name=args.name,
+        model_cfg=args.model_cfg,
     )
     await executor.run()
 

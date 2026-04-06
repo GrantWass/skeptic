@@ -221,6 +221,10 @@ class MarketChannel:
         """Return best ask (what you'd actually pay to buy)."""
         return self.price_cache.get_ask(token_id)
 
+    def get_bid(self, token_id: str) -> float | None:
+        """Return best bid (what you'd receive when selling)."""
+        return self.price_cache.get_bid(token_id)
+
     async def subscribe(self, *token_ids: str) -> None:
         for tid in token_ids:
             self._subscribed_tokens.add(tid)

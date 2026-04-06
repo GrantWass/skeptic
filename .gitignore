@@ -21,3 +21,4 @@ build/
 data/live/
 data/live/*.json
 data/live/*.csv
+.claude
