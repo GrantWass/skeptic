@@ -4,22 +4,39 @@ Slippage report for live momentum trades.
 
 Slippage = fill_price - trigger_pm_price (positive = paid more than mid at trigger).
 
+Loads all trades_mom_*.csv files from data/live/ by default.
+
 Usage:
     python scripts/slippage_report.py
-    python scripts/slippage_report.py --csv data/live/trades_momentum.csv
+    python scripts/slippage_report.py --live-dir data/live
+    python scripts/slippage_report.py --csv data/live/trades_mom_btc.csv  # single file override
 """
 import argparse
 import sys
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--csv", default="data/live/trades_momentum.csv")
+    p.add_argument("--live-dir", default="data/live",
+                   help="Directory containing trades_mom_*.csv files (default: data/live)")
+    p.add_argument("--csv", default=None,
+                   help="Single CSV file override (skips --live-dir glob)")
     args = p.parse_args()
 
-    df = pd.read_csv(args.csv)
+    if args.csv:
+        frames = [pd.read_csv(args.csv)]
+    else:
+        files = sorted(Path(args.live_dir).glob("trades_mom_*.csv"))
+        if not files:
+            print(f"No trades_mom_*.csv files found in {args.live_dir}")
+            sys.exit(0)
+        frames = [pd.read_csv(f) for f in files]
+        print(f"Loaded {len(files)} file(s): {', '.join(f.name for f in files)}\n")
+
+    df = pd.concat(frames, ignore_index=True)
 
     # drop dry runs and keep one row per trade (the resolved/final status row)
     df = df[df["order_id"] != "DRY_RUN"]

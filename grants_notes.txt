@@ -8,9 +8,8 @@ python scripts/filter_incomplete_windows.py
 
 sudo pmset -a disablesleep 1
 tmux new -s skeptic
-bash scripts/collect_loop.sh
-# Ctrl+B, D to detach
-Reattach later with tmux attach -t skeptic.
+source .venv/bin/activate
+python ./scripts/collect_prices.py
 tmux kill-session -t skeptic
 sudo pmset -a disablesleep 0
 
@@ -29,18 +28,17 @@ python scripts/audit_slippage.py
 python scripts/live_high_buy.py --threshold 0.74 --assets BTC --cutoff 180 --name btchigh
 python scripts/live_high_buy.py --threshold 0.78 --assets DOGE --cutoff 60 --name dogehigh
 
+
 python scripts/fetch_coin_prices.py
-python scripts/threshold_edge.py --assets BTC DOGE 
 
 ## MOMENTUM ##
 
+streamlit run scripts/live_dashboard.py
+
 python scripts/slippage_report.py
 python scripts/threshold_edge.py
+python scripts/threshold_edge.py --assets BTC DOGE ETH SOL --no-ewma
 
-python scripts/live_momentum_buy.py \
-  --asset DOGE \
-  --sigma-value 0.00014810474 \
-  --sigma-entry 0.5 \
-  --max-pm-price 0.87 \
-  --dry-run
-
+python scripts/train_model.py --assets BTC
+python scripts/backtest_model.py --sweep           # sweep all thresholds
+python scripts/backtest_model.py --threshold 0.10 --out-csv data/reports/backtest_trades.csv
