@@ -182,13 +182,29 @@ def parse_args() -> argparse.Namespace:
                    help="Override end Unix timestamp (seconds)")
     p.add_argument("--out-dir", default=OUTPUT_DIR,
                    help="Output directory for coin price CSVs")
+    p.add_argument("--start-february", action="store_true",
+                   help="Set start timestamp to Feb 1 of the current year (UTC), overrides --start if given.")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    if args.start and args.end:
+
+    # Determine start and end timestamps
+    if args.start_february:
+        # Set start_ts to Feb 1 of the current year, 00:00:00 UTC
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        start_ts = int(datetime(now.year, 2, 1, tzinfo=timezone.utc).timestamp())
+        log.info("--start-february: Forcing start timestamp to %d (Feb 1, %d UTC)", start_ts, now.year)
+        # End time logic
+        if args.end:
+            end_ts = args.end
+        else:
+            log.info("Scanning %s for end time…", args.prices_dir)
+            _, end_ts = _get_price_time_range(args.prices_dir)
+    elif args.start and args.end:
         start_ts, end_ts = args.start, args.end
     else:
         log.info("Scanning %s for time range…", args.prices_dir)
