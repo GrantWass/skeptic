@@ -50,10 +50,10 @@ ASSET_TO_SYMBOL = {
 # Added to pm_price so edge = win_rate - (pm_price + slippage) — reflects real cost.
 # Update from scripts/slippage_report.py as more data accumulates.
 SLIPPAGE: dict[str, float] = {
-    "BTC":  0.0299,
-    "DOGE": 0.0730,
-    "ETH":  0.0527,
-    "SOL":  0.0398,
+    "BTC":  0.0411,
+    "DOGE": 0.0830,
+    "ETH":  0.0536,
+    "SOL":  0.0376,
 }
 
 
@@ -1178,13 +1178,13 @@ def build_report(
         "",
         "---",
         "",
-        "## 1. Summary — Edge by Asset / Sigma",
+        "## Summary — Edge by Asset / Sigma",
         "",
         section_summary(df),
         "",
         "---",
         "",
-        "## 2. Price Filter — Edge When Trading Below Win Rate",
+        "## Price Filter — Edge When Trading Below Win Rate",
         "",
         "Your actual strategy: only enter when `pm_price < win_rate` for that asset/sigma.",
         "Trades above the win rate hurdle are skipped — shown here to confirm they have negative edge.",
@@ -1193,7 +1193,7 @@ def build_report(
         "",
         "---",
         "",
-        "## 3. Trigger Timing — Does It Matter When in the Window the Coin Moves?",
+        "## Trigger Timing — Does It Matter When in the Window the Coin Moves?",
         "",
         "Early triggers (0–60s) leave more time for the market to catch up.",
         "Late triggers (180–300s) give less time but may have higher certainty.",
@@ -1202,7 +1202,7 @@ def build_report(
         "",
         "---",
         "",
-        "## 4. Hour of Day (UTC) — When Is the Edge Largest?",
+        "## Hour of Day (UTC) — When Is the Edge Largest?",
         "",
         "Thinner hours may have slower Polymarket repricing → more edge.",
         "",
@@ -1210,7 +1210,7 @@ def build_report(
         "",
         "---",
         "",
-        "## 5. Cascade Rate — If Coin Crosses 0.5σ, How Often Does It Reach Higher Sigmas?",
+        "## Cascade Rate — If Coin Crosses 0.5σ, How Often Does It Reach Higher Sigmas?",
         "",
         "Shows momentum continuation. High cascade% at lower base sigmas means",
         "a small initial move is a reliable precursor to a larger one.",
@@ -1219,7 +1219,7 @@ def build_report(
         "",
         "---",
         "",
-        "## 6. Time to Reprice — How Long Does the Edge Window Last?",
+        "## Time to Reprice — How Long Does the Edge Window Last?",
         "",
         "`never_repriced%` = windows where PM price never reached the actual win rate",
         "before the window closed — the edge persisted all the way to resolution.",
@@ -1228,16 +1228,7 @@ def build_report(
         "",
         "---",
         "",
-        "## 7. Velocity Into Trade — Does Faster = Better?",
-        "",
-        "How fast the coin was moving (in σ units) in the seconds before trigger,",
-        "split by whether the trade won or lost.",
-        "",
-        section_velocity(df),
-        "",
-        "---",
-        "",
-        "## 8. Edge by Half-Day — Is It Profitable on All Days?",
+        "## Edge by Half-Day — Is It Profitable on All Days?",
         "",
         "Each half-day = 12-hour block (AM = 00:00–11:59 UTC, PM = 12:00–23:59 UTC).",
         "Rows sorted oldest → newest. Negative edge rows are highlighted with `[!]`.",
@@ -1246,7 +1237,7 @@ def build_report(
         "",
         "---",
         "",
-        "## 10. EWMA vs Static Sigma — Adaptive Volatility Comparison",
+        "## EWMA vs Static Sigma — Adaptive Volatility Comparison",
         "",
         "Static sigma is a single value computed over the entire history. "
         "EWMA (Exponentially Weighted Moving Average) sigma adapts after each session, "
@@ -1456,7 +1447,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--assets",     nargs="+", default=list(ASSET_TO_SYMBOL.keys()))
     p.add_argument("--prices-dir", default="data/prices")
     p.add_argument("--coin-dir",   default="data/coin_prices")
-    p.add_argument("--sigma",      nargs="+", type=float, default=[0.2, 0.3, 0.4, 0.5, 1.0, 1.5])
+    p.add_argument("--sigma",      nargs="+", type=float, default=[0.25, 0.5, 0.75, 1.0])
     p.add_argument("--out-csv",    default="data/reports/threshold_edge.csv")
     p.add_argument("--out-report", default="data/reports/threshold_edge.md")
     p.add_argument(

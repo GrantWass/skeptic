@@ -39,16 +39,6 @@ def print_stats(label: str, df: pd.DataFrame) -> None:
     print(f"  Max           : {slip.max():+.4f}  ({slip.max() * 100:+.2f}¢)")
     print(f"  Std dev       : {slip.std():+.4f}")
     print()
-    print(f"  {'Order':<18}  {'Asset':<6}  {'Side':<5}  {'Threshold':>9}  {'Fill':>6}  {'Slippage':>9}  Status")
-    print(f"  {'─'*18}  {'─'*6}  {'─'*5}  {'─'*9}  {'─'*6}  {'─'*9}  {'─'*10}")
-    for _, r in df.sort_values("ts").iterrows():
-        order_short = str(r["order_id"])[:16] + "…"
-        print(
-            f"  {order_short:<18}  {r['asset']:<6}  {r['side']:<5}  "
-            f"{r['threshold']:>9.2f}  {r['fill_price']:>6.4f}  "
-            f"{r['slippage']:>+8.4f}  {r.get('status', '—')}"
-        )
-
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Audit slippage across live trade files")

@@ -32,7 +32,8 @@ def kelly_usdc(
         fixed_usdc:      minimum stake (returned when edge <= edge_threshold)
         kelly_max_usdc:  maximum stake regardless of edge
     """
-    if edge <= 0 or edge_threshold <= 0:
+    # TODO: go back to this
+    if edge <= 0 or edge_threshold <= 0 or True:
         return fixed_usdc
     multiplier = edge / edge_threshold
     stake = fixed_usdc * multiplier

@@ -145,6 +145,30 @@ def _kv(label: str, value: str, color: str = "#9ca3af") -> str:
             f"<span style='font-size:0.85em;margin-left:3px'>{value}</span>")
 
 
+def _downsample_every_2s(xs: list[float], ys: list[float]) -> tuple[list[float], list[float]]:
+    """Keep one plotted point per 2-second bucket for compact bot-card charts."""
+    if not xs or len(xs) != len(ys):
+        return xs, ys
+
+    keep_x: list[float] = []
+    keep_y: list[float] = []
+    last_bucket = None
+
+    for x, y in zip(xs, ys):
+        bucket = int(max(x, 0) // 2)
+        if bucket != last_bucket:
+            keep_x.append(x)
+            keep_y.append(y)
+            last_bucket = bucket
+
+    # Always include latest point so "now" aligns with current state.
+    if keep_x[-1] != xs[-1]:
+        keep_x.append(xs[-1])
+        keep_y.append(ys[-1])
+
+    return keep_x, keep_y
+
+
 def _render_bot_card(coin: str, s: dict, idx: int = 0, model_cfg: dict | None = None) -> None:
     _model_cfg = model_cfg or {}
     age       = time.time() - s.get("updated_at", 0)
@@ -204,6 +228,7 @@ def _render_bot_card(coin: str, s: dict, idx: int = 0, model_cfg: dict | None = 
                 n   = len(ph)
                 xs  = [i / max(n - 1, 1) * elapsed_now for i in range(n)]
                 ys  = [(p - (coin_open or ph[0])) / sigma_val for p in ph]
+                xs, ys = _downsample_every_2s(xs, ys)
 
                 triggered = filled or (trade is not None)
                 line_color = "#22c55e" if triggered else "#60a5fa"
