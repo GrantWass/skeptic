@@ -31,14 +31,27 @@ logging.basicConfig(
 )
 
 
-def _load_asset_config(config_path: str, asset: str) -> tuple[dict, dict]:
-    """Load per-asset params and MODEL section from YAML config file."""
+def _load_asset_config(config_path: str, asset: str) -> tuple[dict, dict, dict]:
+    """Load per-asset params, MOMENTUM, and MODEL config from YAML config file.
+
+    Returns (asset_cfg, momentum_cfg, model_cfg) where momentum_cfg and model_cfg
+    are global sections merged with per-asset overrides.
+    """
     try:
         with open(config_path) as f:
             cfg = yaml.safe_load(f) or {}
-        return cfg.get(asset.upper(), {}), cfg.get("MODEL", {})
+        asset_cfg = cfg.get(asset.upper(), {})
+        global_momentum = cfg.get("MOMENTUM", {})
+        global_model = cfg.get("MODEL", {})
+        # Merge per-asset configs with global defaults
+        # Per-asset settings override global defaults
+        per_asset_momentum = asset_cfg.get("momentum", {})
+        per_asset_model = asset_cfg.get("model", {})
+        momentum_cfg = {**global_momentum, **per_asset_momentum}
+        model_cfg = {**global_model, **per_asset_model}
+        return asset_cfg, momentum_cfg, model_cfg
     except FileNotFoundError:
-        return {}, {}
+        return {}, {}, {}
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,14 +80,16 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
 
     # Fill unset args from config file
-    asset_cfg, model_cfg = _load_asset_config(args.config, args.asset)
+    asset_cfg, momentum_cfg, model_cfg = _load_asset_config(args.config, args.asset)
+    args.momentum_cfg = momentum_cfg
     args.model_cfg = model_cfg
     if args.sigma_value  is None: args.sigma_value  = asset_cfg.get("sigma_value")
     if args.sigma_entry  is None: args.sigma_entry  = asset_cfg.get("sigma_entry")
     if args.max_pm_price is None: args.max_pm_price = asset_cfg.get("max_pm_price")
     if args.direction    is None: args.direction    = asset_cfg.get("direction", "both")
     if args.name == "momentum":   args.name         = asset_cfg.get("name", args.name)
-    if args.fixed_usdc   is None: args.fixed_usdc = asset_cfg.get("fixed_usdc")
+    if args.fixed_usdc   is None:
+        args.fixed_usdc = asset_cfg.get("fixed_usdc") or model_cfg.get("fixed_usdc")
     if args.wallet_pct   is None:
         args.wallet_pct = asset_cfg.get("wallet_pct", float(config.POSITION_SIZE_PCT)) * 100
 
@@ -111,6 +126,10 @@ async def main() -> None:
     print(f"  Wallet        : {config.WALLET_ADDRESS}")
     print(f"  Balance       : ${balance:,.2f} USDC")
     print(f"  Per trade     : {per_trade_str}")
+    momentum_enabled = args.momentum_cfg.get("enabled", True)
+    model_enabled    = args.model_cfg.get("enabled", True)
+    print(f"  Momentum      : {'ENABLED' if momentum_enabled else 'DISABLED'}")
+    print(f"  Model         : {'ENABLED' if model_enabled else 'DISABLED'}")
     print(f"  Dry run       : {args.dry_run}\n")
 
     if not args.dry_run:
@@ -130,6 +149,7 @@ async def main() -> None:
         dry_run=args.dry_run,
         name=args.name,
         model_cfg=args.model_cfg,
+        momentum_cfg=args.momentum_cfg,
     )
     await executor.run()
 

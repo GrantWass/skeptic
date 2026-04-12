@@ -1,6 +1,6 @@
 """Kelly-style stake sizing: scale from fixed_usdc (minimum) up to kelly_max_usdc."""
 
-KELLY_MAX_USDC = 3.00          # absolute max stake regardless of edge
+KELLY_MAX_USDC = 2.00          # absolute max stake regardless of edge
 MOMENTUM_EDGE_THRESHOLD = 0.10  # momentum: edge at which scaling begins (max_pm_price - pm_ask)
 
 
@@ -33,7 +33,7 @@ def kelly_usdc(
         kelly_max_usdc:  maximum stake regardless of edge
     """
     # TODO: go back to this
-    if edge <= 0 or edge_threshold <= 0 or True:
+    if edge <= 0 or edge_threshold <= 0:
         return fixed_usdc
     multiplier = edge / edge_threshold
     stake = fixed_usdc * multiplier
