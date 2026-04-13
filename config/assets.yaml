@@ -9,39 +9,73 @@
 #   direction    - "up", "down", or "both" (default: both)
 #   wallet_pct   - percent of wallet to deploy per trade (default: from config.py)
 #   name         - instance name for trades/status files (default: momentum)
+#   momentum     - per-coin momentum trading config (overrides global MOMENTUM defaults)
+#   model        - per-coin model trading config (overrides global MODEL defaults)
 
-BTC:  # best entry: 0.4σ  |  edge/fill: +4.4%  |  edge/session: +4.37%
-  sigma_value: 95.239643
-  sigma_entry: 0.5
-  max_pm_price: 0.82 
-  name: mom_btc
-  fixed_usdc: 1.75
+# Global strategy defaults (can be overridden per coin)
+MOMENTUM:
+  fixed_usdc: 1.1
 
-DOGE:  # best entry: 0.3σ  |  edge/fill: +9.2%  |  edge/session: +8.99%
-  sigma_value: 0.00015629591
-  sigma_entry: 0.5
-  max_pm_price: 0.82
-  name: mom_doge
-  fixed_usdc: 1.75
-
-ETH:  # best entry: 0.4σ  |  edge/fill: +1.1%  |  edge/session: +0.91%
-  sigma_value: 3.6357477
-  sigma_entry: 0.5
-  max_pm_price: 0.82
-  name: mom_eth
-  fixed_usdc: 1.75
-
-SOL:  # best entry: 0.4σ  |  edge/fill: +5.1%  |  edge/session: +4.51%
-  sigma_value: 0.15563089
-  sigma_entry: 0.5
-  max_pm_price: 0.82
-  name: mom_sol
-  fixed_usdc: 1.75
 
 MODEL:
-  enabled: false          # set to false to disable model trading entirely
-  window_start: 0
+  window_start: 15
   window_end: 270
-  edge_threshold: .25
-  early_threshold: .30   # higher threshold for trades before second 30
-  fixed_usdc: 1.25
+  edge_threshold: .20
+  fixed_usdc: 1.1
+  multi_trade_cooldown: 10 # 0 = one trade per window; N = re-enter every N seconds while edge >= threshold
+  max_trades_per_window: 3 # maximum number of trades allowed per window (0 = unlimited)
+  max_slippage: 0.20       # max ask movement above trigger price before FOK rejects
+
+
+BTC:  # best entry: 0.25σ  |  edge/fill: +6.2%  |  edge/session: +6.13%
+  sigma_value: 45.247387
+  sigma_entry: 0.25
+  max_pm_price: 0.62
+  name: mom_btc
+  momentum:
+    enabled: true
+  model:
+    enabled: false
+
+
+DOGE:  # best entry: 0.25σ  |  edge/fill: +7.1%  |  edge/session: +7.04%
+  sigma_value: 9.1459826e-05
+  sigma_entry: 0.5
+  max_pm_price: 0.73
+  name: mom_doge
+  momentum:
+    enabled: true
+  model:
+    enabled: false
+
+
+ETH:  # best entry: 0.25σ  |  edge/fill: +5.3%  |  edge/session: +5.27%
+  sigma_value: 1.8037128
+  sigma_entry: 0.25
+  max_pm_price: 0.62
+  name: mom_eth
+  momentum:
+    enabled: true
+  model:
+    enabled: false
+
+
+SOL:  # best entry: 0.5σ  |  edge/fill: +8.7%  |  edge/session: +6.79%
+  sigma_value: 0.075576743
+  sigma_entry: 0.5
+  max_pm_price: 0.73
+  name: mom_sol
+  momentum:
+    enabled: true
+  model:
+    enabled: false
+
+BNB:  # best entry: 0.25σ  |  edge/fill: +5.2%  |  edge/session: +5.18%
+  sigma_value: 0.34608524
+  sigma_entry: 0.5
+  max_pm_price: 0.75
+  name: mom_bnb
+  momentum:
+    enabled: true
+  model:
+    enabled: false
