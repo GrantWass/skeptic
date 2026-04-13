@@ -26,11 +26,18 @@ from typing import Any
 
 import joblib
 import numpy as np
+import pandas as pd
 import httpx
 import websockets
 
 from skeptic import config
 from skeptic.clients import clob as clob_client
+
+_BALANCE_PHRASES = ("insufficient", "not enough", "balance", "funds")
+
+
+class InsufficientBalanceError(RuntimeError):
+    """Raised when an order is rejected due to insufficient USDC balance."""
 from skeptic.clients import ctf as ctf_client
 from skeptic.clients import gamma
 from skeptic.clients.ws import MarketChannel
@@ -132,22 +139,26 @@ ASSET_TO_SYMBOL = {
 
 TRADE_FIELDS = [
     "ts", "asset", "side", "token_id",
-    "fill_price", "fill_size", "fill_usdc",
+    "fill_price", "fill_size", "fill_usdc", "fee_usdc",
     "sigma_value", "sigma_entry", "max_pm_price",
-    "coin_open", "coin_trigger", "coin_move",
+    "elapsed_second", "coin_open", "coin_trigger", "coin_move",
     "slippage", "window_start_ts", "window_end_ts",
+    "sign_ms", "post_ms", "order_ms",
     "resolution", "pnl_usdc", "status", "order_id",
 ]
 
-SLIPPAGE = 0.05
+SLIPPAGE = 0.075
+BUY_FEE_RATE = 0.015
 MODEL_EDGE_THRESHOLD = 0.20   # min predicted_win - pm_ask to fire a model dry-run trade
+EWMA_LAMBDA = 0.95             # decay factor for walk-forward sigma estimate
 
 MODEL_TRADE_FIELDS = [
     "ts", "asset", "side", "token_id",
-    "fill_price", "fill_size", "fill_usdc",
+    "fill_price", "fill_size", "fill_usdc", "fee_usdc",
     "predicted_win", "edge",
     "elapsed_second", "coin_open", "coin_trigger", "coin_move",
     "window_start_ts", "window_end_ts",
+    "sign_ms", "post_ms", "order_ms",
     "resolution", "pnl_usdc", "status", "order_id", "slippage",
 ]
 
@@ -161,6 +172,7 @@ class ModelTrade:
     fill_price: float
     fill_size: float
     fill_usdc: float
+    fee_usdc: float
     predicted_win: float
     edge: float
     elapsed_second: int
@@ -169,6 +181,9 @@ class ModelTrade:
     coin_move: float
     window_start_ts: int
     window_end_ts: int
+    sign_ms: float | None = None   # ms for sign+POST combined (None for dry-run)
+    post_ms: float | None = None   # always None — model never uses presigned path
+    order_ms: float | None = None  # total ms from _execute_model_buy entry to order confirmed
     resolution: float | None = None
     pnl_usdc: float | None = None
     status: str = "open"
@@ -176,13 +191,40 @@ class ModelTrade:
     slippage: float = 0.0
 
 
-def _write_model_trade(trade: ModelTrade, trades_csv: str) -> None:
+def _ensure_model_csv(trades_csv: str) -> None:
     os.makedirs(LIVE_DIR, exist_ok=True)
-    write_header = not os.path.exists(trades_csv)
+    if not os.path.exists(trades_csv):
+        with open(trades_csv, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=MODEL_TRADE_FIELDS).writeheader()
+        return
+    with open(trades_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        existing_fields = reader.fieldnames or []
+        missing = [c for c in MODEL_TRADE_FIELDS if c not in existing_fields]
+        if not missing:
+            return
+        rows = list(reader)
+    tmp = trades_csv + ".migrate.tmp"
+    with open(tmp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=MODEL_TRADE_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            for col in missing:
+                row.setdefault(col, "")
+            w.writerow(row)
+    os.replace(tmp, trades_csv)
+    log.info("Migrated %s — added columns: %s", trades_csv, missing)
+
+
+_model_csv_ensured: set[str] = set()
+
+
+def _write_model_trade(trade: ModelTrade, trades_csv: str) -> None:
+    if trades_csv not in _model_csv_ensured:
+        _ensure_model_csv(trades_csv)
+        _model_csv_ensured.add(trades_csv)
     with open(trades_csv, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=MODEL_TRADE_FIELDS)
-        if write_header:
-            w.writeheader()
         w.writerow(asdict(trade))
 
 
@@ -195,15 +237,20 @@ class MomentumTrade:
     fill_price: float
     fill_size: float
     fill_usdc: float
+    fee_usdc: float
     sigma_value: float
     sigma_entry: float
     max_pm_price: float
+    elapsed_second: int
     coin_open: float
     coin_trigger: float
     coin_move: float
     slippage: float
     window_start_ts: int
     window_end_ts: int
+    sign_ms: float | None = None   # ms to sign the order (None if presigned path or dry-run)
+    post_ms: float | None = None   # ms for the HTTP POST to return (None on fresh-sign path)
+    order_ms: float | None = None  # total ms from _execute_buy entry to order confirmed (None if dry-run)
     resolution: float | None = None
     pnl_usdc: float | None = None
     status: str = "open"
@@ -215,6 +262,27 @@ def _ensure_live_dir(trades_csv: str) -> None:
     if not os.path.exists(trades_csv):
         with open(trades_csv, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=TRADE_FIELDS).writeheader()
+        return
+
+    # Migrate existing file if it's missing any columns from TRADE_FIELDS.
+    with open(trades_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        existing_fields = reader.fieldnames or []
+        missing = [c for c in TRADE_FIELDS if c not in existing_fields]
+        if not missing:
+            return
+        rows = list(reader)
+
+    tmp = trades_csv + ".migrate.tmp"
+    with open(tmp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=TRADE_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            for col in missing:
+                row.setdefault(col, "")
+            w.writerow(row)
+    os.replace(tmp, trades_csv)
+    log.info("Migrated %s — added columns: %s", trades_csv, missing)
 
 
 def _write_trade(trade: MomentumTrade, trades_csv: str) -> None:
@@ -250,6 +318,7 @@ class MomentumBuyExecutor:
         dry_run: bool = False,
         name: str = "momentum",
         model_cfg: dict | None = None,
+        momentum_cfg: dict | None = None,
     ) -> None:
         assert direction in ("up", "down", "both"), "direction must be 'up', 'down', or 'both'"
         self.asset        = asset
@@ -260,16 +329,19 @@ class MomentumBuyExecutor:
         self.wallet_pct   = wallet_pct
         self.fixed_usdc      = fixed_usdc
         self.dry_run         = dry_run
+        _mom = momentum_cfg or {}
+        self._momentum_enabled: bool = bool(_mom.get("enabled", True))
         _mc = model_cfg or {}
         self._model_cfg = _mc
         self._model_enabled:         bool        = bool(_mc.get("enabled", True))
         self._model_window_start:    int         = int(_mc.get("window_start", 0))
         self._model_window_end:      int         = int(_mc.get("window_end",   300))
-        self._model_edge_threshold:  float       = float(_mc.get("edge_threshold", MODEL_EDGE_THRESHOLD))
-        self._model_early_threshold: float | None = (
-            float(_mc["early_threshold"]) if "early_threshold" in _mc else None
-        )
-        self._model_fixed_usdc:      float | None = _mc.get("fixed_usdc")
+        self._MODEL_EDGE_THRESHOLD:  float       = float(_mc.get("edge_threshold", MODEL_EDGE_THRESHOLD))
+        self._model_fixed_usdc:         float | None = _mc.get("fixed_usdc")
+
+        self._model_multi_trade_cooldown: int        = int(_mc.get("multi_trade_cooldown", 0))
+        self._model_max_trades_per_window: int       = int(_mc.get("max_trades_per_window", 3))
+        self._model_max_slippage:          float     = float(_mc.get("max_slippage", 0.10))
 
         self._symbol = ASSET_TO_SYMBOL.get(asset.upper())
         if self._symbol is None:
@@ -293,6 +365,11 @@ class MomentumBuyExecutor:
             except Exception as exc:
                 log.warning("Could not load model for %s: %s", asset, exc)
 
+        # EWMA sigma state — updated after every completed window
+        # Initialize from config sigma^2 so the first live update treats config sigma as prior state.
+        self._sigma_initial: float = sigma_value
+        self._ewma_var: float = float(sigma_value) ** 2
+
         # Per-window state
         self._market:   Market | None = None
         self._filled:   bool = False
@@ -307,21 +384,44 @@ class MomentumBuyExecutor:
         # (timestamp, price) ring buffer — used to compute velocity/acceleration features
         self._price_history: deque[tuple[float, float]] = deque(maxlen=60)
         # Model dry-run state — separate from live trading state
-        self._model_filled: bool = False
-        self._model_trade:  ModelTrade | None = None
+        self._model_last_fire_ts: float | None = None   # None = not fired this window
+        self._model_trades: list[ModelTrade]   = []     # all trades this window
+        self._model_trade:  ModelTrade | None  = None   # most recent trade (for status display)
 
     # ── Public ────────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
         _ensure_live_dir(self._trades_csv)
-        async with httpx.AsyncClient() as http:
+        _ensure_model_csv(self._model_trades_csv)
+        _model_csv_ensured.add(self._model_trades_csv)
+        async with httpx.AsyncClient(http2=True, limits=httpx.Limits(max_connections=50, max_keepalive_connections=12)) as http:
             self._http = http
             ws_task          = asyncio.create_task(self._ws.run())
             coin_stream_task = asyncio.create_task(self._coin_stream.run())
             status_task      = asyncio.create_task(self._status_loop())
 
-            # Give the Binance streams a moment to receive their first prices
-            await asyncio.sleep(1.0)
+            # Warm up HTTP connection and crypto library on the dedicated signing executor.
+            from skeptic.clients.clob import _signing_executor
+            from py_clob_client.clob_types import MarketOrderArgs, OrderType
+            from py_clob_client.order_builder.constants import BUY
+
+            def _dummy_sign() -> None:
+                try:
+                    self._clob.create_market_order(MarketOrderArgs(
+                        token_id="0x" + "aa" * 32, amount=1.0, side=BUY,
+                        price=0.50, order_type=OrderType.FOK,  # type: ignore[arg-type]
+                    ))
+                except Exception:
+                    pass
+
+            loop = asyncio.get_event_loop()
+            await asyncio.gather(
+                loop.run_in_executor(_signing_executor, _dummy_sign),
+                http.get(f"{self._clob.host}/time"),
+                asyncio.sleep(1.0),
+                return_exceptions=True,
+            )
+            log.info("Warmup complete (signing thread + HTTP connection)")
 
             try:
                 while True:
@@ -341,6 +441,24 @@ class MomentumBuyExecutor:
                 coin_stream_task.cancel()
                 status_task.cancel()
 
+    def _disable_strategy_on_balance_error(self, strategy: str, side: str, exc: Exception) -> None:
+        """Disable one strategy for this asset after insufficient-balance rejection; keep process running."""
+        if strategy == "momentum":
+            self._momentum_enabled = False
+            self._filled = False
+        elif strategy == "model":
+            self._model_enabled = False
+            self._model_last_fire_ts = None
+
+        log.error(
+            "Insufficient balance on %s %s (%s): %s — disabling %s and switching it to DRY-RUN; executor will continue",
+            self.asset,
+            side,
+            strategy.upper(),
+            exc,
+            strategy,
+        )
+
     # ── Window ────────────────────────────────────────────────────────────────
 
     async def _run_window(self, window_start: int, window_end: int) -> None:
@@ -348,15 +466,30 @@ class MomentumBuyExecutor:
         self._trade         = None
         self._market        = None
         self._presigned     = {}
-        self._model_presigned: dict[str, object] = {}
         self._tp_sell_order_id = None
         self._coin_open     = None
         self._coin_current  = None
         self._window_start  = window_start
         self._window_end    = window_end
         self._price_history.clear()
-        self._model_filled = False
-        self._model_trade  = None
+        self._model_last_fire_ts = None
+        self._model_trades       = []
+        self._model_trade        = None
+
+        # Apply EWMA sigma for this window (estimated from all prior windows)
+        old_sigma = self.sigma_value
+        if self._ewma_var is not None:
+            new_sigma = float(self._ewma_var ** 0.5)
+            self.sigma_value = new_sigma
+            log.info(
+                "%s EWMA σ update: %.6g → %.6g  (λ=%.2f)",
+                self.asset, old_sigma, new_sigma, EWMA_LAMBDA,
+            )
+        else:
+            log.info(
+                "%s EWMA σ: using config seed %.6g (no prior windows yet)",
+                self.asset, self.sigma_value,
+            )
         balance = await asyncio.to_thread(clob_client.get_usdc_balance, self._clob)
         if self.fixed_usdc is not None:
             self._position_usdc = self.fixed_usdc
@@ -392,27 +525,17 @@ class MomentumBuyExecutor:
                 break
             await asyncio.sleep(0.1)
 
-        if not self.dry_run:
+        if not self.dry_run and self._momentum_enabled:
             for token_id in all_tokens:
                 try:
-                    signed = await asyncio.to_thread(
+                    presigned_tuple = await asyncio.to_thread(
                         clob_client.presign_market_order,
                         self._clob, token_id, self._position_usdc, 0.90,
                     )
-                    self._presigned[token_id] = signed
+                    self._presigned[token_id] = presigned_tuple
                 except Exception as exc:
                     log.warning("Pre-sign failed for %s: %s", token_id[:10], exc)
 
-            model_usdc = self._model_fixed_usdc if self._model_fixed_usdc is not None else self._position_usdc
-            for token_id in all_tokens:
-                try:
-                    signed = await asyncio.to_thread(
-                        clob_client.presign_market_order,
-                        self._clob, token_id, model_usdc, 0.90,
-                    )
-                    self._model_presigned[token_id] = signed
-                except Exception as exc:
-                    log.warning("Model pre-sign failed for %s: %s", token_id[:10], exc)
 
         # Watch until 8s before end
         watch_until = window_end - 8
@@ -427,11 +550,11 @@ class MomentumBuyExecutor:
                 pass
 
         # Snapshot state now — _run_window will reset these at the next window start
-        trade_snap       = self._trade
-        model_trade_snap = self._model_trade
-        market_snap      = self._market
-        coin_open_snap   = self._coin_open
-        coin_close_snap  = self._coin_current
+        trade_snap        = self._trade
+        model_trades_snap = list(self._model_trades)
+        market_snap       = self._market
+        coin_open_snap    = self._coin_open
+        coin_close_snap   = self._coin_current
 
         # Cancel any open take-profit sell before resolution
         if self._tp_sell_order_id:
@@ -444,41 +567,55 @@ class MomentumBuyExecutor:
                 trade_snap, market_snap, coin_open_snap, coin_close_snap, delay=8.0
             ))
 
-        if model_trade_snap and model_trade_snap.status == "open":
-            asyncio.create_task(self._resolve_model_bg(
-                model_trade_snap, market_snap, coin_open_snap, coin_close_snap, delay=8.0
-            ))
+        for _mt in model_trades_snap:
+            if _mt.status in ("open", "fok_killed"):
+                asyncio.create_task(self._resolve_model_bg(
+                    _mt, market_snap, coin_open_snap, coin_close_snap, delay=8.0
+                ))
 
         await self._ws.unsubscribe(*all_tokens)
 
+        # Update EWMA with this window's realized move (used as sigma for the NEXT window)
+        if coin_open_snap is not None and coin_close_snap is not None:
+            move = coin_close_snap - coin_open_snap
+            move_sq = move ** 2
+            if self._ewma_var is None:
+                self._ewma_var = move_sq   # seed on first completed window
+            else:
+                self._ewma_var = EWMA_LAMBDA * self._ewma_var + (1.0 - EWMA_LAMBDA) * move_sq
+
     async def _momentum_watch_loop(self) -> None:
         """
-        Trigger when momentum threshold is crossed on 3 consecutive trades.
-        The confirmation requirement filters single-trade spikes that are
-        common for lower-priced assets like SOL and DOGE.
+        Check threshold once per second using the latest aggTrade price —
+        matching the 1-second candle close used in backtesting.
+
+        aggTrades arrive many times per second; we accumulate them via
+        BinanceCoinStream and sample the latest price at each 1s tick.
+        This means a mid-second spike that reverts before the tick fires
+        will not trigger, exactly as in the training data.
 
         In dry-run mode, logs a per-tick DEBUG line and a 30-second INFO heartbeat
         so the stream health can be verified without placing real orders.
         """
-        CONFIRM_TRADES = 2
-
         threshold  = self.sigma_entry * self.sigma_value
         _skipped: set[str] = set()
         _stale_warns    = 0
-        _consec_up      = 0
-        _consec_dn      = 0
 
         while True:
-            coin_price = await self._coin_stream.next_price(timeout=8.0)
+            # Sleep until the next 1-second boundary, then sample the latest price.
+            # This matches the cadence of the 1s OHLCV candles used in training.
+            now = time.time()
+            await asyncio.sleep(1.0 - (now % 1.0))
 
-            if coin_price is None:
+            coin_price = self._coin_stream.get_price()
+
+            if coin_price is None or self._coin_stream.stale:
                 _stale_warns += 1
                 if _stale_warns % 3 == 1:
                     log.warning(
-                        "BinanceCoinStream stale (age=%.0f ms) — no price in 8s",
+                        "BinanceCoinStream stale (age=%.0f ms) — no price",
                         self._coin_stream.age_ms,
                     )
-                _consec_up = _consec_dn = 0
                 continue
 
             _stale_warns       = 0
@@ -491,15 +628,13 @@ class MomentumBuyExecutor:
             move   = coin_price - self._coin_open
             sigmas = move / self.sigma_value if self.sigma_value else 0.0
 
-            _consec_up = (_consec_up + 1) if move >= threshold  else 0
-            _consec_dn = (_consec_dn + 1) if move <= -threshold else 0
-
-            if self.direction in ("up", "both") and _consec_up >= CONFIRM_TRADES:
+            if self.direction in ("up", "both") and move >= threshold:
                 pm_price = self._ws.get_ask(self._market.up_token.token_id)
                 if pm_price is not None and pm_price <= self.max_pm_price:
                     log.info(
-                        "TRIGGER UP  coin_open=%g  coin_now=%g  move=%+g (%.2fσ)  pm_ask=%.4f",
+                        "TRIGGER UP  coin_open=%g  coin_now=%g  move=%+g (%.2fσ)  pm_ask=%.4f%s",
                         self._coin_open, coin_price, move, sigmas, pm_price,
+                        "  [MOMENTUM DISABLED]" if not self._momentum_enabled else "",
                     )
                     self._filled = True
                     _skipped.discard("up")
@@ -507,15 +642,16 @@ class MomentumBuyExecutor:
                                             pm_price, coin_price, move)
                 elif pm_price is not None:
                     _skipped.add("up")
-            elif move < threshold:
+            else:
                 _skipped.discard("up")
 
-            if self.direction in ("down", "both") and _consec_dn >= CONFIRM_TRADES:
+            if self.direction in ("down", "both") and move <= -threshold:
                 pm_price = self._ws.get_ask(self._market.down_token.token_id)
                 if pm_price is not None and pm_price <= self.max_pm_price:
                     log.info(
-                        "TRIGGER DOWN  coin_open=%g  coin_now=%g  move=%+g (%.2fσ)  pm_ask=%.4f",
+                        "TRIGGER DOWN  coin_open=%g  coin_now=%g  move=%+g (%.2fσ)  pm_ask=%.4f%s",
                         self._coin_open, coin_price, move, sigmas, pm_price,
+                        "  [MOMENTUM DISABLED]" if not self._momentum_enabled else "",
                     )
                     self._filled = True
                     _skipped.discard("down")
@@ -523,7 +659,7 @@ class MomentumBuyExecutor:
                                             pm_price, coin_price, move)
                 elif pm_price is not None:
                     _skipped.add("down")
-            elif move > -threshold:
+            else:
                 _skipped.discard("down")
 
     # ── Execution ─────────────────────────────────────────────────────────────
@@ -536,7 +672,7 @@ class MomentumBuyExecutor:
     def _model_kelly_stake(self, edge: float) -> float:
         """Scale model stake from fixed_usdc up to KELLY_MAX_USDC. fixed_usdc is the floor."""
         fixed = self._model_fixed_usdc if self._model_fixed_usdc is not None else self._position_usdc
-        return kelly_usdc(edge=edge, edge_threshold=self._model_edge_threshold, fixed_usdc=fixed)
+        return kelly_usdc(edge=edge, edge_threshold=self._MODEL_EDGE_THRESHOLD, fixed_usdc=fixed)
 
     async def _execute_buy(
         self,
@@ -546,9 +682,12 @@ class MomentumBuyExecutor:
         coin_trigger: float,
         coin_move: float,
     ) -> None:
+        t0 = time.perf_counter()
+
         # Kelly sizing: edge = max_pm_price - ask
         stake    = self._kelly_stake(self.max_pm_price - trigger_pm_price)
         est_size = round(stake / trigger_pm_price, 2)
+        fee_usdc = round(stake * BUY_FEE_RATE, 4)
 
         trade = MomentumTrade(
             ts=time.time(),
@@ -557,10 +696,12 @@ class MomentumBuyExecutor:
             token_id=token_id,
             fill_price=trigger_pm_price,
             fill_size=est_size,
-            fill_usdc=stake,
+            fill_usdc=round(stake + fee_usdc, 4),
+            fee_usdc=fee_usdc,
             sigma_value=self.sigma_value,
             sigma_entry=self.sigma_entry,
             max_pm_price=self.max_pm_price,
+            elapsed_second=int(time.time() - self._window_start),
             coin_open=self._coin_open,
             coin_trigger=coin_trigger,
             coin_move=coin_move,
@@ -569,36 +710,78 @@ class MomentumBuyExecutor:
             window_end_ts=self._window_end,
         )
 
-        if self.dry_run:
+        if self.dry_run or not self._momentum_enabled:
             log.info(
-                "[DRY RUN] BUY %s %s  $%.2f USDC  pm=%.4f  coin_open=%g  coin_now=%g  move=%+g",
+                "[%s] BUY %s %s  $%.2f USDC  pm=%.4f  coin_open=%g  coin_now=%g  move=%+g",
+                "DRY RUN" if self.dry_run else "MOMENTUM DISABLED",
                 self.asset, side, stake, trigger_pm_price,
                 self._coin_open, coin_trigger, coin_move,
             )
             trade.order_id = "DRY_RUN"
         else:
             try:
-                order = await clob_client.sign_and_post_async(
-                    self._http, self._clob, token_id, side, stake, price_cap=0.90,
-                )
+                presigned = self._presigned.get(token_id)
+                fixed = self.fixed_usdc if self.fixed_usdc is not None else self._position_usdc
+                if presigned is not None and stake <= fixed:
+                    # Fast path: Kelly didn't scale up — use pre-signed order.
+                    # Hot path cost: HMAC headers (~0.3ms) + network POST only.
+                    _, serialized_body, body_dict, pre_usdc = presigned
+                    t_post_start = time.perf_counter()
+                    order = await clob_client.post_preserialized_order_async(
+                        self._http, self._clob, serialized_body, body_dict,
+                        token_id, side, pre_usdc,
+                    )
+                    trade.sign_ms = None  # presigned — no sign cost at trigger time
+                    trade.post_ms = round((time.perf_counter() - t_post_start) * 1000, 1)
+                    stake = pre_usdc
+                    trade.fee_usdc = round(pre_usdc * BUY_FEE_RATE, 4)
+                    trade.fill_usdc = round(pre_usdc + trade.fee_usdc, 4)
+                else:
+                    # Kelly scaled up (or no pre-signed order) — sign fresh at trigger time.
+                    order, trade.sign_ms, trade.post_ms = await clob_client.sign_and_post_async(
+                        self._http, self._clob, token_id, side, stake, price_cap=0.90,
+                    )
 
+                trade.order_ms   = round((time.perf_counter() - t0) * 1000, 1)
                 trade.order_id   = order.order_id
                 trade.fill_price = order.price if order.price > 0 else trigger_pm_price
                 trade.fill_size  = order.size  if order.size  > 0 else est_size
-                trade.fill_usdc  = round(trade.fill_price * trade.fill_size, 4)
+                notional_usdc    = round(trade.fill_price * trade.fill_size, 4)
+                trade.fee_usdc   = round(notional_usdc * BUY_FEE_RATE, 4)
+                trade.fill_usdc  = round(notional_usdc + trade.fee_usdc, 4)
                 trade.slippage   = round(trade.fill_price - trigger_pm_price, 4)
+                _fmt_ms = lambda v: f"{v:.0f}ms" if v is not None else "—"
                 log.info(
-                    "FILLED  %s %s  %.4f shares @ %.4f  ($%.2f)  slippage=%+.4f  order=%s",
+                    "FILLED  %s %s  %.4f shares @ %.4f  ($%.2f incl fee %.4f)"
+                    "  slippage=%+.4f  order=%s  sign=%s post=%s total=%s",
                     self.asset, side, trade.fill_size, trade.fill_price,
-                    trade.fill_usdc, trade.slippage, order.order_id[:16],
+                    trade.fill_usdc, trade.fee_usdc, trade.slippage, order.order_id[:16],
+                    _fmt_ms(trade.sign_ms), _fmt_ms(trade.post_ms), _fmt_ms(trade.order_ms),
                 )
             except Exception as exc:
-                log.error("Order failed %s %s: %s", self.asset, side, exc)
-                trade.status = "order_failed"
-                err_str = str(exc)
-                if "fully filled" in err_str or "FOK" in err_str:
-                    self._filled = False  # FOK failure: allow retry in same window
-                # else: bad token / orderbook gone — don't retry
+                trade.order_ms = round((time.perf_counter() - t0) * 1000, 1)
+                err_str = str(exc).lower()
+                if any(p in err_str for p in _BALANCE_PHRASES):
+                    trade.status = "insufficient_balance_disabled"
+                    self._disable_strategy_on_balance_error("momentum", side, exc)
+                else:
+                    if "fully filled" in err_str or "fok" in err_str:
+                        # FOK killed — log as hypothetical with assumed slippage, resolve for analysis
+                        FOK_SLIPPAGE = 0.25
+                        trade.fill_price = round(trigger_pm_price + FOK_SLIPPAGE, 4)
+                        trade.fill_size  = round(stake / trade.fill_price, 2) if trade.fill_price > 0 else 0.0
+                        notional         = round(trade.fill_price * trade.fill_size, 4)
+                        trade.fee_usdc   = round(notional * BUY_FEE_RATE, 4)
+                        trade.fill_usdc  = round(notional + trade.fee_usdc, 4)
+                        trade.slippage   = FOK_SLIPPAGE
+                        trade.status     = "fok_killed"
+                        trade.order_id   = "FOK_KILLED"
+                        self._filled     = False  # allow retry in same window
+                        log.warning("FOK KILLED %s %s  hypothetical fill=%.4f (+%.2f slip)", self.asset, side, trade.fill_price, FOK_SLIPPAGE)
+                    else:
+                        log.error("Order failed %s %s: %s", self.asset, side, exc)
+                        trade.status = "order_failed"
+                        # bad token / orderbook gone — don't retry
 
         self._trade = trade
         await asyncio.to_thread(_write_trade, trade, self._trades_csv)
@@ -660,7 +843,8 @@ class MomentumBuyExecutor:
             open_ids = {o.get("id") or o.get("order_id") for o in open_orders}
             if self._tp_sell_order_id not in open_ids:
                 # Order gone from open orders — it filled
-                pnl = (self.TAKE_PROFIT_PRICE - trade.fill_price) * trade.fill_size
+                payout = self.TAKE_PROFIT_PRICE * trade.fill_size
+                pnl = payout - trade.fill_usdc
                 trade.pnl_usdc   = round(pnl, 4)
                 trade.status     = "won"
                 trade.resolution = self.TAKE_PROFIT_PRICE
@@ -683,10 +867,11 @@ class MomentumBuyExecutor:
         coin_close: "float | None",
         delay: float = 0.0,
     ) -> None:
-        if not trade or trade.status != "open":
+        if not trade or trade.status not in ("open", "fok_killed"):
             return
+        is_fok = trade.status == "fok_killed"
         await asyncio.sleep(delay)
-        if trade.status != "open":  # take-profit may have resolved it during the delay
+        if trade.status not in ("open", "fok_killed"):  # take-profit may have resolved it during the delay
             return
 
         # Poll PM up to 60s for settlement
@@ -717,10 +902,14 @@ class MomentumBuyExecutor:
             return
 
         win = (resolved_up and trade.side.upper() == "UP") or (not resolved_up and trade.side.upper() == "DOWN")
-        pnl = ((1.0 - trade.fill_price) if win else -trade.fill_price) * trade.fill_size
+        payout = trade.fill_size if win else 0.0
+        pnl = payout - trade.fill_usdc
         trade.resolution = 1.0 if resolved_up else 0.0
         trade.pnl_usdc   = round(pnl, 4)
-        trade.status     = "won" if win else "lost"
+        if is_fok:
+            trade.status = "fok_won" if win else "fok_lost"
+        else:
+            trade.status = "won" if win else "lost"
         log.info("RESOLVED  %s %s  PnL=$%.4f  %s", self.asset, trade.side, pnl, trade.status.upper())
         await asyncio.to_thread(_write_trade, trade, self._trades_csv)
 
@@ -733,8 +922,12 @@ class MomentumBuyExecutor:
         predicted_win: float,
         elapsed: int,
     ) -> None:
+        _trigger_ts = time.perf_counter()
+        paper_run = not self._model_enabled
         model_usdc = self._model_kelly_stake(edge)
-        est_size   = round(model_usdc / trigger_ask, 2) if trigger_ask > 0 else 0.0
+        fill_price = trigger_ask + SLIPPAGE if paper_run else trigger_ask
+        est_size   = round(model_usdc / fill_price, 2) if fill_price > 0 else 0.0
+        fee_usdc   = round(model_usdc * BUY_FEE_RATE, 4)
         coin_move  = (self._coin_current or self._coin_open or 0.0) - (self._coin_open or 0.0)
 
         mtrade = ModelTrade(
@@ -742,9 +935,10 @@ class MomentumBuyExecutor:
             asset=self.asset,
             side=side,
             token_id=token_id,
-            fill_price=trigger_ask,
+            fill_price=fill_price,
             fill_size=est_size,
-            fill_usdc=model_usdc,
+            fill_usdc=round(model_usdc + fee_usdc, 4),
+            fee_usdc=fee_usdc,
             predicted_win=round(predicted_win, 4),
             edge=round(edge, 4),
             elapsed_second=elapsed,
@@ -755,31 +949,58 @@ class MomentumBuyExecutor:
             window_end_ts=self._window_end,
         )
 
-        if self.dry_run:
+        if paper_run:
             mtrade.order_id = "DRY_RUN"
-            log.info("[MODEL] DRY-RUN ENTRY %s %s  predicted=%.1f%%  ask=%.3f  edge=%+.3f  elapsed=%ds",
-                     self.asset, side, predicted_win * 100, trigger_ask, edge, elapsed)
+            mtrade.slippage = SLIPPAGE
+            # sign_ms / post_ms / order_ms intentionally left None — no real order placed
+            log.info("[MODEL] DRY-RUN ENTRY %s %s  predicted=%.1f%%  ask=%.3f  fill=%.3f  edge=%+.3f  elapsed=%ds",
+                     self.asset, side, predicted_win * 100, trigger_ask, fill_price, edge, elapsed)
         else:
             try:
-                order = await clob_client.sign_and_post_async(
-                    self._http, self._clob, token_id, side, model_usdc, price_cap=0.90,
+                order, mtrade.sign_ms, mtrade.post_ms = await clob_client.sign_and_post_async(
+                    self._http, self._clob, token_id, side, model_usdc,
+                    price_cap=trigger_ask + self._model_max_slippage,
                 )
+                mtrade.order_ms   = round((time.perf_counter() - _trigger_ts) * 1000, 1)
                 mtrade.order_id   = order.order_id
                 mtrade.fill_price = order.price if order.price > 0 else trigger_ask
                 mtrade.fill_size  = order.size  if order.size  > 0 else est_size
-                mtrade.fill_usdc  = round(mtrade.fill_price * mtrade.fill_size, 4)
+                notional_usdc     = round(mtrade.fill_price * mtrade.fill_size, 4)
+                mtrade.fee_usdc   = round(notional_usdc * BUY_FEE_RATE, 4)
+                mtrade.fill_usdc  = round(notional_usdc + mtrade.fee_usdc, 4)
                 mtrade.slippage   = round(mtrade.fill_price - trigger_ask, 4)
-                log.info("[MODEL] FILLED %s %s  predicted=%.1f%%  %.4f shares @ %.4f  ($%.2f)  edge=%+.3f  elapsed=%ds",
+                log.info("[MODEL] FILLED %s %s  predicted=%.1f%%  %.4f shares @ %.4f  ($%.2f)  edge=%+.3f  elapsed=%ds  order=%.0fms",
                          self.asset, side, predicted_win * 100, mtrade.fill_size,
-                         mtrade.fill_price, mtrade.fill_usdc, edge, elapsed)
+                         mtrade.fill_price, mtrade.fill_usdc, edge, elapsed, mtrade.order_ms)
             except Exception as exc:
+                mtrade.order_ms = round((time.perf_counter() - _trigger_ts) * 1000, 1)
                 log.error("[MODEL] Order failed %s %s: %s", self.asset, side, exc)
                 mtrade.status = "order_failed"
-                err_str = str(exc)
-                if "fully filled" in err_str or "FOK" in err_str:
-                    self._model_filled = False  # FOK failure: allow retry in same window
-                # else: bad token / orderbook gone — don't retry
+                err_str = str(exc).lower()
+                if any(p in err_str for p in _BALANCE_PHRASES):
+                    mtrade.status = "insufficient_balance_disabled"
+                    self._disable_strategy_on_balance_error("model", side, exc)
+                else:
+                    is_fok_failure = "fully filled" in err_str or "fok" in err_str
+                    if is_fok_failure:
+                        FOK_SLIPPAGE = 0.25
+                        mtrade.fill_price = round(trigger_ask + FOK_SLIPPAGE, 4)
+                        mtrade.fill_size  = round(model_usdc / mtrade.fill_price, 2) if mtrade.fill_price > 0 else 0.0
+                        notional          = round(mtrade.fill_price * mtrade.fill_size, 4)
+                        mtrade.fee_usdc   = round(notional * BUY_FEE_RATE, 4)
+                        mtrade.fill_usdc  = round(notional + mtrade.fee_usdc, 4)
+                        mtrade.slippage   = FOK_SLIPPAGE
+                        mtrade.status     = "fok_killed"
+                        mtrade.order_id   = "FOK_KILLED"
+                        self._model_last_fire_ts = None  # allow retry this window
+                        log.warning("[MODEL] FOK KILLED %s %s  hypothetical fill=%.4f (+%.2f slip)", self.asset, side, mtrade.fill_price, FOK_SLIPPAGE)
+                        self._model_trades.append(mtrade)
+                        self._model_trade = mtrade
+                        await asyncio.to_thread(_write_model_trade, mtrade, self._model_trades_csv)
+                        return  # don't count against per-window trade limit
+                    # else: bad token / orderbook gone — don't retry
 
+        self._model_trades.append(mtrade)
         self._model_trade = mtrade
         await asyncio.to_thread(_write_model_trade, mtrade, self._model_trades_csv)
 
@@ -791,8 +1012,9 @@ class MomentumBuyExecutor:
         coin_close: "float | None",
         delay: float = 0.0,
     ) -> None:
-        if not trade or trade.status != "open":
+        if not trade or trade.status not in ("open", "fok_killed"):
             return
+        is_fok = trade.status == "fok_killed"
         await asyncio.sleep(delay)
 
         # Poll PM up to 60s for settlement
@@ -822,10 +1044,14 @@ class MomentumBuyExecutor:
             return
 
         win = (resolved_up and trade.side.upper() == "UP") or (not resolved_up and trade.side.upper() == "DOWN")
-        pnl = ((1.0 - trade.fill_price) if win else -trade.fill_price) * trade.fill_size
+        payout = trade.fill_size if win else 0.0
+        pnl = payout - trade.fill_usdc
         trade.resolution = 1.0 if resolved_up else 0.0
         trade.pnl_usdc   = round(pnl, 4)
-        trade.status     = "won" if win else "lost"
+        if is_fok:
+            trade.status = "fok_won" if win else "fok_lost"
+        else:
+            trade.status = "won" if win else "lost"
         log.info("[MODEL] RESOLVED %s %s  predicted=%.1f%%  fill=%.3f  PnL=$%.4f  %s",
                  self.asset, trade.side, trade.predicted_win * 100, trade.fill_price, pnl,
                  trade.status.upper())
@@ -916,10 +1142,14 @@ class MomentumBuyExecutor:
         elapsed_second = int(now - self._window_start)
         vol_10s_log    = self._coin_stream.get_vol_10s_log()
 
+        _hour_utc = datetime.fromtimestamp(self._window_start, tz=timezone.utc).hour
+        _hour_rad = _hour_utc * (2 * 3.141592653589793 / 24)
+
         feats: dict[str, float | None] = {
             "move_sigmas":    _r(move_sigmas, 4),
             "elapsed_second": elapsed_second,
-            "hour_utc":       datetime.fromtimestamp(self._window_start, tz=timezone.utc).hour,
+            "hour_sin":       round(math.sin(_hour_rad), 8),
+            "hour_cos":       round(math.cos(_hour_rad), 8),
             "vel_2s":         _r(vel_2s),
             "vel_5s":         _r(vel_5s),
             "vel_10s":        _r(vel_10s),
@@ -940,10 +1170,15 @@ class MomentumBuyExecutor:
             return None
         try:
             feat_order = self._model["features"]
-            X = np.array([[features.get(f) for f in feat_order]], dtype=float)
+            # Preserve training feature names to avoid sklearn/lightgbm name warnings.
+            X = pd.DataFrame(
+                [[features.get(f) for f in feat_order]],
+                columns=feat_order,
+                dtype=float,
+            )
             return float(self._model["pipe"].predict_proba(X)[0, 1])
         except Exception as exc:
-            log.debug("Inference failed: %s", exc)
+            log.warning("Inference failed: %s", exc)
             return None
 
     async def _status_loop(self) -> None:
@@ -958,17 +1193,38 @@ class MomentumBuyExecutor:
 
             features      = self._compute_features()
             predicted_win: float | None = None
+            inference_ms: float | None = None
             try:
+                t0 = time.perf_counter()
                 predicted_win = await asyncio.to_thread(self._run_inference, features)
+                inference_ms = (time.perf_counter() - t0) * 1000.0
+                # if self._model is not None and features:
+                #     log.info(
+                #         "Model inference latency: %.2f ms | predicted_win=%s",
+                #         inference_ms,
+                #         f"{predicted_win:.4f}" if predicted_win is not None else "None",
+                #     )
             except Exception as exc:
                 log.warning("Inference failed: %s", exc)
 
-            # Model trade: fire when edge >= threshold, one trade per window
+            # Model trade: fire when edge >= threshold
+            # once-per-window (cooldown=0) or every N seconds (cooldown=N)
             try:
+                _cd = self._model_multi_trade_cooldown
+                _model_gate = (
+                    self._model_last_fire_ts is None
+                    if _cd == 0
+                    else (self._model_last_fire_ts is None or
+                          time.time() - self._model_last_fire_ts >= _cd)
+                )
+                # Check max trades per window limit
+                _max_trades = self._model_max_trades_per_window
+                _trades_limit_ok = (_max_trades == 0 or len(self._model_trades) < _max_trades)
+
                 if (
-                    self._model_enabled
-                    and predicted_win is not None
-                    and not self._model_filled
+                    predicted_win is not None
+                    and _model_gate
+                    and _trades_limit_ok
                     and market is not None
                     and self._coin_open is not None
                     and self._coin_current is not None
@@ -988,21 +1244,12 @@ class MomentumBuyExecutor:
                         self._model_window_start <= elapsed_now <= self._model_window_end
                     )
 
-                    # Early seconds use a higher threshold if configured
-                    if (
-                        self._model_early_threshold is not None
-                        and elapsed_now < 30
-                    ):
-                        active_threshold = self._model_early_threshold
-                    else:
-                        active_threshold = self._model_edge_threshold
-
-                    if in_model_window and up_edge is not None and up_edge >= active_threshold:
+                    if in_model_window and up_edge is not None and up_edge >= self._MODEL_EDGE_THRESHOLD:
                         if dn_edge is None or up_edge >= dn_edge:
                             fire_side, fire_ask, fire_edge, fire_token = (
                                 "UP", up_ask_now, up_edge, market.up_token.token_id
                             )
-                    if in_model_window and dn_edge is not None and dn_edge >= active_threshold:
+                    if in_model_window and dn_edge is not None and dn_edge >= self._MODEL_EDGE_THRESHOLD:
                         if fire_side is None or dn_edge > (fire_edge or 0):
                             fire_side, fire_ask, fire_edge, fire_token = (
                                 "DOWN", dn_ask_now, dn_edge, market.down_token.token_id
@@ -1012,7 +1259,7 @@ class MomentumBuyExecutor:
                         fire_side is not None and fire_ask is not None
                         and fire_token is not None and fire_edge is not None
                     ):
-                        self._model_filled = True
+                        self._model_last_fire_ts = time.time()
                         asyncio.create_task(self._execute_model_buy(
                             side=fire_side,
                             token_id=fire_token,
@@ -1049,13 +1296,16 @@ class MomentumBuyExecutor:
                     "dry_run":        self.dry_run,
                     "features":       {k: (float(v) if v is not None else None) for k, v in features.items()},
                     "predicted_win":        predicted_win,
-                    "model_edge_threshold": self._model_edge_threshold,
+                    "MODEL_EDGE_THRESHOLD": self._MODEL_EDGE_THRESHOLD,
                     "model_trade":          asdict(self._model_trade) if self._model_trade else None,
+                    "model_trades":         [asdict(t) for t in self._model_trades],
+                    "momentum_enabled":     self._momentum_enabled,
+                    "model_enabled":        self._model_enabled,
                     "price_history":        [px for _, px in self._price_history],
                 }
                 await asyncio.to_thread(_write_status, payload, self._status_json)
             except Exception as exc:
                 log.warning("Status write failed: %s", exc, exc_info=True)
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(0.25)
 
 

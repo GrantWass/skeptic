@@ -2,6 +2,8 @@
 Wrapper around py-clob-client for order placement, cancellation, and balance queries.
 Handles credential derivation and caching.
 """
+import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -29,6 +31,14 @@ from skeptic import config
 from skeptic.models.order import Order
 
 logger = logging.getLogger(__name__)
+
+
+# ── Dedicated signing executor ────────────────────────────────────────────────
+# A single-thread executor ensures signing work never waits for other tasks.
+
+_signing_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="clob-signer"
+)
 
 
 def _creds_file() -> str:
@@ -136,10 +146,13 @@ def presign_market_order(
     token_id: str,
     usdc_amount: float,
     price_cap: float = 0.99,
-):
+) -> tuple:
     """
-    Sign a FOK market buy order without submitting it.
-    Call this at window start (once per token) so the hot path only needs to POST.
+    Sign a FOK market buy order and pre-serialize the body without submitting it.
+    Call this at window start (once per token) so the hot path only needs to
+    compute HMAC headers and POST.
+
+    Returns (signed_order, serialized_body_bytes, body_dict, usdc_amount).
     price_cap: max price willing to pay — set high to guarantee fill; actual fill
                is determined by the order book at POST time, not this cap.
     """
@@ -150,7 +163,10 @@ def presign_market_order(
         price=price_cap,
         order_type=OrderType.FOK,
     )
-    return client.create_market_order(args)
+    signed = client.create_market_order(args)
+    body = order_to_json(signed, client.creds.api_key, OrderType.FOK)
+    serialized = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
+    return signed, serialized, body, usdc_amount
 
 
 def _parse_fill(resp: dict, usdc_amount: float) -> tuple[float, float]:
@@ -213,31 +229,46 @@ async def sign_and_post_async(
     outcome: str,
     usdc_amount: float,
     price_cap: float = 0.85,
-) -> Order:
+) -> tuple["Order", float, float]:
     """
-    Sign and POST a FOK market order in the event loop.
-    sign (~3ms CPU) + POST (network) — no thread handoff.
-    Used for Kelly sizing where the amount isn't known until trigger time.
+    Sign and POST a FOK market order.
+    Signing (EIP-712/ECDSA) runs in a thread pool to avoid blocking the event loop.
+
+    Returns (order, sign_ms, post_ms) where sign_ms is the time spent signing
+    and building headers, and post_ms is the HTTP round-trip time.
     """
-    args = MarketOrderArgs(
-        token_id=token_id,
-        amount=usdc_amount,
-        side=BUY,
-        price=price_cap,
-        order_type=OrderType.FOK,
-    )
-    signed = client.create_market_order(args)
-    body = order_to_json(signed, client.creds.api_key, OrderType.FOK)
-    serialized = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-    request_args = RequestArgs(
-        method="POST",
-        request_path=POST_ORDER,
-        body=body,
-        serialized_body=serialized,
-    )
-    headers = create_level_2_headers(client.signer, client.creds, request_args)
+    import asyncio
+    _t0 = time.perf_counter()
+
+    def _sign() -> tuple:
+        args = MarketOrderArgs(
+            token_id=token_id,
+            amount=usdc_amount,
+            side=BUY,
+            price=price_cap,
+            order_type=OrderType.FOK,
+        )
+        signed = client.create_market_order(args)
+        body = order_to_json(signed, client.creds.api_key, OrderType.FOK)
+        serialized = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+        request_args = RequestArgs(
+            method="POST",
+            request_path=POST_ORDER,
+            body=body,
+            serialized_body=serialized,
+        )
+        headers = create_level_2_headers(client.signer, client.creds, request_args)
+        return serialized, headers
+
+    serialized, headers = await asyncio.get_event_loop().run_in_executor(_signing_executor, _sign)
+    _t_signed = time.perf_counter()
+    sign_ms = round((_t_signed - _t0) * 1000, 1)
+    logger.info("ORDER TIMING  sign+headers=%.0fms", sign_ms)
     url = f"{client.host}{POST_ORDER}"
     resp = await http.post(url, content=serialized.encode(), headers=headers)
+    _t_resp = time.perf_counter()
+    post_ms = round((_t_resp - _t_signed) * 1000, 1)
+    logger.info("ORDER TIMING  http_post=%.0fms  status=%d", post_ms, resp.status_code)
     if resp.status_code != 200:
         raise RuntimeError(f"Order POST {resp.status_code}: {resp.text}")
     data = resp.json()
@@ -245,8 +276,9 @@ async def sign_and_post_async(
     if not order_id:
         raise RuntimeError(f"Market order failed: {data}")
     fill_price, fill_size = _parse_fill(data, usdc_amount)
-    logger.info("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f",
-                order_id, outcome, usdc_amount, fill_price, fill_size)
+    logger.info("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f  total=%.0fms",
+                order_id, outcome, usdc_amount, fill_price, fill_size,
+                (time.perf_counter() - _t0) * 1000)
     return Order(
         order_id=order_id,
         token_id=token_id,
@@ -257,7 +289,7 @@ async def sign_and_post_async(
         status="FILLED",
         placed_at=time.time(),
         updated_at=time.time(),
-    )
+    ), sign_ms, post_ms
 
 
 async def post_presigned_order_async(
@@ -283,6 +315,51 @@ async def post_presigned_order_async(
     headers = create_level_2_headers(client.signer, client.creds, request_args)
     url = f"{client.host}{POST_ORDER}"
     resp = await http.post(url, content=serialized.encode(), headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
+    order_id = data.get("orderID") or data.get("order_id", "")
+    if not order_id:
+        raise RuntimeError(f"Market order failed: {data}")
+    fill_price, fill_size = _parse_fill(data, usdc_amount)
+    logger.info("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f",
+                order_id, outcome, usdc_amount, fill_price, fill_size)
+    return Order(
+        order_id=order_id,
+        token_id=token_id,
+        outcome=outcome,
+        side="BUY",
+        price=fill_price,
+        size=fill_size,
+        status="FILLED",
+        placed_at=time.time(),
+        updated_at=time.time(),
+    )
+
+
+async def post_preserialized_order_async(
+    http: httpx.AsyncClient,
+    client: ClobClient,
+    serialized_body: bytes,
+    body_dict: dict,
+    token_id: str,
+    outcome: str,
+    usdc_amount: float,
+) -> Order:
+    """
+    Fastest possible order submission: body is already signed and serialized at
+    window start. Hot path only computes HMAC headers (~0.3ms) and POSTs.
+
+    Use with presign_market_order() which returns (signed, serialized_body, body_dict, amount).
+    """
+    request_args = RequestArgs(
+        method="POST",
+        request_path=POST_ORDER,
+        body=body_dict,
+        serialized_body=serialized_body.decode(),
+    )
+    headers = create_level_2_headers(client.signer, client.creds, request_args)
+    url = f"{client.host}{POST_ORDER}"
+    resp = await http.post(url, content=serialized_body, headers=headers)
     resp.raise_for_status()
     data = resp.json()
     order_id = data.get("orderID") or data.get("order_id", "")
