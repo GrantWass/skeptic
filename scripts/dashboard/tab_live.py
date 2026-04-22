@@ -15,6 +15,7 @@ ASSETS_YAML  = Path("config/assets.yaml")
 STALE_SECS   = 12   # warn if status older than this
 
 
+@st.cache_data(ttl=60)
 def _load_strategy_cfg(asset: str | None = None) -> tuple[dict, dict]:
     """Load strategy config (global + per-asset overrides if asset specified).
 
@@ -55,6 +56,7 @@ STATUS_ICON = {
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
+@st.cache_data(ttl=10)
 def _load_bots() -> list[tuple[str, dict]]:
     """Return [(coin_name, status_dict), ...] sorted by asset name."""
     bots = []
@@ -75,9 +77,11 @@ _MOM_NUMERIC_COLS = {
     "slippage", "window_start_ts", "window_end_ts",
     "sign_ms", "post_ms", "order_ms",
     "resolution", "pnl_usdc",
+    "coin_ob_imbalance", "coin_ob_imb_5s", "coin_ob_trend",
 }
 
 
+@st.cache_data(ttl=10)
 def _load_trades() -> pd.DataFrame:
     frames = []
     mom_trade_cols = [
@@ -88,6 +92,7 @@ def _load_trades() -> pd.DataFrame:
         "slippage", "window_start_ts", "window_end_ts",
         "sign_ms", "post_ms", "order_ms",
         "resolution", "pnl_usdc", "status", "order_id",
+        "coin_ob_imbalance", "coin_ob_imb_5s", "coin_ob_trend",
     ]
     for path in LIVE_DIR.glob("trades_mom_*.csv"):
         try:
@@ -215,7 +220,7 @@ def _downsample_every_2s(xs: list[float], ys: list[float]) -> tuple[list[float],
     return keep_x, keep_y
 
 
-def _render_bot_card(coin: str, s: dict, idx: int = 0, momentum_cfg: dict | None = None, model_cfg: dict | None = None) -> None:
+def _render_bot_card(coin: str, s: dict, idx: int = 0, momentum_cfg: dict | None = None, model_cfg: dict | None = None, mom_csv_trades: pd.DataFrame | None = None) -> None:
     _momentum_cfg = momentum_cfg or {}
     _model_cfg = model_cfg or {}
     age       = time.time() - s.get("updated_at", 0)
@@ -247,18 +252,41 @@ def _render_bot_card(coin: str, s: dict, idx: int = 0, momentum_cfg: dict | None
         thresh_str = f"edge {norm_thresh}"
         momentum_enabled = _momentum_cfg.get("enabled", True)
         model_enabled = _model_cfg.get("enabled", True)
+        mom_cooldown  = int(_momentum_cfg.get("multi_trade_cooldown", 0))
+        mom_max       = int(_momentum_cfg.get("max_trades_per_window", 0))
+        mom_count     = int(s.get("momentum_trade_count", 0))
         # Status indicators: enabled = 🚀, disabled = 🔒
         momentum_status = "🚀" if momentum_enabled else "🔒"
         model_status = "🤖" if model_enabled else "🔒"
+
+        # Multi-trade badge: show trades/max when cooldown > 0
+        if mom_cooldown > 0:
+            max_label  = str(mom_max) if mom_max > 0 else "∞"
+            count_color = "#22c55e" if mom_count < (mom_max or 999) else "#f59e0b"
+            trades_str = (
+                f"<span style='color:{count_color}'>{mom_count}/{max_label}</span>"
+                f"<span style='color:#6b7280;font-size:0.78em'> cd{mom_cooldown}s</span>"
+            )
+            trades_kv = (
+                f"<span style='color:#9ca3af;font-size:0.78em'>trades</span>"
+                f"<span style='font-size:0.85em;margin-left:3px'>{trades_str}</span>"
+            )
+        else:
+            trades_kv = None
+
+        header_parts = [
+            _kv("move", sig_str),
+            _kv("dir", direction),
+            _kv("max", str(max_pm)),
+            _kv("win", ws_clock),
+            _kv("", stale_str, "#f59e0b" if age > STALE_SECS else "#6b7280"),
+        ]
+        if trades_kv is not None:
+            header_parts.insert(3, trades_kv)
+
         st.markdown(
             f"**{coin}** {momentum_status} {model_status} &nbsp; "
-            + "  &nbsp;·&nbsp;  ".join([
-                _kv("move", sig_str),
-                _kv("dir", direction),
-                _kv("max", str(max_pm)),
-                _kv("win", ws_clock),
-                _kv("", stale_str, "#f59e0b" if age > STALE_SECS else "#6b7280"),
-            ]),
+            + "  &nbsp;·&nbsp;  ".join(header_parts),
             unsafe_allow_html=True,
         )
 
@@ -270,11 +298,11 @@ def _render_bot_card(coin: str, s: dict, idx: int = 0, momentum_cfg: dict | None
         _has_live_mom = (
             _mom_live
             and trade is not None
-            and trade.get("order_id") != "DRY_RUN"
+            and trade.get("order_id") not in ("DRY_RUN", "DRY_RUN_OB_FILTERED")
             and int(trade.get("window_start_ts") or 0) == ws_now
         )
         _has_live_mdl = _mdl_live and any(
-            t.get("order_id") != "DRY_RUN"
+            t.get("order_id") not in ("DRY_RUN", "DRY_RUN_OB_FILTERED")
             for t in (s.get("model_trades") or [])
             if int(t.get("window_start_ts") or 0) == ws_now
         )
@@ -413,11 +441,29 @@ def _render_bot_card(coin: str, s: dict, idx: int = 0, momentum_cfg: dict | None
         up_ask_str = f"<span style='color:#ef4444'>{up_ask:.2f}!</span>" if hot_up else (f"{up_ask:.2f}" if up_ask is not None else "—")
         dn_ask_str = f"<span style='color:#ef4444'>{dn_ask:.2f}!</span>" if hot_dn else (f"{dn_ask:.2f}" if dn_ask is not None else "—")
 
+        coin_ob_imb = s.get("coin_ob_imbalance")
+        coin_bid_v  = s.get("coin_bid_vol")
+        coin_ask_v  = s.get("coin_ask_vol")
+        if coin_ob_imb is not None:
+            _imb_pct  = coin_ob_imb * 100
+            _imb_col  = "#22c55e" if coin_ob_imb >= 0.55 else ("#ef4444" if coin_ob_imb <= 0.45 else "#9ca3af")
+            _bv_str   = f"{coin_bid_v:,.1f}" if coin_bid_v else "—"
+            _av_str   = f"{coin_ask_v:,.1f}" if coin_ask_v else "—"
+            _imb_html = (
+                f"<span style='color:{_imb_col};font-weight:700'>{_imb_pct:.1f}%</span>"
+                f"<span style='color:#6b7280;font-size:0.82em'> b{_bv_str}/a{_av_str}</span>"
+            )
+            coin_ob_kv = _kv("coin OB", _imb_html)
+        else:
+            coin_ob_kv = None
+
         parts = [
             _kv("UP ask", up_ask_str),
             _kv("DN ask", dn_ask_str),
             _kv("vig", spread_str),
         ]
+        if coin_ob_kv is not None:
+            parts.append(coin_ob_kv)
         if predicted_win is not None:
             parts += [
                 _kv("P(UP)", f"{predicted_win:.1%}"),
@@ -431,44 +477,43 @@ def _render_bot_card(coin: str, s: dict, idx: int = 0, momentum_cfg: dict | None
         model_live    = _mdl_live
 
         def _trade_row(t: dict, label: str, is_live: bool) -> None:
-            status     = t.get("status", "open")
-            side       = t.get("side", "")
-            fp         = t.get("fill_price", 0.0)
-            fusdc      = t.get("fill_usdc", 0.0)
-            pnl        = t.get("pnl_usdc")
-            slip       = t.get("slippage")
-            resolution = t.get("resolution")
-            elapsed    = t.get("elapsed_second")
-            is_dry     = t.get("order_id") == "DRY_RUN" or not is_live
-            icon       = {"won": "✅", "lost": "❌", "open": "🔵", "order_failed": "⚠️", "unresolved": "❓"}.get(status, "🔵")
-            took_profit = (status == "won" and resolution is not None and float(resolution) not in (0.0, 1.0))
-            theme_base = st.get_option("theme.base")
-            is_light = theme_base == "light"
+            status        = t.get("status", "open")
+            side          = t.get("side", "")
+            fp            = t.get("fill_price", 0.0)
+            fusdc         = t.get("fill_usdc", 0.0)
+            pnl           = t.get("pnl_usdc")
+            slip          = t.get("slippage")
+            resolution    = t.get("resolution")
+            elapsed       = t.get("elapsed_second")
+            order_id      = t.get("order_id", "")
+            is_ob_filtered = order_id == "DRY_RUN_OB_FILTERED"
+            is_dry        = order_id in ("DRY_RUN", "DRY_RUN_OB_FILTERED") or not is_live
+            took_profit   = (status == "won" and resolution is not None and float(resolution) not in (0.0, 1.0))
+            theme_base    = st.get_option("theme.base")
+            is_light      = theme_base == "light"
 
-            status_colors = {
-                "won": "#15803d" if is_light else "#22c55e",
-                "lost": "#b91c1c" if is_light else "#ef4444",
-                "open": "#1d4ed8" if is_light else "#60a5fa",
-                "order_failed": "#991b1b" if is_light else "#f87171",
-                "unresolved": "#b45309" if is_light else "#f59e0b",
-                "insufficient_balance_disabled": "#b45309" if is_light else "#f59e0b",
-            }
-
-            text_main = "#000000" if is_light else "#ffffff"
+            text_main  = "#000000" if is_light else "#ffffff"
             text_muted = text_main
-            card_bg = (
-                ("#f7fff8" if is_light else "rgba(20,83,45,0.35)")
-                if is_dry
-                else ("#f6f9ff" if is_light else "rgba(30,58,138,0.35)")
-            )
-            base_border = (
-                ("#86efac" if is_light else "rgba(134,239,172,0.50)")
-                if is_dry
-                else ("#93c5fd" if is_light else "rgba(147,197,253,0.50)")
-            )
+
+            if is_ob_filtered:
+                card_bg     = "#fffbeb" if is_light else "rgba(120,53,15,0.30)"
+                base_border = "#fcd34d" if is_light else "rgba(251,191,36,0.55)"
+            elif is_dry:
+                card_bg     = "#f7fff8" if is_light else "rgba(20,83,45,0.35)"
+                base_border = "#86efac" if is_light else "rgba(134,239,172,0.50)"
+            else:
+                card_bg     = "#f6f9ff" if is_light else "rgba(30,58,138,0.35)"
+                base_border = "#93c5fd" if is_light else "rgba(147,197,253,0.50)"
+
             failed_statuses = {"lost", "order_failed", "unresolved", "insufficient_balance_disabled"}
-            is_failed = status in failed_statuses
-            card_border = "#dc2626" if is_light and is_failed else ("#f87171" if is_failed else base_border)
+            is_failed   = status in failed_statuses
+            is_fok      = status in {"fok_killed", "fok_won", "fok_lost"}
+            if is_fok:
+                card_border = "#dc2626" if is_light else "#f87171"
+            elif is_failed:
+                card_border = "#dc2626" if is_light else "#f87171"
+            else:
+                card_border = base_border
 
             slip_html = ""
             if slip is not None:
@@ -490,6 +535,22 @@ def _render_bot_card(coin: str, s: dict, idx: int = 0, momentum_cfg: dict | None
             if took_profit and resolution is not None:
                 tp_html = f"<span style='color:{'#166534' if is_light else '#86efac'};font-weight:700'>sold @ {float(resolution):.2f}</span>"
 
+            # OB filter badge: show direction-adjusted imbalance that caused the skip
+            ob_filter_html = ""
+            if is_ob_filtered:
+                _raw_imb = t.get("coin_ob_imbalance")
+                if _raw_imb is not None:
+                    try:
+                        _fav = float(_raw_imb) if str(side).upper() == "UP" else 1.0 - float(_raw_imb)
+                        _badge_col = "#92400e" if is_light else "#fbbf24"
+                        ob_filter_html = (
+                            f"<span style='color:{_badge_col};font-weight:800'>"
+                        )
+                    except (TypeError, ValueError):
+                        ob_filter_html = f"<span style='color:#fbbf24;font-weight:800'>OB filtered</span>"
+                else:
+                    ob_filter_html = f"<span style='color:#fbbf24;font-weight:800'>OB filtered</span>"
+
             elapsed_html = f"t+{int(elapsed)}s" if elapsed is not None else "t+—"
             row_items = [
                 f"<span style='font-weight:800;color:{text_main}'>{label}</span>",
@@ -498,6 +559,8 @@ def _render_bot_card(coin: str, s: dict, idx: int = 0, momentum_cfg: dict | None
                 f"<span style='color:{text_muted};font-weight:700'>${fusdc:.2f}</span>",
                 f"<span style='color:{text_muted};font-weight:700'>{elapsed_html}</span>",
             ]
+            if ob_filter_html:
+                row_items.append(ob_filter_html)
             if slip_html:
                 row_items.append(slip_html)
             if pnl_html:
@@ -515,8 +578,29 @@ def _render_bot_card(coin: str, s: dict, idx: int = 0, momentum_cfg: dict | None
                 unsafe_allow_html=True,
             )
 
+        # ── Momentum trades (all this window) ────────────────────────────────
+        # Primary: status JSON (has live in-flight state, keyed by ts)
+        mom_map: dict[int, dict] = {}
+        for t in (s.get("momentum_trades") or []):
+            if int(t.get("window_start_ts") or 0) == ws_now:
+                mom_map[int(float(t.get("ts") or 0))] = t
+        # Also check the single legacy `trade` field
         if trade and int(trade.get("window_start_ts") or 0) == ws_now:
-            _trade_row(trade, "MOM", momentum_live)
+            ts_key = int(float(trade.get("ts") or 0))
+            mom_map.setdefault(ts_key, trade)
+        # Supplement: CSV trades may be ahead of the status JSON during multi-entry
+        if mom_csv_trades is not None and not mom_csv_trades.empty:
+            for _, row in mom_csv_trades.iterrows():
+                ts_key = int(float(row.get("ts") or 0))
+                if ts_key not in mom_map:
+                    mom_map[ts_key] = row.to_dict()
+
+        momentum_trades_this_window = sorted(mom_map.values(), key=lambda t: float(t.get("ts") or 0))
+
+        if momentum_trades_this_window:
+            for i, mt in enumerate(momentum_trades_this_window):
+                label = "MOM"
+                _trade_row(mt, label, momentum_live)
         elif not filled:
             st.caption("Watching…")
 
@@ -926,7 +1010,7 @@ def _strategy_stats(df: pd.DataFrame, extra_cols: list[str] | None = None) -> di
         entry_edge = _v(pd.to_numeric(df["max_pm_price"], errors="coerce") - pd.to_numeric(df["fill_price"], errors="coerce"))
 
     # Timing — exclude dry-run rows, then drop sub-1ms noise
-    _real_orders = df[df["order_id"] != "DRY_RUN"] if "order_id" in df.columns else df
+    _real_orders = df[~df["order_id"].isin({"DRY_RUN", "DRY_RUN_OB_FILTERED"})] if "order_id" in df.columns else df
     def _timing(col):
         s = pd.to_numeric(_real_orders[col], errors="coerce").dropna() if col in _real_orders.columns else pd.Series(dtype=float)
         s = s[s >= 1.0]  # < 1ms is residual noise — treat as missing
@@ -1065,6 +1149,7 @@ MODEL_TRADE_COLS = [
     "window_start_ts", "window_end_ts",
     "sign_ms", "post_ms", "order_ms",
     "resolution", "pnl_usdc", "status", "order_id", "slippage",
+    "coin_ob_imbalance", "coin_ob_imb_5s", "coin_ob_trend",
 ]
 
 _MODEL_NUMERIC_COLS = {
@@ -1074,9 +1159,11 @@ _MODEL_NUMERIC_COLS = {
     "window_start_ts", "window_end_ts",
     "sign_ms", "post_ms", "order_ms",
     "resolution", "pnl_usdc", "slippage",
+    "coin_ob_imbalance", "coin_ob_imb_5s", "coin_ob_trend",
 }
 
 
+@st.cache_data(ttl=10)
 def _load_model_trades() -> pd.DataFrame:
     frames = []
     for path in LIVE_DIR.glob("trades_model_*.csv"):
@@ -1152,6 +1239,645 @@ def _render_per_coin_stats(trades: pd.DataFrame, model_trades: pd.DataFrame) -> 
             col.metric("Model", f"${pnl:+.2f}", f"{win_rate:.0%} ({n_won}W/{n_lost}L)")
 
 
+# ── Order sizing impact analysis ─────────────────────────────────────────────
+
+def _render_order_sizing_analysis(trades: pd.DataFrame, model_trades: pd.DataFrame) -> None:
+    """Compare actual PnL vs a flat $1.1 order-size benchmark."""
+    FLAT = 1.1
+
+    def _prep(df: pd.DataFrame, strategy: str) -> pd.DataFrame:
+        if df.empty or "status" not in df.columns:
+            return pd.DataFrame()
+        r = df[df["status"].isin(["won", "lost"])].copy()
+        r["strategy"] = strategy
+        for col in ["fill_price", "fill_size", "fill_usdc", "pnl_usdc"]:
+            r[col] = pd.to_numeric(r.get(col, pd.Series(dtype=float)), errors="coerce")
+        r = r.dropna(subset=["fill_usdc", "pnl_usdc"])
+        r = r[r["fill_usdc"] > 0]
+        # Hypothetical PnL scales linearly with order size at the same fill_price
+        r["hyp_pnl"] = r["pnl_usdc"] * (FLAT / r["fill_usdc"])
+        return r
+
+    mom_r = _prep(trades, "MOM")
+    mdl_r = _prep(model_trades, "MODEL")
+    all_r = pd.concat([mom_r, mdl_r], ignore_index=True)
+
+    if all_r.empty:
+        return
+
+    st.subheader("Order Sizing Impact")
+    st.caption(
+        f"Compares actual PnL (variable order sizes) to a flat ${FLAT:.2f} benchmark "
+        "on the same trades. PnL scales linearly with size at the same fill price."
+    )
+
+    actual_total = float(all_r["pnl_usdc"].sum())
+    hyp_total    = float(all_r["hyp_pnl"].sum())
+    diff         = actual_total - hyp_total
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Actual Total PnL",     f"${actual_total:+.4f}")
+    c2.metric(f"Flat ${FLAT:.2f} PnL", f"${hyp_total:+.4f}")
+    c3.metric("Sizing Edge",           f"${diff:+.4f}",
+              delta="helps" if diff >= 0 else "hurts",
+              delta_color="normal" if diff >= 0 else "inverse")
+    c4.metric("Trades",                len(all_r))
+
+    # ── Per-asset bar chart: actual vs flat ───────────────────────────────────
+    assets = sorted(all_r["asset"].dropna().unique())
+
+    col_chart, col_tbl = st.columns([3, 2])
+
+    with col_chart:
+        fig = go.Figure()
+        act_vals  = [float(all_r[all_r["asset"] == a]["pnl_usdc"].sum()) for a in assets]
+        hyp_vals  = [float(all_r[all_r["asset"] == a]["hyp_pnl"].sum())  for a in assets]
+
+        fig.add_trace(go.Bar(
+            name=f"Flat ${FLAT:.2f}", x=assets, y=hyp_vals,
+            marker_color="#6b7280", opacity=0.75,
+            hovertemplate="%{x}: $%{y:+.4f}<extra>Flat</extra>",
+        ))
+        fig.add_trace(go.Bar(
+            name="Actual", x=assets, y=act_vals,
+            marker_color=["#22c55e" if v >= h else "#ef4444" for v, h in zip(act_vals, hyp_vals)],
+            opacity=0.85,
+            hovertemplate="%{x}: $%{y:+.4f}<extra>Actual</extra>",
+        ))
+        fig.update_layout(
+            title=dict(text="Actual vs Flat PnL by Asset", font=dict(size=12), x=0),
+            barmode="group",
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            height=220, margin=dict(t=32, b=28, l=48, r=8),
+            yaxis=dict(tickformat="$.2f", gridcolor="rgba(255,255,255,0.06)", zeroline=True,
+                       zerolinecolor="rgba(255,255,255,0.2)"),
+            xaxis=dict(showgrid=False),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
+        )
+        st.plotly_chart(fig, config={"displayModeBar": False}, width="stretch")
+
+    # ── Win-rate by size bucket ───────────────────────────────────────────────
+    _bins   = [0, 0.9, 1.05, 1.15, 1.35, 1.60, 1.85, 3.0]
+    _labels = ["<$0.90", "$0.90-1.05", "$1.05-1.15", "$1.15-1.35", "$1.35-1.60", "$1.60-1.85", ">$1.85"]
+    all_r["size_bucket"] = pd.cut(all_r["fill_usdc"], bins=_bins, labels=_labels)
+
+    bucket_rows = []
+    for lbl in _labels:
+        g = all_r[all_r["size_bucket"] == lbl]
+        if g.empty:
+            continue
+        n      = len(g)
+        wr     = float((g["status"] == "won").mean())
+        act    = float(g["pnl_usdc"].sum())
+        hyp    = float(g["hyp_pnl"].sum())
+        d      = act - hyp
+        avg_sz = float(g["fill_usdc"].mean())
+        bucket_rows.append({"Size Bucket": lbl, "n": n,
+                             "Avg Size": f"${avg_sz:.3f}", "Win Rate": f"{wr:.1%}",
+                             "Actual PnL": f"${act:+.3f}", f"Flat ${FLAT:.2f} PnL": f"${hyp:+.3f}",
+                             "Sizing Edge": f"${d:+.3f}"})
+
+    with col_tbl:
+        if bucket_rows:
+            st.markdown(
+                "<div style='font-size:12px;color:#6b7280;text-transform:uppercase;"
+                "letter-spacing:.08em;margin-bottom:6px'>By Size Bucket</div>",
+                unsafe_allow_html=True,
+            )
+            bdf = pd.DataFrame(bucket_rows)
+            # colour the Sizing Edge column
+            headers = "".join(f"<th>{c}</th>" for c in bdf.columns)
+            rows_html = []
+            for _, row in bdf.iterrows():
+                edge_val = float(str(row["Sizing Edge"]).replace("$", "").replace("+", ""))
+                edge_col = "#22c55e" if edge_val >= 0 else "#ef4444"
+                cells = []
+                for col_name, v in row.items():
+                    if col_name == "Sizing Edge":
+                        cells.append(f"<td style='color:{edge_col};font-weight:700'>{v}</td>")
+                    else:
+                        cells.append(f"<td>{v}</td>")
+                rows_html.append(f"<tr>{''.join(cells)}</tr>")
+            st.markdown(
+                "<div style='overflow-x:auto'>"
+                "<style>.sz-tbl td,th{padding:3px 7px;border-bottom:1px solid rgba(255,255,255,0.07);"
+                "font-size:12px;text-align:right}.sz-tbl th{color:#9ca3af;font-weight:600}"
+                ".sz-tbl td:first-child,.sz-tbl th:first-child{text-align:left}</style>"
+                f"<table class='sz-tbl'><thead><tr>{headers}</tr></thead>"
+                f"<tbody>{''.join(rows_html)}</tbody></table></div>",
+                unsafe_allow_html=True,
+            )
+
+    # ── Per-asset sizing edge summary ─────────────────────────────────────────
+    parts = []
+    for asset in assets:
+        g    = all_r[all_r["asset"] == asset]
+        d    = float(g["pnl_usdc"].sum()) - float(g["hyp_pnl"].sum())
+        avg  = float(g["fill_usdc"].mean())
+        col  = "#22c55e" if d >= 0 else "#ef4444"
+        sign = "+" if d >= 0 else ""
+        arrow = "▲" if d >= 0 else "▼"
+        parts.append(
+            f"<span style='margin-right:16px'>"
+            f"<b>{asset}</b> "
+            f"<span style='color:{col}'>{arrow} &#36;{sign}{d:.2f}</span>"
+            f"<span style='color:#6b7280;font-size:11px'> (avg &#36;{avg:.3f})</span>"
+            f"</span>"
+        )
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+# ── Coin OB Imbalance Analysis ───────────────────────────────────────────────
+
+
+
+def _render_ob_analysis(
+    trades: pd.DataFrame,
+    model_trades: pd.DataFrame,
+    ob_trades: pd.DataFrame | None = None,
+    ob_model_trades: pd.DataFrame | None = None,
+) -> None:
+    """Win rate and PnL broken down by coin orderbook imbalance at trigger time."""
+
+    def _prep(df: pd.DataFrame, strategy: str) -> pd.DataFrame:
+        if df.empty or "coin_ob_imbalance" not in df.columns:
+            return pd.DataFrame()
+        r = df[df["status"].isin(["won", "lost"])].copy()
+        r["strategy"] = strategy
+        for col in ["coin_ob_imbalance", "coin_ob_imb_5s", "coin_ob_trend", "pnl_usdc"]:
+            r[col] = pd.to_numeric(r.get(col, pd.Series(dtype=float)), errors="coerce")
+        r["side_up"] = r["side"].str.upper() == "UP"
+        return r.dropna(subset=["coin_ob_imbalance"])
+
+    # ── Quantile-based bucket edges from observed data ────────────────────────
+    def _qedges(series: pd.Series, n: int = 5, pct: bool = True) -> tuple[list[float], list[str]]:
+        """Compute n equal-count bucket edges. Falls back to fixed bins if sparse.
+        pct=True: imbalance values 0–1 with % labels.
+        pct=False: raw float values (e.g. trend) with decimal labels.
+        """
+        vals = series.dropna()
+        if pct:
+            fallback = ([0.0, 0.35, 0.45, 0.55, 0.65, 1.001],
+                        ["<35%", "35–45%", "45–55%", "55–65%", ">65%"])
+        else:
+            fallback = ([-1.0, -0.10, -0.01, 0.01, 0.10, 1.001],
+                        ["<-10%", "-10–-1%", "-1–1%", "1–10%", ">10%"])
+        if len(vals) < n * 3:
+            return fallback
+        try:
+            _, edges = pd.qcut(vals, q=n, retbins=True, duplicates="drop")
+            edges = list(edges)
+            if pct:
+                edges[0] = 0.0; edges[-1] = 1.001
+                labels = [f"{edges[i]:.0%}–{edges[i+1]:.0%}" for i in range(len(edges) - 1)]
+            else:
+                edges[0] = edges[0] - 0.001; edges[-1] = edges[-1] + 0.001
+                labels = [f"{edges[i]:+.3f}–{edges[i+1]:+.3f}" for i in range(len(edges) - 1)]
+            return edges, labels
+        except ValueError:
+            return fallback
+
+    # ── Per-bucket stats for a given column and edges ─────────────────────────
+    def _bstats(df: pd.DataFrame, col: str, edges: list, labels: list) -> pd.DataFrame:
+        df = df.dropna(subset=[col]).copy()
+        if df.empty:
+            return pd.DataFrame(columns=["bucket", "n", "win_rate", "avg_pnl"])
+        df["_b"] = pd.cut(df[col], bins=edges, labels=labels, right=False)
+        return (
+            df.groupby("_b", observed=True)
+            .agg(n=("status", "count"),
+                 win_rate=("status", lambda s: (s == "won").mean()),
+                 avg_pnl=("pnl_usdc", "mean"))
+            .reset_index()
+            .rename(columns={"_b": "bucket"})
+        )
+
+    # ── Single-metric chart: PnL or WR per bucket ────────────────────────────
+    def _chart(
+        stats: pd.DataFrame,
+        title: str,
+        xaxis_title: str,
+        show_pnl: bool = True,
+        bar_color: str = "#3b82f6",
+    ) -> go.Figure:
+        fig = go.Figure()
+        x = [f"{b}  (n={n})" for b, n in zip(stats["bucket"].astype(str), stats["n"])]
+
+        if show_pnl:
+            bar_colors = ["#22c55e" if v >= 0 else "#ef4444" for v in stats["avg_pnl"]]
+            fig.add_bar(
+                name="Avg PnL", x=x, y=stats["avg_pnl"],
+                marker_color=bar_colors,
+                text=[f"${v:+.4f}" for v in stats["avg_pnl"]],
+                textposition="outside",
+                hovertemplate="%{x}: $%{y:+.4f}<extra></extra>",
+            )
+            fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.15)")
+            fig.update_layout(yaxis=dict(
+                title="Avg PnL ($)", gridcolor="rgba(255,255,255,0.06)",
+            ))
+        else:
+            fig.add_bar(
+                name="Win Rate", x=x, y=stats["win_rate"],
+                marker_color=bar_color,
+                text=[f"{v:.0%}" for v in stats["win_rate"]],
+                textposition="outside",
+                hovertemplate="%{x}: %{y:.1%} WR<extra></extra>",
+            )
+            fig.add_hline(y=0.5, line_dash="dot", line_color="rgba(59,130,246,0.4)")
+            fig.update_layout(yaxis=dict(
+                tickformat=".0%", title="Win Rate",
+                range=[0, 1.25], gridcolor="rgba(255,255,255,0.06)",
+            ))
+
+        fig.update_layout(
+            title=dict(text=title, font=dict(size=11), x=0),
+            xaxis_title=xaxis_title,
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            height=320, margin=dict(t=36, b=60, l=60, r=40),
+            showlegend=False,
+        )
+        return fig
+
+    mom_r = _prep(trades, "MOM")
+    mdl_r = _prep(model_trades, "MODEL")
+    all_r = pd.concat([mom_r, mdl_r], ignore_index=True)
+
+    if len(all_r) < 5:
+        st.caption("Not enough trades with OB data yet — analysis will appear once more trades are recorded.")
+        return
+
+    st.subheader("Coin Orderbook Imbalance at Trigger")
+    st.caption(
+        "Imbalance = bid volume / (bid + ask) across top-5 Binance depth levels at trigger time.  "
+        "5s mean is averaged over ~50 depth snapshots in the 5 seconds before trigger.  "
+        "Buckets are equal-count (quantile-based) from observed trades.  "
+        "Only trades with OB data are included."
+    )
+
+    # ── Direction-adjusted "favorable" columns ────────────────────────────────
+    adj_r = all_r.copy()
+    adj_r["fav_imb"] = adj_r.apply(
+        lambda row: row["coin_ob_imbalance"] if row["side_up"] else 1.0 - row["coin_ob_imbalance"], axis=1
+    )
+    adj_r["fav_imb_5s"] = adj_r.apply(
+        lambda row: row["coin_ob_imb_5s"] if pd.isna(row["coin_ob_imb_5s"])
+        else (row["coin_ob_imb_5s"] if row["side_up"] else 1.0 - row["coin_ob_imb_5s"]),
+        axis=1,
+    )
+    adj_r["fav_trend"] = adj_r.apply(
+        lambda row: row["coin_ob_trend"] if pd.isna(row["coin_ob_trend"])
+        else (row["coin_ob_trend"] if row["side_up"] else -row["coin_ob_trend"]),
+        axis=1,
+    )
+
+    # ── Detailed report ───────────────────────────────────────────────────────
+    with st.expander("📋 Detailed OB Imbalance Report", expanded=False):
+        _rpt_metric_col, _ = st.columns([1, 5])
+        with _rpt_metric_col:
+            rpt_metric_sel = st.radio("Metric", ["PnL", "Win Rate"],
+                                      horizontal=True, key="ob_report_metric_sel")
+        rpt_show_pnl = rpt_metric_sel == "PnL"
+
+        rpt_tabs = st.tabs(["All", "MOM", "MODEL"])
+        for rpt_tab, strat_label in zip(rpt_tabs, ["All", "MOM", "MODEL"]):
+            with rpt_tab:
+                if strat_label == "MOM":
+                    rpt_df = adj_r[adj_r["strategy"] == "MOM"].copy()
+                elif strat_label == "MODEL":
+                    rpt_df = adj_r[adj_r["strategy"] == "MODEL"].copy()
+                else:
+                    rpt_df = adj_r.copy()
+
+                if len(rpt_df) < 10:
+                    st.caption(f"Not enough {strat_label} trades with OB data.")
+                    continue
+
+                # ── Baseline stats ─────────────────────────────────────────
+                n_tot  = len(rpt_df)
+                n_won  = (rpt_df["status"] == "won").sum()
+                wr_all = n_won / n_tot
+                avg_p  = rpt_df["pnl_usdc"].mean()
+                tot_p  = rpt_df["pnl_usdc"].sum()
+                _bc1, _bc2, _bc3, _bc4 = st.columns(4)
+                _bc1.metric("Trades", n_tot)
+                _bc2.metric("Win Rate", f"{wr_all:.1%}")
+                _bc3.metric("Avg PnL", f"${avg_p:+.4f}")
+                _bc4.metric("Total PnL", f"${tot_p:+.2f}")
+
+                # ── Favorable imbalance snapshot (10 deciles) ──────────────
+                st.markdown("##### Favorable Imbalance — Snapshot")
+                rpt_snap = rpt_df.dropna(subset=["fav_imb"])
+                if len(rpt_snap) >= 20:
+                    fe10, fl10 = _qedges(rpt_snap["fav_imb"], n=10)
+                    fb10 = _bstats(rpt_snap, "fav_imb", fe10, fl10)
+                    st.plotly_chart(
+                        _chart(fb10,
+                               title="Favorable Imbalance — Snapshot (10 deciles)",
+                               xaxis_title="Favorable imbalance (bid %)",
+                               show_pnl=rpt_show_pnl),
+                        config={"displayModeBar": False}, width="stretch",
+                    )
+                else:
+                    st.caption("Not enough snapshot data for 10-decile chart.")
+
+                # ── Favorable imbalance 5s mean (10 deciles) ───────────────
+                st.markdown("##### Favorable Imbalance — 5s Mean")
+                rpt_m5 = rpt_df.dropna(subset=["fav_imb_5s"])
+                if len(rpt_m5) >= 20:
+                    fm5e, fm5l = _qedges(rpt_m5["fav_imb_5s"], n=10)
+                    fm5b = _bstats(rpt_m5, "fav_imb_5s", fm5e, fm5l)
+                    st.plotly_chart(
+                        _chart(fm5b,
+                               title="Favorable Imbalance — 5s Mean (10 deciles)",
+                               xaxis_title="Favorable imbalance 5s mean (bid %)",
+                               show_pnl=rpt_show_pnl, bar_color="#a855f7"),
+                        config={"displayModeBar": False}, width="stretch",
+                    )
+                else:
+                    st.caption("Not enough 5s mean data for 10-decile chart.")
+
+                # ── Favorable trend (10 deciles) ───────────────────────────
+                st.markdown("##### Favorable Trend")
+                rpt_trend = rpt_df.dropna(subset=["fav_trend"])
+                if len(rpt_trend) >= 20:
+                    fte, ftl = _qedges(rpt_trend["fav_trend"], n=10, pct=False)
+                    ftb = _bstats(rpt_trend, "fav_trend", fte, ftl)
+                    st.plotly_chart(
+                        _chart(ftb,
+                               title="Favorable Trend — direction-adjusted (10 deciles)",
+                               xaxis_title="Favorable OB trend (snapshot − 5s mean)",
+                               show_pnl=rpt_show_pnl, bar_color="#f59e0b"),
+                        config={"displayModeBar": False}, width="stretch",
+                    )
+                else:
+                    st.caption("Not enough trend data for 10-decile chart.")
+
+                # ── Combined signal: avg(snapshot, 5s mean) (10 deciles) ───
+                st.markdown("##### Combined Signal — avg(Snapshot, 5s Mean)")
+                rpt_comb = rpt_df.dropna(subset=["fav_imb", "fav_imb_5s"]).copy()
+                if len(rpt_comb) >= 20:
+                    rpt_comb["_comb"] = (rpt_comb["fav_imb"] + rpt_comb["fav_imb_5s"]) / 2
+                    cce, ccl = _qedges(rpt_comb["_comb"], n=10)
+                    ccb = _bstats(rpt_comb, "_comb", cce, ccl)
+                    st.plotly_chart(
+                        _chart(ccb,
+                               title="Combined Signal — avg(snapshot, 5s mean) (10 deciles)",
+                               xaxis_title="Combined favorable imbalance",
+                               show_pnl=rpt_show_pnl, bar_color="#10b981"),
+                        config={"displayModeBar": False}, width="stretch",
+                    )
+                else:
+                    st.caption("Not enough data for combined signal chart.")
+
+                # ── Filtering simulation (dynamic) ────────────────────────
+                st.markdown("##### Filtering Simulation — dynamic thresholds")
+                st.caption(
+                    "Toggle each threshold on/off and tune the sliders. "
+                    "When both are active: **AND** = discard only if *both* filters reject "
+                    "(more permissive); **OR** = discard if *either* filter rejects (more restrictive). "
+                    "Stats update instantly."
+                )
+
+                _fk = strat_label  # unique key suffix per strategy tab
+                _fc1, _fc2, _fc3 = st.columns([5, 5, 2])
+                with _fc1:
+                    _use_snap = st.checkbox(
+                        "Snapshot threshold", value=True,
+                        key=f"ob_use_snap_{_fk}",
+                    )
+                    _snap_thr = st.slider(
+                        "Min favorable snapshot imb", 0.0, 1.0, 0.55, 0.01,
+                        format="%.2f", key=f"ob_snap_thr_{_fk}",
+                        disabled=not _use_snap,
+                    )
+                with _fc2:
+                    _use_mean = st.checkbox(
+                        "5s Mean threshold", value=False,
+                        key=f"ob_use_mean_{_fk}",
+                    )
+                    _mean_thr = st.slider(
+                        "Min favorable 5s mean imb", 0.0, 1.0, 0.55, 0.01,
+                        format="%.2f", key=f"ob_mean_thr_{_fk}",
+                        disabled=not _use_mean,
+                    )
+                with _fc3:
+                    if _use_snap and _use_mean:
+                        _logic = st.radio(
+                            "Logic", ["AND", "OR"],
+                            key=f"ob_logic_{_fk}",
+                            help=(
+                                "AND — take the trade unless *both* filters reject it "
+                                "(pass if at least one threshold is met).\n\n"
+                                "OR — take the trade only if *both* filters accept it "
+                                "(discard if either threshold is missed)."
+                            ),
+                        )
+                    else:
+                        _logic = "AND"
+                        st.caption("Enable both to pick AND / OR")
+
+                # Build mask
+                _fmask = pd.Series(True, index=rpt_df.index)
+                if _use_snap:
+                    _snap_mask = rpt_df["fav_imb"].fillna(-1) >= _snap_thr
+                    _fmask = _snap_mask
+                if _use_mean:
+                    _mean_mask = rpt_df["fav_imb_5s"].fillna(-1) >= _mean_thr
+                    if _use_snap:
+                        # AND = discard only if both reject → pass if either passes (union)
+                        # OR  = discard if either rejects → pass only if both pass (intersection)
+                        _fmask = (_fmask | _mean_mask) if _logic == "AND" else (_fmask & _mean_mask)
+                    else:
+                        _fmask = _mean_mask
+
+                _fsub = rpt_df[_fmask]
+                _n_sub = len(_fsub)
+
+                if not _use_snap and not _use_mean:
+                    st.caption("Enable at least one threshold to filter.")
+                elif _n_sub >= 2:
+                    _ms1, _ms2, _ms3, _ms4, _ms5 = st.columns(5)
+                    _ms1.metric("Trades (passing)", _n_sub)
+                    _ms2.metric("Kept", f"{_n_sub / n_tot:.0%}")
+                    _fsub_wr = (_fsub["status"] == "won").mean()
+                    _ms3.metric(
+                        "Win Rate", f"{_fsub_wr:.1%}",
+                        delta=f"{_fsub_wr - wr_all:+.1%} vs all",
+                    )
+                    _fsub_avg_pnl = _fsub["pnl_usdc"].mean()
+                    _ms4.metric(
+                        "Avg PnL", f"${_fsub_avg_pnl:+.4f}",
+                        delta=f"${_fsub_avg_pnl - avg_p:+.4f} vs all",
+                    )
+                    _ms5.metric("Total PnL", f"${_fsub['pnl_usdc'].sum():+.2f}")
+                else:
+                    st.caption("No trades pass the current filter — try lowering the thresholds.")
+
+                # ── Config snippet ─────────────────────────────────────────
+                if _use_snap or _use_mean:
+                    _cfg_lines = []
+                    if _use_snap:
+                        _cfg_lines.append(f"min_fav_imbalance: {_snap_thr:.2f}")
+                    if _use_mean:
+                        _cfg_lines.append(f"min_fav_imbalance_mean: {_mean_thr:.2f}")
+                    # AND/OR not yet reflected in config — may add later
+                    st.code("\n".join(_cfg_lines), language="yaml")
+
+                # ── OB Filter Activity ─────────────────────────────────────
+                st.divider()
+                st.markdown("##### OB Filter Activity")
+                st.caption("Trades logged as DRY_RUN_OB_FILTERED — below the OB imbalance threshold.")
+
+                if strat_label == "MOM":
+                    _ob_strat_df = (ob_trades.copy() if ob_trades is not None and not ob_trades.empty
+                                    else pd.DataFrame())
+                elif strat_label == "MODEL":
+                    _ob_strat_df = (ob_model_trades.copy() if ob_model_trades is not None and not ob_model_trades.empty
+                                    else pd.DataFrame())
+                else:
+                    _parts = []
+                    if ob_trades is not None and not ob_trades.empty:
+                        _parts.append(ob_trades.assign(strategy="MOM"))
+                    if ob_model_trades is not None and not ob_model_trades.empty:
+                        _parts.append(ob_model_trades.assign(strategy="MODEL"))
+                    _ob_strat_df = pd.concat(_parts, ignore_index=True) if _parts else pd.DataFrame()
+
+                if _ob_strat_df.empty:
+                    st.caption("No OB-filtered trades in selected time window.")
+                else:
+                    # Only resolved trades have meaningful PnL
+                    _ob_res = _ob_strat_df[_ob_strat_df["status"].isin(["won", "lost"])].copy()
+                    if "pnl_usdc" in _ob_res.columns:
+                        _ob_res["pnl_usdc"] = pd.to_numeric(_ob_res["pnl_usdc"], errors="coerce")
+
+                    # ── PnL / WinRate bar chart by asset ───────────────────
+                    if not _ob_res.empty and "asset" in _ob_res.columns:
+                        _ob_fig = go.Figure()
+
+                        def _ob_bar_series(df: pd.DataFrame, name: str, color: str) -> None:
+                            grp = df.groupby("asset").agg(
+                                n=("status", "count"),
+                                win_rate=("status", lambda s: (s == "won").mean()),
+                                avg_pnl=("pnl_usdc", "mean"),
+                            ).reset_index()
+                            if rpt_show_pnl:
+                                colors = ["#22c55e" if v >= 0 else "#ef4444"
+                                          for v in grp["avg_pnl"]]
+                                _ob_fig.add_bar(
+                                    name=name, x=grp["asset"], y=grp["avg_pnl"],
+                                    marker_color=colors,
+                                    text=[f"${v:+.4f}" for v in grp["avg_pnl"]],
+                                    textposition="outside",
+                                    customdata=grp["n"],
+                                    hovertemplate="%{x} (n=%{customdata}): $%{y:+.4f}<extra></extra>",
+                                )
+                            else:
+                                _ob_fig.add_bar(
+                                    name=name, x=grp["asset"], y=grp["win_rate"],
+                                    marker_color=color,
+                                    text=[f"{v:.0%}" for v in grp["win_rate"]],
+                                    textposition="outside",
+                                    customdata=grp["n"],
+                                    hovertemplate="%{x} (n=%{customdata}): %{y:.1%} WR<extra></extra>",
+                                )
+
+                        if strat_label == "All" and "strategy" in _ob_res.columns:
+                            # Use close shades so same-asset bars look related
+                            for _s, _c in [("MOM", "#3b82f6"), ("MODEL", "#93c5fd")]:
+                                _sub = _ob_res[_ob_res["strategy"] == _s]
+                                if not _sub.empty:
+                                    _ob_bar_series(_sub, _s, _c)
+                            _ob_fig.update_layout(barmode="group", showlegend=True,
+                                                  legend=dict(orientation="h", y=1.1))
+                        else:
+                            _bar_col = "#3b82f6" if strat_label == "MOM" else "#93c5fd"
+                            _ob_bar_series(_ob_res, strat_label, _bar_col)
+                            _ob_fig.update_layout(showlegend=False)
+
+                        if rpt_show_pnl:
+                            _ob_fig.add_hline(y=0, line_dash="dot",
+                                              line_color="rgba(255,255,255,0.15)")
+                            _ob_fig.update_layout(yaxis=dict(
+                                title="Avg PnL ($)", gridcolor="rgba(255,255,255,0.06)",
+                            ))
+                        else:
+                            _ob_fig.add_hline(y=0.5, line_dash="dot",
+                                              line_color="rgba(59,130,246,0.4)")
+                            _ob_fig.update_layout(yaxis=dict(
+                                tickformat=".0%", title="Win Rate",
+                                range=[0, 1.25], gridcolor="rgba(255,255,255,0.06)",
+                            ))
+
+                        _ob_fig.update_layout(
+                            title=dict(text="OB-Filtered Trades — if taken", font=dict(size=11), x=0),
+                            xaxis_title="Asset",
+                            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                            height=300, margin=dict(t=36, b=60, l=60, r=40),
+                        )
+                        st.plotly_chart(_ob_fig, config={"displayModeBar": False}, width="stretch")
+                    elif _ob_res.empty:
+                        st.caption("OB-filtered trades not yet resolved — check back once outcomes are known.")
+
+                    # ── Avg PnL by favorable imbalance bucket ──────────────
+                    if "coin_ob_imbalance" in _ob_strat_df.columns and "side" in _ob_strat_df.columns:
+                        _ob_h = _ob_strat_df[_ob_strat_df["status"].isin(["won", "lost"])].copy()
+                        if _ob_h.empty or "pnl_usdc" not in _ob_h.columns:
+                            pass
+                        else:
+                            _ob_h["coin_ob_imbalance"] = pd.to_numeric(_ob_h["coin_ob_imbalance"], errors="coerce")
+                            _ob_h["pnl_usdc"] = pd.to_numeric(_ob_h["pnl_usdc"], errors="coerce")
+                            _ob_h["side_up"] = _ob_h["side"].str.upper() == "UP"
+                            _ob_h["fav_imb"] = _ob_h.apply(
+                                lambda r: r["coin_ob_imbalance"] if r["side_up"] else 1.0 - r["coin_ob_imbalance"],
+                                axis=1,
+                            )
+                            _ob_h = _ob_h.dropna(subset=["fav_imb", "pnl_usdc"])
+                            if not _ob_h.empty:
+                                st.markdown("**Avg PnL by favorable imbalance at filter time**")
+                                _bins = [i / 10 for i in range(11)]
+                                _bin_labels = [f"{_bins[i]:.0%}–{_bins[i+1]:.0%}" for i in range(10)]
+                                _ob_h["_b"] = pd.cut(_ob_h["fav_imb"], bins=_bins,
+                                                     labels=_bin_labels, right=False,
+                                                     include_lowest=True)
+                                _pnl_fig = go.Figure()
+
+                                def _pnl_bucket_series(df: pd.DataFrame, name: str) -> None:
+                                    grp = (df.groupby("_b", observed=True)["pnl_usdc"]
+                                           .agg(n="count", avg_pnl="mean").reset_index())
+                                    x = [f"{b}  (n={n})" for b, n in zip(grp["_b"].astype(str), grp["n"])]
+                                    colors = ["#22c55e" if v >= 0 else "#ef4444" for v in grp["avg_pnl"]]
+                                    _pnl_fig.add_bar(
+                                        name=name, x=x, y=grp["avg_pnl"],
+                                        marker_color=colors,
+                                        text=[f"${v:+.4f}" for v in grp["avg_pnl"]],
+                                        textposition="outside",
+                                        hovertemplate="%{x}: $%{y:+.4f}<extra></extra>",
+                                    )
+
+                                if strat_label == "All" and "strategy" in _ob_h.columns:
+                                    for _s in ["MOM", "MODEL"]:
+                                        _sub = _ob_h[_ob_h["strategy"] == _s]
+                                        if not _sub.empty:
+                                            _pnl_bucket_series(_sub, _s)
+                                    _pnl_fig.update_layout(barmode="group", showlegend=True,
+                                                           legend=dict(orientation="h", y=1.1))
+                                else:
+                                    _pnl_bucket_series(_ob_h, strat_label)
+                                    _pnl_fig.update_layout(showlegend=False)
+
+                                _pnl_fig.add_hline(y=0, line_dash="dot",
+                                                   line_color="rgba(255,255,255,0.15)")
+                                _pnl_fig.update_layout(
+                                    xaxis_title="Favorable Imbalance at Filter Time",
+                                    yaxis=dict(title="Avg PnL ($)",
+                                               gridcolor="rgba(255,255,255,0.06)"),
+                                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                                    height=300, margin=dict(t=20, b=60, l=60, r=40),
+                                )
+                                st.plotly_chart(_pnl_fig, config={"displayModeBar": False}, width="stretch")
+
+
 # ── Unified trade log ─────────────────────────────────────────────────────────
 
 def _render_unified_trade_log(trades: pd.DataFrame, model_trades: pd.DataFrame) -> None:
@@ -1182,8 +1908,16 @@ def _render_unified_trade_log(trades: pd.DataFrame, model_trades: pd.DataFrame) 
     if "status" in combined.columns:
         combined = combined[combined["status"] != "order_failed"].reset_index(drop=True)
 
+    # Cap display at 1000 most recent rows — full data is used by analytics/overview
+    LOG_DISPLAY_LIMIT = 1000
+    total_rows = len(combined)
+    combined = combined.head(LOG_DISPLAY_LIMIT)
+
     # Strategy filter
-    strategy_filter = st.radio("Show", ["All", "MOM", "MODEL"], horizontal=True)
+    strategy_filter = st.radio(
+        f"Show  ·  displaying {min(total_rows, LOG_DISPLAY_LIMIT):,} of {total_rows:,} trades",
+        ["All", "MOM", "MODEL"], horizontal=True,
+    )
     if strategy_filter != "All":
         combined = combined[combined["strategy"] == strategy_filter].reset_index(drop=True)
 
@@ -1209,7 +1943,7 @@ def _render_unified_trade_log(trades: pd.DataFrame, model_trades: pd.DataFrame) 
     display["side"] = display["side"].apply(_side_fmt)
 
     # Mask timing for dry-run rows and sub-1ms noise
-    _is_dry = display["order_id"] == "DRY_RUN" if "order_id" in display.columns else pd.Series(False, index=display.index)
+    _is_dry = display["order_id"].isin({"DRY_RUN", "DRY_RUN_OB_FILTERED"}) if "order_id" in display.columns else pd.Series(False, index=display.index)
     for _tc in ("sign_ms", "post_ms", "order_ms"):
         if _tc in display.columns:
             _s = pd.to_numeric(display[_tc], errors="coerce")
@@ -1261,19 +1995,23 @@ def render() -> None:
 
     st.subheader("🤖 Live Momentum Bots")
 
-    # ── Include dry-run trades toggle ─────────────────────────────────────────
-    include_dry_run = st.toggle("Include dry-run trades", value=True, label_visibility="collapsed")
+    # ── Trade filter toggles ──────────────────────────────────────────────────
+    _tf1, _tf2, _ = st.columns([1, 1, 5])
+    include_dry_run  = _tf1.toggle("Include dry-run trades",    value=True)
+    include_ob_filtered = _tf2.toggle("Include OB-filtered trades", value=True)
 
-    # Apply dry-run filter to momentum and model trades
-    def _apply_dry_run_filter(df: pd.DataFrame, include: bool) -> pd.DataFrame:
+    def _apply_dry_run_filter(df: pd.DataFrame, incl_dry: bool, incl_ob: bool) -> pd.DataFrame:
         if df.empty or "order_id" not in df.columns:
             return df
-        if not include:
-            return df[df["order_id"] != "DRY_RUN"].reset_index(drop=True)
-        return df
+        mask = pd.Series(True, index=df.index)
+        if not incl_dry:
+            mask &= df["order_id"] != "DRY_RUN"
+        if not incl_ob:
+            mask &= df["order_id"] != "DRY_RUN_OB_FILTERED"
+        return df[mask].reset_index(drop=True)
 
-    trades_filtered = _apply_dry_run_filter(trades, include_dry_run)
-    model_trades_filtered = _apply_dry_run_filter(model_trades, include_dry_run)
+    trades_filtered = _apply_dry_run_filter(trades, include_dry_run, include_ob_filtered)
+    model_trades_filtered = _apply_dry_run_filter(model_trades, include_dry_run, include_ob_filtered)
 
     _FOK_STATUSES = {"fok_killed", "fok_won", "fok_lost"}
 
@@ -1299,14 +2037,65 @@ def render() -> None:
     # ── Overview ──────────────────────────────────────────────────────────────
     with tab_ov:
         _render_window_bar()
-        _render_summary(trades_filtered, model_trades_filtered)
-        _render_overview_charts(trades_filtered, model_trades_filtered)
+
+        # Asset filter — built from whatever assets appear in the trade history
+        all_assets = sorted(set(
+            list(trades_filtered["asset"].dropna().unique() if "asset" in trades_filtered.columns else []) +
+            list(model_trades_filtered["asset"].dropna().unique() if "asset" in model_trades_filtered.columns else [])
+        ))
+        _ov_filter_cols = st.columns([3, 4, 0.1])
+        # Time window filter
+        _OV_SNAPS = [
+            (30 * 60,        "30m"),
+            (1 * 3600,       "1h"),
+            (2 * 3600,       "2h"),
+            (4 * 3600,       "4h"),
+            (8 * 3600,       "8h"),
+            (12 * 3600,      "12h"),
+            (24 * 3600,      "24h"),
+            (48 * 3600,      "48h"),
+            (7 * 24 * 3600,  "7d"),
+            (0,              "All time"),
+        ]
+        _ov_snap_labels = [s[1] for s in _OV_SNAPS]
+        ov_selected_label = _ov_filter_cols[0].select_slider(
+            "Time window", options=_ov_snap_labels, value="All time",
+            label_visibility="collapsed", key="ov_time_window",
+        )
+        _ov_cutoff_secs = dict((v, k) for k, v in _OV_SNAPS)[ov_selected_label] or None
+
+        def _ov_time_filter(df: pd.DataFrame) -> pd.DataFrame:
+            if df.empty or _ov_cutoff_secs is None or "ts" not in df.columns:
+                return df
+            cutoff = time.time() - _ov_cutoff_secs
+            return df[pd.to_numeric(df["ts"], errors="coerce") >= cutoff].reset_index(drop=True)
+
+        ov_trades       = _ov_time_filter(trades_filtered)
+        ov_model_trades = _ov_time_filter(model_trades_filtered)
+
+        if all_assets:
+            selected_assets = st.multiselect(
+                "Filter assets",
+                options=all_assets,
+                default=all_assets,
+                label_visibility="collapsed",
+                placeholder="Select assets…",
+            )
+            def _filter_assets(df: pd.DataFrame) -> pd.DataFrame:
+                if df.empty or "asset" not in df.columns or not selected_assets:
+                    return df
+                return df[df["asset"].isin(selected_assets)].reset_index(drop=True)
+            ov_trades       = _filter_assets(ov_trades)
+            ov_model_trades = _filter_assets(ov_model_trades)
+
+        _render_summary(ov_trades, ov_model_trades)
+        _render_overview_charts(ov_trades, ov_model_trades)
         st.divider()
 
         if not bots:
             st.info(
                 "No momentum bots running.  Start one with:\n"
-                "```\npython scripts/live_momentum_buy.py --asset BTC --name mom_btc --dry-run\n```"
+                "```\npython scripts/live_momentum_buy.py --asset BTC --name mom_btc\n```"
             )
         else:
             # Active trades summary: one row per bot, showing current trade state
@@ -1355,7 +2144,7 @@ def render() -> None:
         if not bots:
             st.info(
                 "No momentum bots running.  Start one with:\n"
-                "```\npython scripts/live_momentum_buy.py --asset BTC --name mom_btc --dry-run\n```"
+                "```\npython scripts/live_momentum_buy.py --asset BTC --name mom_btc\n```"
             )
         else:
             ws_now = int(time.time()) // 300 * 300
@@ -1367,19 +2156,24 @@ def render() -> None:
                         # Load per-asset strategy config (merges global defaults with per-coin overrides)
                         momentum_cfg, model_cfg = _load_strategy_cfg(coin)
 
-                        # Count active trades for this coin in current window
-                        mom_active = trades_filtered[
+                        # Trades for this coin in the current window (from CSV — always up to date)
+                        mom_this_window = trades_filtered[
                             (trades_filtered["asset"] == coin) &
-                            (trades_filtered["window_start_ts"] == ws_now) &
-                            (trades_filtered["status"] == "open")
-                        ]
+                            (trades_filtered["window_start_ts"] == ws_now)
+                        ] if not trades_filtered.empty else pd.DataFrame()
+                        mom_active = mom_this_window[mom_this_window["status"] == "open"] \
+                            if not mom_this_window.empty else pd.DataFrame()
                         model_active = model_trades_filtered[
                             (model_trades_filtered["asset"] == coin) &
                             (model_trades_filtered["window_start_ts"] == ws_now) &
                             (model_trades_filtered["status"] == "open")
-                        ]
+                        ] if not model_trades_filtered.empty else pd.DataFrame()
 
-                        _render_bot_card(coin, s, idx=i + j, momentum_cfg=momentum_cfg, model_cfg=model_cfg)
+                        _render_bot_card(
+                            coin, s, idx=i + j,
+                            momentum_cfg=momentum_cfg, model_cfg=model_cfg,
+                            mom_csv_trades=mom_this_window if not mom_this_window.empty else None,
+                        )
 
                         # Show multi-trade badges if applicable
                         if len(mom_active) > 1 or len(model_active) > 1:
@@ -1444,12 +2238,33 @@ def render() -> None:
                 at  = at[at["asset"].isin(selected_assets)].reset_index(drop=True)  if not at.empty  else at
                 amt = amt[amt["asset"].isin(selected_assets)].reset_index(drop=True) if not amt.empty else amt
 
+        # OB-filtered trades for activity analysis (bypasses dry-run toggle)
+        def _extract_ob_filtered(raw_df: pd.DataFrame) -> pd.DataFrame:
+            if raw_df.empty or "order_id" not in raw_df.columns:
+                return pd.DataFrame()
+            ob = _time_filter(raw_df[raw_df["order_id"] == "DRY_RUN_OB_FILTERED"].reset_index(drop=True))
+            if not ob.empty and "asset" in ob.columns:
+                _active = sorted(set(
+                    (at["asset"].dropna().unique().tolist() if not at.empty and "asset" in at.columns else []) +
+                    (amt["asset"].dropna().unique().tolist() if not amt.empty and "asset" in amt.columns else [])
+                ))
+                if _active != _all_assets:
+                    ob = ob[ob["asset"].isin(_active)].reset_index(drop=True)
+            return ob
+
+        _ob_at  = _extract_ob_filtered(trades)
+        _ob_amt = _extract_ob_filtered(model_trades)
+
         if not at.empty or not amt.empty:
             st.plotly_chart(_pnl_chart(at, amt), width="stretch")
             st.divider()
             _render_strategy_stats(at, amt)
             st.divider()
             _render_per_coin_stats(at, amt)
+            st.divider()
+            _render_order_sizing_analysis(at, amt)
+            st.divider()
+            _render_ob_analysis(at, amt, _ob_at, _ob_amt)
         else:
             st.caption("No trades recorded yet — analytics will appear once trades are recorded.")
 
@@ -1515,4 +2330,4 @@ def render() -> None:
                     lambda t: _fmt_ts(float(t)) if pd.notna(t) else "—"
                 )
                 fok_disp = fok_disp.sort_values("ts", ascending=False) if "ts" in fok_disp.columns else fok_disp
-                st.dataframe(fok_disp, use_container_width=True, hide_index=True)
+                st.dataframe(fok_disp, width='stretch', hide_index=True)

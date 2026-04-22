@@ -19,7 +19,7 @@ from skeptic import config
 from skeptic.models.market import Market, Token
 from skeptic.utils.time import market_slug
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("gamma")
 
 _HEADERS = {"Accept": "application/json"}
 

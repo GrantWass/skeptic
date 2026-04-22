@@ -16,6 +16,7 @@ Usage:
     python scripts/train_model.py --assets BTC --out-report data/reports/model_report.md
 """
 import argparse
+import gc
 import joblib
 import logging
 import os
@@ -46,7 +47,7 @@ try:
 except ImportError:
     _HAS_LGB = False
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%M:%S")
 log = logging.getLogger(__name__)
 
 WINDOW_SECS   = 300
@@ -67,33 +68,29 @@ ASSET_TO_SYMBOL = {
     "HYPE": "HYPEUSDT",
 }
 
-BASE_FEATURES = [
+FEATURES = [
     "move_sigmas",
     "elapsed_second",
     "hour_sin",
     "hour_cos",
-    "vel_2s",
     "vel_5s",
+    "dist_low_30",              # distance above 30s rolling low (σ-norm)
+    "dist_high_30",             # distance below 30s rolling high (σ-norm)
+    "move_x_elapsed",           # position × time: early moves can reverse, late moves hold
+    "move_x_vol",               # position × volume: volume-confirmed move vs thin-air move
+    "acc_4s",                   # second derivative over 4s
+    "move_x_elapsed_x_vel10s",  # move_x_elapsed × vel_10s: momentum persistence
+    "move_x_acc10s",            # move_sigmas × acc_10s: accelerating vs fading move
+]
+
+# Extended feature set — additional features on top of FEATURES
+NEW_FEATURES = [
+    "vel_2s",
     "vel_10s",
-    "acc_4s",
     "acc_10s",
     "vel_ratio",
     "vel_decay",
     "vol_10s_log",
-]
-
-# Interaction features added on top of BASE_FEATURES
-INTERACTION_FEATURES = [
-    "move_x_elapsed",  # position × time: early moves can reverse, late moves hold
-    "move_x_vol",      # position × volume: volume-confirmed move vs thin-air move
-]
-
-FEATURES = BASE_FEATURES + INTERACTION_FEATURES
-
-# Extended feature set — structural / regime features added on top of FEATURES
-NEW_FEATURES = [
-    "dist_high_30",       # distance below 30s rolling high (σ-norm)
-    "dist_low_30",        # distance above 30s rolling low (σ-norm)
     "zscore_20",          # price z-score relative to 20s mean/std
     "vol_z_30",           # volume z-score relative to 30s mean/std
     "signed_vol_imb",     # net signed volume imbalance over 10s (range ≈ [-1, 1])
@@ -104,7 +101,25 @@ NEW_FEATURES = [
     "time_since_flip",    # seconds since last direction flip (trend persistence)
 ]
 
+# Path-dependent features: capture WHERE the price has been within the window,
+# not just the current snapshot.  All computable in O(n) via cumulative ops.
+QUANT_FEATURES = [
+    "vwap_dev",              # deviation from volume-weighted avg price in window so far
+    "chan_pos",              # position in running high-low channel: 0=at low, 1=at high
+    "max_up_excursion",      # max upside from window open / σ  (always ≥ 0)
+    "max_dn_excursion",      # max downside from window open / σ (always ≤ 0)
+    "move_efficiency",       # |move| / running_range — 1=clean trend, 0=full retracement
+    "dir_consistency_window",# running fraction of up-ticks since window open ∈ [-1, 1]
+    "pv_corr_10",            # 10s rolling price-change / volume correlation (buy pressure)
+    "vol_accel",             # recent vol / baseline vol — is volume picking up?
+]
+
 EXTENDED_FEATURES = FEATURES + NEW_FEATURES
+
+# Market features: base coin features + PM orderbook signals
+# Trained only on windows where both coin price and PM data are available (80/20 temporal split).
+PM_FEATURES = ["up_imbalance", "dn_imbalance"]
+MARKET_FEATURES = FEATURES + PM_FEATURES
 
 
 from skeptic.models.calibration import PlattScaledModel  # noqa: F401 — re-exported for joblib
@@ -113,13 +128,14 @@ from skeptic.models.calibration import PlattScaledModel  # noqa: F401 — re-exp
 # ── Data loading ───────────────────────────────────────────────────────────────
 
 def load_pm_windows(prices_dir: str, asset: str) -> pd.DataFrame:
-    """Load all prices_*.csv files, filter to asset. Returns ts, window_ts, up_ask, dn_ask."""
+    """Load all prices_*.csv files, filter to asset. Returns ts, window_ts, up_ask, dn_ask, and orderbook cols."""
     files = sorted(Path(prices_dir).glob("prices_*.csv"))
     if not files:
         raise FileNotFoundError(f"No prices_*.csv in {prices_dir}")
     frames = []
     for f in files:
-        df = pd.read_csv(f, usecols=["ts", "window_ts", "asset", "up_ask", "dn_ask"])
+        df = pd.read_csv(f, usecols=["ts", "window_ts", "asset", "up_ask", "dn_ask",
+                                      "up_imbalance", "dn_imbalance"])
         frames.append(df[df["asset"] == asset])
     out = pd.concat(frames, ignore_index=True)
     out = out.drop_duplicates(subset=["ts", "window_ts"]).sort_values(["window_ts", "ts"])
@@ -392,6 +408,53 @@ def build_window_features(
             prev_s = s
         time_since_flip[i] = float(i - last_flip)
 
+    # ── Quant path features ───────────────────────────────────────────────────
+    # All use only information available at second t (no lookahead).
+
+    # 1. VWAP deviation — running volume-weighted average price vs current price
+    _run_vol      = np.cumsum(win_vol)
+    _run_pv       = np.cumsum(win_price * win_vol)
+    _safe_run_vol = np.where(_run_vol > 1e-10, _run_vol, 1.0)
+    _vwap         = np.where(_run_vol > 1e-10, _run_pv / _safe_run_vol, win_price)
+    vwap_dev = (win_price - _vwap) / sigma
+
+    # 2–5. Running max/min from window open → channel position + excursions
+    max_price_run    = np.maximum.accumulate(win_price)
+    min_price_run    = np.minimum.accumulate(win_price)
+    max_up_excursion = (max_price_run - open_price) / sigma   # ≥ 0
+    max_dn_excursion = (min_price_run - open_price) / sigma   # ≤ 0
+    running_range    = max_price_run - min_price_run
+    _safe_range      = np.where(running_range > 1e-10, running_range, 1.0)
+    chan_pos         = np.where(running_range > 1e-10,
+                                (win_price - min_price_run) / _safe_range,
+                                0.5)
+    move_efficiency  = np.where(running_range > 1e-10,
+                                np.abs(win_price - open_price) / _safe_range,
+                                0.0)
+
+    # 6. Running directional consistency since window open ∈ [-1, 1]
+    dir_consistency_window = np.cumsum(tick_sign) / np.arange(1, n + 1)
+
+    # 7. 10s price-change / volume correlation (measures buy pressure conviction)
+    pv_corr_10 = np.full(n, np.nan)
+    if n > 10:
+        _sw_dp = _sw(price_diffs, 10)[:n - 10]   # (n-10, 10)
+        _sw_v  = _sw(win_vol,     10)[:n - 10]
+        _dp_c  = _sw_dp - _sw_dp.mean(axis=1, keepdims=True)
+        _v_c   = _sw_v  - _sw_v.mean(axis=1,  keepdims=True)
+        _num   = (_dp_c * _v_c).sum(axis=1)
+        _den   = np.sqrt((_dp_c ** 2).sum(axis=1) * (_v_c ** 2).sum(axis=1)) + 1e-10
+        pv_corr_10[10:n] = _num / _den
+
+    # 8. Volume acceleration — 5s mean vol vs 20s mean vol (>1 = picking up)
+    vol_accel = np.full(n, np.nan)
+    if n > 20:
+        _sw_v5  = _sw(win_vol, 5)[:n - 5]    # (n-5, 5)
+        _sw_v20 = _sw(win_vol, 20)[:n - 20]  # (n-20, 20)
+        _mu5    = _sw_v5[15:n - 5].mean(axis=1)   # align to index 20..n
+        _mu20   = _sw_v20[:n - 20].mean(axis=1)
+        vol_accel[20:n] = _mu5 / (_mu20 + 1e-10)
+
     _hour_rad = hour_utc * (2 * np.pi / 24)
     df = pd.DataFrame({
         "ts":               win_ts,
@@ -410,6 +473,8 @@ def build_window_features(
         "move_x_elapsed":   move_sigmas * elapsed,
         "move_x_vol":       move_sigmas * vol_10s_log,
         # Extended features
+        "move_x_elapsed_x_vel10s": move_sigmas * elapsed * vel_10s,
+        "move_x_acc10s":           move_sigmas * acc_10s,
         "dist_high_30":       dist_high_30,
         "dist_low_30":        dist_low_30,
         "zscore_20":          zscore_20,
@@ -420,6 +485,15 @@ def build_window_features(
         "mom_slope":          mom_slope,
         "dir_consistency_10": dir_consistency_10,
         "time_since_flip":    time_since_flip,
+        # Quant path features
+        "vwap_dev":               vwap_dev,
+        "chan_pos":               chan_pos,
+        "max_up_excursion":       max_up_excursion,
+        "max_dn_excursion":       max_dn_excursion,
+        "move_efficiency":        move_efficiency,
+        "dir_consistency_window": dir_consistency_window,
+        "pv_corr_10":             pv_corr_10,
+        "vol_accel":              vol_accel,
     })
 
     return df
@@ -433,6 +507,7 @@ def build_asset_dataset(
     close_series:  pd.Series,
     volume_series: pd.Series,
     sigma:         float,  # kept for vol_ratio / report sections; features use EWMA sigma
+    ewma_lambda:   float = EWMA_LAMBDA,
 ) -> pd.DataFrame:
     """
     Build the full per-second dataset for one asset across all resolvable windows.
@@ -455,7 +530,7 @@ def build_asset_dataset(
         train_set = set(windows)
 
     # Walk-forward EWMA sigma: computed over ALL coin windows (dense signal)
-    ewma_sigmas = compute_ewma_sigmas(windows, close_series)
+    ewma_sigmas = compute_ewma_sigmas(windows, close_series, lambda_=ewma_lambda)
     log.info(
         "%s: EWMA σ available for %d/%d windows  (warmup excluded: %d)",
         asset, len(ewma_sigmas), len(windows), len(windows) - len(ewma_sigmas),
@@ -521,6 +596,107 @@ def build_asset_dataset(
         out[out["split"] == "test"]["window_ts"].nunique(),
     )
     return out
+
+
+# ── Market features dataset ───────────────────────────────────────────────────
+
+def build_market_features_dataset(
+    asset:         str,
+    pm_df:         pd.DataFrame,
+    close_series:  pd.Series,
+    volume_series: pd.Series,
+    sigma:         float,
+    ewma_lambda:   float = EWMA_LAMBDA,
+) -> pd.DataFrame:
+    """
+    Build a per-second dataset for the market features model experiment.
+
+    Only includes windows where BOTH coin price data (>=280 rows) AND PM orderbook
+    data are available — the intersection of coin windows and pm_df windows.
+
+    80/20 temporal split: first 80% of overlap windows = train, last 20% = test.
+
+    PM orderbook features (up_imbalance, up_spread, dn_imbalance, dn_spread) are
+    joined onto the per-second coin feature rows by ts.  Seconds with no PM row
+    get NaN and are handled by median imputation at train time.
+    """
+    if not all(c in pm_df.columns for c in PM_FEATURES):
+        log.warning("%s: pm_df missing PM feature columns — skipping market features model", asset)
+        return pd.DataFrame()
+
+    all_coin_windows  = build_coin_windows(close_series)
+    ewma_sigmas       = compute_ewma_sigmas(all_coin_windows, close_series, lambda_=ewma_lambda)
+    market_window_set = set(pm_df["window_ts"].unique())
+    overlap_windows   = sorted(w for w in all_coin_windows if w in market_window_set)
+
+    if not overlap_windows:
+        log.warning("%s: no overlapping coin+market windows", asset)
+        return pd.DataFrame()
+
+    # PM feature lookup indexed by ts for fast join
+    pm_mkt = (
+        pm_df[["ts"] + PM_FEATURES]
+        .drop_duplicates("ts")
+        .set_index("ts")
+    )
+
+    ts_idx = close_series.index.values
+    vals   = close_series.values
+    all_frames: list[pd.DataFrame] = []
+    n_skipped = 0
+
+    for wts in overlap_windows:
+        lo = int(np.searchsorted(ts_idx, wts,               side="left"))
+        hi = int(np.searchsorted(ts_idx, wts + WINDOW_SECS, side="left"))
+        if (hi - lo) < MIN_COIN_ROWS:
+            n_skipped += 1
+            continue
+
+        window_move = float(vals[hi - 1]) - float(vals[lo])
+        label       = resolve_window(window_move)
+        if label is None:
+            n_skipped += 1
+            continue
+
+        win_sigma = ewma_sigmas.get(wts)
+        if win_sigma is None or win_sigma <= 0:
+            n_skipped += 1
+            continue
+
+        hour_utc = datetime.fromtimestamp(wts, tz=timezone.utc).hour
+        feat_df  = build_window_features(wts, close_series, volume_series, win_sigma, hour_utc)
+        if feat_df.empty:
+            n_skipped += 1
+            continue
+
+        feat_df["window_ts"]   = wts
+        feat_df["ewma_sigma"]  = win_sigma
+        feat_df["resolved_up"] = int(label)
+
+        # Join PM orderbook features by ts; unmatched seconds get NaN (imputed later)
+        feat_df = feat_df.join(pm_mkt, on="ts", how="left")
+        all_frames.append(feat_df)
+
+    if not all_frames:
+        log.warning("%s: no market features windows produced data", asset)
+        return pd.DataFrame()
+
+    combined = pd.concat(all_frames, ignore_index=True)
+
+    # Temporal 80/20 split on the overlap windows
+    sorted_wins = sorted(combined["window_ts"].unique())
+    n_train     = max(1, int(len(sorted_wins) * 0.80))
+    train_set   = set(sorted_wins[:n_train])
+
+    combined["split"] = combined["window_ts"].apply(
+        lambda w: "train" if w in train_set else "test"
+    )
+
+    log.info(
+        "%s market features: %d overlap windows → %d train / %d test, %d rows (%d skipped)",
+        asset, len(sorted_wins), n_train, len(sorted_wins) - n_train, len(combined), n_skipped,
+    )
+    return combined
 
 
 # ── Model ──────────────────────────────────────────────────────────────────────
@@ -635,11 +811,11 @@ def train_asset_logreg(asset: str, df: pd.DataFrame, features: list[str] = FEATU
         "n_windows_test":  test_df["window_ts"].nunique(),
     }
 
-# ── LightGBM primary model ────────────────────────────────────────────────────
+# ── LightGBM comparison model ────────────────────────────────────────────────
 
 def train_asset_lgb(asset: str, df: pd.DataFrame, features: list[str] = FEATURES) -> dict | None:
     """
-    LightGBM + Platt calibration — primary production model.
+    LightGBM + Platt calibration — comparison model.
     Returns the same dict shape as train_asset_logreg so all report sections work unchanged.
     """
     if not _HAS_LGB:
@@ -776,15 +952,17 @@ def section_extended_features(
     pm_lookup: dict,
     dn_lookup: dict,
     threshold: float = DEFAULT_THRESHOLD,
+    base_label: str = "Ensemble(LGB+Mkt)",
+    extended_label: str = "Extended Ensemble(LGB+Mkt)",
 ) -> str:
     """
-    Compare base LGB (FEATURES) vs extended LGB (EXTENDED_FEATURES) on AUC, Brier, and trading EV.
-    Shows whether the 10 new structural/regime features add predictive value.
+    Compare base ensemble vs extended ensemble on AUC, Brier, and trading EV.
+    Shows whether the 10 new structural/regime features add predictive value over the base model.
     """
     out = [
-        f"Base LGB uses {len(FEATURES)} features. Extended LGB adds {len(NEW_FEATURES)} structural/regime features "
-        f"({len(EXTENDED_FEATURES)} total). Both use identical train/test splits and Platt calibration. "
-        f"threshold={threshold}.\n",
+        f"**{base_label}** (LGB: {len(FEATURES)} features, Market: {len(PM_FEATURES)} PM features) vs "
+        f"**{extended_label}** (LGB: {len(EXTENDED_FEATURES)} features — adds {len(NEW_FEATURES)} structural/regime signals; Market unchanged). "
+        f"Both use the same train/test windows and Platt calibration. threshold={threshold}.\n",
         "### AUC & Calibration",
         "",
         "| asset | Base AUC | Ext AUC | ΔAUC | Base Brier | Ext Brier | ΔBrier |",
@@ -830,10 +1008,10 @@ def section_extended_features(
 
     for r in base_results:
         asset = r["asset"]
-        out.append(_ev_row("Base LGB", asset, r["test_df"]))
+        out.append(_ev_row(base_label, asset, r["test_df"]))
         ext = extended_results.get(asset)
         if ext and not ext["test_df"].empty:
-            out.append(_ev_row("Extended LGB", asset, ext["test_df"]))
+            out.append(_ev_row(extended_label, asset, ext["test_df"]))
 
     out.append("")
     return "\n".join(out)
@@ -1198,6 +1376,293 @@ def section_threshold_ev(results: list[dict], pm_lookup: dict, dn_lookup: dict) 
     return "\n".join(out)
 
 
+def section_model_comparison(
+    current_results: list[dict],
+    lgb_results: dict[str, dict],
+    pm_lookup: dict,
+    dn_lookup: dict,
+    mkt_results: list[dict] | None = None,
+    mkt_lgb_results: dict[str, dict] | None = None,
+) -> str:
+    """
+    Compare four models: LogReg+Platt, LGB+Platt, Market Features (LogReg+PM orderbook),
+    and Ensemble (0.5 × LogReg + 0.5 × Market).
+
+    All models are evaluated on the same windows: the last 20% of PM windows (the market
+    model's test set). LogReg and LGB predictions are restricted to those windows so the
+    comparison is apples-to-apples. AUC and Brier are recomputed on the restricted subset.
+    Assets without a market model fall back to their full test set (LogReg/LGB only rows).
+    """
+    THRESHOLDS = [0.20, 0.25]
+    out: list[str] = []
+
+    mkt_by_asset: dict[str, dict] = {r["asset"]: r for r in (mkt_results or [])}
+
+    def _trade_stats(result: dict, threshold: float) -> dict:
+        asset = result["asset"]
+        valid = _augment_both_sides(result["test_df"].copy(), asset, pm_lookup, dn_lookup)
+        n_win = int(valid["window_ts"].nunique()) if not valid.empty else 0
+        if valid.empty:
+            return dict(n_windows=0, n_trades=0, fill_pct="0%", win_pct="—", avg_pnl="—", total_pnl="—")
+        cands  = valid[valid["edge"] >= threshold].sort_values("elapsed_second")
+        trades = cands.groupby("window_ts").first().reset_index() if not cands.empty else pd.DataFrame()
+        if trades.empty:
+            return dict(n_windows=n_win, n_trades=0, fill_pct="0%", win_pct="—", avg_pnl="—", total_pnl="+0.0000")
+        won    = trades["effective_won"]
+        fill_p = trades["pm_fill_price"].fillna(trades["pm_price_signal"])
+        pnl    = _pnl_per_trade(fill_p, won)
+        return dict(
+            n_windows = n_win,
+            n_trades  = len(trades),
+            fill_pct  = f"{len(trades)/n_win*100:.0f}%",
+            win_pct   = f"{won.mean()*100:.1f}%",
+            avg_pnl   = f"{pnl.mean():+.4f}",
+            total_pnl = f"{pnl.sum():+.4f}",
+        )
+
+    def _restrict_to_windows(r: dict, window_set: set) -> dict:
+        """Shallow-copy result with test_df filtered to window_set; recomputes AUC/Brier."""
+        tdf = r["test_df"][r["test_df"]["window_ts"].isin(window_set)].copy()
+        auc, brier = None, None
+        if "predicted_prob" in tdf.columns and len(tdf) >= 10:
+            y = tdf["resolved_up"].values
+            p = tdf["predicted_prob"].values
+            if len(np.unique(y)) == 2:
+                try:
+                    auc   = float(roc_auc_score(y, p))
+                    brier = float(brier_score_loss(y, p))
+                except Exception:
+                    pass
+        return {**r, "test_df": tdf, "auc": auc, "brier": brier}
+
+    def _build_ensemble(r_first: dict, r_mkt: dict) -> dict | None:
+        """Blend r_first (LGB or LogReg) and market features probabilities on the market model's test windows."""
+        mkt_test   = r_mkt["test_df"]
+        first_test = r_first["test_df"]
+        if mkt_test.empty or "predicted_prob" not in mkt_test.columns:
+            return None
+        first_sub = (
+            first_test[["window_ts", "ts", "predicted_prob"]]
+            .drop_duplicates(["window_ts", "ts"])
+            .rename(columns={"predicted_prob": "p_first"})
+        )
+        merged = mkt_test.merge(first_sub, on=["window_ts", "ts"], how="left").dropna(subset=["p_first"])
+        if merged.empty:
+            return None
+        merged = merged.copy()
+        merged["predicted_prob"] = 0.5 * merged["predicted_prob"] + 0.5 * merged["p_first"]
+        y, p = merged["resolved_up"].values, merged["predicted_prob"].values
+        try:
+            auc   = float(roc_auc_score(y, p))
+            brier = float(brier_score_loss(y, p))
+        except Exception:
+            auc, brier = None, None
+        ens: dict = {
+            "asset":            r_first["asset"],
+            "test_df":          merged,
+            "auc":              auc,
+            "brier":            brier,
+            # Metadata from the market model (defines the test window set)
+            "n_windows_train":  r_mkt.get("n_windows_train", 0),
+            "n_windows_test":   r_mkt.get("n_windows_test", 0),
+            "n_train":          r_mkt.get("n_train", 0),
+            "n_test":           len(merged),
+            "baseline_wr":      r_mkt.get("baseline_wr", 0.5),
+            "features":         MARKET_FEATURES,  # reference only
+        }
+        if "feature_importances" in r_first:
+            ens["feature_importances"] = r_first["feature_importances"]
+        return ens
+
+    # ── Build per-asset model lists (one pass so ensemble is cached) ──────────
+    # Each entry in `models` is: (label, r_all, r_h1, r_h2, auc, brier)
+    # r_h1 / r_h2 are restricted to the first / second half of the market test windows.
+    HDR = "| threshold | period | model | n_windows | AUC | Brier | trades | fill% | win% | avg_pnl | total_pnl |"
+    SEP = "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+
+    mkt_lgb_by_asset: dict[str, dict] = {a: r for a, r in (mkt_lgb_results or {}).items()}
+
+    per_asset: list[tuple[dict, list[tuple]]] = []
+    for r_cur in current_results:
+        asset    = r_cur["asset"]
+        r_lgb    = lgb_results.get(asset)
+        r_mkt    = mkt_by_asset.get(asset)
+        r_mkt_lgb = mkt_lgb_by_asset.get(asset)
+
+        # Restrict all models to the market model's test windows so comparisons are fair.
+        # Falls back to the full test set when no market model exists for this asset.
+        if r_mkt:
+            sorted_mkt_wins = sorted(r_mkt["test_df"]["window_ts"].unique())
+            mid             = len(sorted_mkt_wins) // 2
+            mkt_windows     = set(sorted_mkt_wins)
+            mkt_windows_h1  = set(sorted_mkt_wins[:mid])
+            mkt_windows_h2  = set(sorted_mkt_wins[mid:])
+
+            r_cur_all = _restrict_to_windows(r_cur, mkt_windows)
+            r_cur_h1  = _restrict_to_windows(r_cur, mkt_windows_h1)
+            r_cur_h2  = _restrict_to_windows(r_cur, mkt_windows_h2)
+            if r_lgb:
+                r_lgb_all = _restrict_to_windows(r_lgb, mkt_windows)
+                r_lgb_h1  = _restrict_to_windows(r_lgb, mkt_windows_h1)
+                r_lgb_h2  = _restrict_to_windows(r_lgb, mkt_windows_h2)
+            else:
+                r_lgb_all = r_lgb_h1 = r_lgb_h2 = None
+
+            r_mkt_h1 = _restrict_to_windows(r_mkt, mkt_windows_h1)
+            r_mkt_h2 = _restrict_to_windows(r_mkt, mkt_windows_h2)
+
+            if r_mkt_lgb:
+                r_mkt_lgb_h1 = _restrict_to_windows(r_mkt_lgb, mkt_windows_h1)
+                r_mkt_lgb_h2 = _restrict_to_windows(r_mkt_lgb, mkt_windows_h2)
+            else:
+                r_mkt_lgb_h1 = r_mkt_lgb_h2 = None
+        else:
+            r_cur_all = r_cur_h1 = r_cur_h2 = r_cur
+            r_lgb_all = r_lgb_h1 = r_lgb_h2 = r_lgb
+            r_mkt_h1  = r_mkt_h2 = None
+            r_mkt_lgb_h1 = r_mkt_lgb_h2 = None
+
+        r_ens        = _build_ensemble(r_cur, r_mkt)       if r_mkt    else None
+        r_ens_h1     = _build_ensemble(r_cur, r_mkt_h1)    if r_mkt_h1 else None
+        r_ens_h2     = _build_ensemble(r_cur, r_mkt_h2)    if r_mkt_h2 else None
+        r_ens_lgb    = _build_ensemble(r_lgb, r_mkt)       if (r_lgb and r_mkt)    else None
+        r_ens_lgb_h1 = _build_ensemble(r_lgb, r_mkt_h1)   if (r_lgb and r_mkt_h1) else None
+        r_ens_lgb_h2 = _build_ensemble(r_lgb, r_mkt_h2)   if (r_lgb and r_mkt_h2) else None
+
+        # (label, r_all, r_h1, r_h2, auc_all, brier_all)
+        models: list[tuple] = [(
+            "LogReg+Platt",
+            r_cur_all, r_cur_h1, r_cur_h2,
+            r_cur_all.get("auc"), r_cur_all.get("brier"),
+        )]
+        if r_lgb_all:
+            models.append((
+                "LGB+Platt",
+                r_lgb_all, r_lgb_h1, r_lgb_h2,
+                r_lgb_all.get("auc"), r_lgb_all.get("brier"),
+            ))
+        if r_mkt:
+            models.append((
+                "Market LogReg+Platt",
+                r_mkt, r_mkt_h1, r_mkt_h2,
+                r_mkt.get("auc"), r_mkt.get("brier"),
+            ))
+        if r_mkt_lgb:
+            models.append((
+                "Market LGB+Platt",
+                r_mkt_lgb, r_mkt_lgb_h1, r_mkt_lgb_h2,
+                r_mkt_lgb.get("auc"), r_mkt_lgb.get("brier"),
+            ))
+        if r_ens:
+            models.append((
+                "Ensemble(LR+Mkt)",
+                r_ens, r_ens_h1, r_ens_h2,
+                r_ens.get("auc"), r_ens.get("brier"),
+            ))
+        if r_ens_lgb:
+            models.append((
+                "Ensemble(LGB+Mkt)",
+                r_ens_lgb, r_ens_lgb_h1, r_ens_lgb_h2,
+                r_ens_lgb.get("auc"), r_ens_lgb.get("brier"),
+            ))
+        per_asset.append((r_cur, models))
+
+    # ── Per-asset tables ──────────────────────────────────────────────────────
+    for r_cur, models in per_asset:
+        out.append(f"### {r_cur['asset']}\n")
+        out.append(HDR)
+        out.append(SEP)
+        for t in THRESHOLDS:
+            for label, r_all, r_h1, r_h2, auc, brier in models:
+                auc_str   = f"{auc:.4f}"   if auc   is not None else "—"
+                brier_str = f"{brier:.4f}" if brier is not None else "—"
+                for period, r_period in [("H1", r_h1), ("H2", r_h2), ("All", r_all)]:
+                    s = _trade_stats(r_period, t)
+                    # Only show AUC/Brier on the "All" row to avoid clutter
+                    a_s = auc_str   if period == "All" else "—"
+                    b_s = brier_str if period == "All" else "—"
+                    out.append(
+                        f"| {t:.2f} | {period} | {label} | {s['n_windows']} | {a_s} | {b_s} "
+                        f"| {s['n_trades']} | {s['fill_pct']} | {s['win_pct']} "
+                        f"| {s['avg_pnl']} | {s['total_pnl']} |"
+                    )
+        out.append("")
+
+    # ── Aggregated table ──────────────────────────────────────────────────────
+    MODEL_ORDER = ["LogReg+Platt", "LGB+Platt", "Market LogReg+Platt", "Market LGB+Platt", "Ensemble(LR+Mkt)", "Ensemble(LGB+Mkt)"]
+    # Track result lists per model per period
+    all_by_label: dict[str, dict[str, list[dict]]] = {
+        m: {"H1": [], "H2": [], "All": []} for m in MODEL_ORDER
+    }
+    for _, models in per_asset:
+        for label, r_all, r_h1, r_h2, _, _ in models:
+            if label not in all_by_label:
+                continue
+            all_by_label[label]["All"].append(r_all)
+            if r_h1 is not None:
+                all_by_label[label]["H1"].append(r_h1)
+            if r_h2 is not None:
+                all_by_label[label]["H2"].append(r_h2)
+
+    def _agg_row(result_list: list[dict], t: float, label: str, period: str) -> str | None:
+        """Aggregate trade stats across multiple result dicts; return formatted row or None."""
+        total_windows = total_trades = total_won = 0
+        total_pnl_val = auc_w = brier_w = 0.0
+        n_rows_total = 0
+        for r in result_list:
+            valid = _augment_both_sides(r["test_df"].copy(), r["asset"], pm_lookup, dn_lookup)
+            if valid.empty:
+                continue
+            total_windows += int(valid["window_ts"].nunique())
+            cands  = valid[valid["edge"] >= t].sort_values("elapsed_second")
+            trades = cands.groupby("window_ts").first().reset_index() if not cands.empty else pd.DataFrame()
+            if not trades.empty:
+                won    = trades["effective_won"]
+                fill_p = trades["pm_fill_price"].fillna(trades["pm_price_signal"])
+                pnl    = _pnl_per_trade(fill_p, won)
+                total_trades  += len(trades)
+                total_won     += int(won.sum())
+                total_pnl_val += float(pnl.sum())
+            n_r = len(r["test_df"])
+            if r.get("auc") is not None and r.get("brier") is not None:
+                auc_w        += float(r["auc"])   * n_r
+                brier_w      += float(r["brier"]) * n_r
+                n_rows_total += n_r
+        if not total_windows:
+            return None
+        auc_str   = f"{auc_w/n_rows_total:.4f}"        if (period == "All" and n_rows_total > 0) else "—"
+        brier_str = f"{brier_w/n_rows_total:.4f}"      if (period == "All" and n_rows_total > 0) else "—"
+        fill_pct  = f"{total_trades/total_windows*100:.0f}%" if total_windows > 0 else "0%"
+        win_pct   = f"{total_won/total_trades*100:.1f}%"     if total_trades  > 0 else "—"
+        avg_pnl   = f"{total_pnl_val/total_trades:+.4f}"     if total_trades  > 0 else "—"
+        return (
+            f"| {t:.2f} | {period} | {label} | {total_windows} | {auc_str} | {brier_str} "
+            f"| {total_trades} | {fill_pct} | {win_pct} | {avg_pnl} | {total_pnl_val:+.4f} |"
+        )
+
+    out.append("### All Assets (aggregated)\n")
+    out.append(HDR)
+    out.append(SEP)
+    for t in THRESHOLDS:
+        for label in MODEL_ORDER:
+            for period in ("H1", "H2", "All"):
+                row = _agg_row(all_by_label[label][period], t, label, period)
+                if row:
+                    out.append(row)
+    out.append("")
+
+    if not out:
+        return "_Model comparison unavailable._"
+
+    out.append(
+        "_All models evaluated on the same windows: the last 20% of PM windows (market model's test set), "
+        "split into H1 (first half) and H2 (second half) to check consistency over time. "
+        "AUC/Brier shown on All rows only (recomputed on the restricted subset). "
+        "fill% = trades ÷ n_windows. avg_pnl and total_pnl include the 1.5% buy fee._"
+    )
+    return "\n".join(out)
+
+
 def _multi_trade_window_both(window_df: pd.DataFrame, threshold: float, cooldown: int = 5) -> pd.DataFrame:
     """
     Greedy multi-trade picker for a single window — UP and DOWN tracked independently.
@@ -1487,23 +1952,6 @@ def section_hour_of_day(results: list[dict], pm_lookup: dict, dn_lookup: dict,
         )
 
     out.append("")
-    out.append("| hour UTC | n | win% | avg_fill | avg_pnl |")
-    out.append("|---:|---:|---:|---:|---:|")
-
-    for hour in range(24):
-        grp = agg[agg["hour_utc"] == hour]
-        if grp.empty:
-            continue
-        won    = grp["effective_won"]
-        fill_p = grp["pm_fill_price"].fillna(grp["pm_price_signal"])
-        pnl    = _pnl_per_trade(fill_p, won)
-        flag   = " ⚠" if won.mean() < 0.45 else ""
-        out.append(
-            f"| {hour:02d}:00 | {len(grp)} | {won.mean()*100:.1f}%{flag}"
-            f" | {fill_p.mean():.3f} | {pnl.mean():+.4f} |"
-        )
-
-    out.append("")
     return "\n".join(out)
 
 
@@ -1565,22 +2013,6 @@ def section_day_of_week(results: list[dict], pm_lookup: dict, dn_lookup: dict,
         out.append(
             "**Worst days:** " +
             "  ".join(f"{_DOW_NAMES[d]} ({p:+.3f})" for d, (p, _, _) in sorted_dow[-3:])
-        )
-
-    out.append("")
-    out.append("| day | n | win% | avg_fill | avg_pnl |")
-    out.append("|---:|---:|---:|---:|---:|")
-    for dow in range(7):
-        grp = agg[agg["dow"] == dow]
-        if grp.empty:
-            continue
-        won    = grp["effective_won"]
-        fill_p = grp["pm_fill_price"].fillna(grp["pm_price_signal"])
-        pnl    = _pnl_per_trade(fill_p, won)
-        flag   = " ⚠" if won.mean() < 0.45 else ""
-        out.append(
-            f"| {_DOW_NAMES[dow]} | {len(grp)} | {won.mean()*100:.1f}%{flag}"
-            f" | {fill_p.mean():.3f} | {pnl.mean():+.4f} |"
         )
 
     out.append("")
@@ -1788,14 +2220,258 @@ def _augment_both_sides(test_df: pd.DataFrame, asset: str,
     return df.dropna(subset=["up_ask"])
 
 
+# ── Orderbook imbalance section ──────────────────────────────────────────────
+
+def section_orderbook_imbalance(
+    results:       list[dict],
+    pm_lookup:     dict,
+    dn_lookup:     dict,
+    up_imb_lookup: dict,
+    dn_imb_lookup: dict,
+    threshold:     float = DEFAULT_THRESHOLD,
+) -> str:
+    """
+    Edge by orderbook imbalance at the trigger second.
+    Imbalance = bid vol / (bid + ask vol) for the side taken.
+    Tercile buckets computed from the full imbalance distribution across all trades.
+    """
+    all_trades = []
+    for r in results:
+        asset  = r["asset"]
+        valid  = _augment_both_sides(r["test_df"].copy(), asset, pm_lookup, dn_lookup)
+        cands  = valid[valid["edge"] >= threshold].sort_values("elapsed_second")
+        trades = cands.groupby("window_ts").first().reset_index()
+        if trades.empty:
+            continue
+        trades["asset"] = asset
+        # Look up imbalance at trigger second for the side taken
+        def _imb(row, _asset=asset):
+            ts = int(row["ts"])
+            if row["side_taken"] == "up":
+                return up_imb_lookup.get((_asset, ts))
+            else:
+                return dn_imb_lookup.get((_asset, ts))
+        trades["imbalance"] = trades.apply(_imb, axis=1)
+        all_trades.append(trades)
+
+    if not all_trades:
+        return "_No trades available for imbalance analysis._"
+
+    agg = pd.concat(all_trades, ignore_index=True)
+    valid_imb = agg["imbalance"].dropna()
+    if valid_imb.empty:
+        return "_No imbalance data available (column missing from PM data)._"
+
+    q33 = float(valid_imb.quantile(0.333))
+    q67 = float(valid_imb.quantile(0.667))
+
+    buckets = [
+        ("bid-heavy", f"> {q67:.2f}",               lambda r, q=q67: r > q),
+        ("balanced",  f"{q33:.2f} – {q67:.2f}",     lambda r, lo=q33, hi=q67: (r >= lo) & (r <= hi)),
+        ("ask-heavy", f"< {q33:.2f}",               lambda r, q=q33: r < q),
+    ]
+
+    out = [
+        f"_Tercile buckets computed from the full imbalance distribution: "
+        f"ask-heavy < {q33:.2f} (bottom third), balanced {q33:.2f}–{q67:.2f} (middle third), "
+        f"bid-heavy > {q67:.2f} (top third). Each bucket contains ~equal sample counts._",
+        "",
+        "### All Assets (aggregate)",
+        "",
+        "**avg_pnl by imbalance regime** — each █ ≈ 1% avg_pnl:\n",
+        "```",
+    ]
+
+    bucket_stats: list[tuple[str, str, float, float, int]] = []
+    for label, range_str, mask_fn in buckets:
+        grp = agg[mask_fn(agg["imbalance"].fillna(-1))]
+        if grp.empty:
+            continue
+        won    = grp["effective_won"]
+        fill_p = grp["pm_fill_price"].fillna(grp["pm_price_signal"])
+        pnl    = _pnl_per_trade(fill_p, won)
+        bucket_stats.append((label, range_str, float(pnl.mean()), float(won.mean()), len(grp)))
+
+    for label, range_str, avg_pnl, wr, n in bucket_stats:
+        bar_len = max(0, int(abs(avg_pnl) * 100))
+        bar     = ("█" * bar_len) if avg_pnl >= 0 else ("░" * bar_len)
+        sign    = "+" if avg_pnl >= 0 else "-"
+        out.append(f"  {label:<10}  ({range_str:<14})  {sign}{abs(avg_pnl):.3f}  {bar}  (n={n})")
+    out.append("```")
+    out.append("")
+
+    return "\n".join(out)
+
+
+# ── Market features section ───────────────────────────────────────────────────
+
+def section_market_features_model(
+    mkt_results: list[dict],
+    pm_lookup:   dict,
+    dn_lookup:   dict,
+) -> str:
+    """
+    Report section for the market features model experiment.
+
+    Trained on the intersection of coin-price and PM orderbook windows using an
+    80/20 temporal split.  Features: base coin features + up_imbalance, up_spread,
+    dn_imbalance, dn_spread.  Model is not saved — experiment only.
+    """
+    THRESHOLDS = [0.15, 0.20, 0.25]
+    dn = dn_lookup or {}
+    out: list[str] = []
+
+    # ── Dataset summary ───────────────────────────────────────────────────────
+    out += [
+        "### Dataset",
+        "",
+        f"Only windows where coin price (≥{MIN_COIN_ROWS} rows) and PM orderbook data both exist. "
+        f"Temporal 80/20 split — first 80% of overlap windows = train, last 20% = test. "
+        f"Base coin features ({len(FEATURES)}) + `{'`, `'.join(PM_FEATURES)}`.",
+        "",
+        "| asset | overlap windows | train | test | train rows | test rows |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for r in mkt_results:
+        n_overlap = r["n_windows_train"] + r["n_windows_test"]
+        out.append(
+            f"| {r['asset']} | {n_overlap} | {r['n_windows_train']} | {r['n_windows_test']} "
+            f"| {r['n_train']} | {r['n_test']} |"
+        )
+    out.append("")
+
+    # ── AUC / Brier ───────────────────────────────────────────────────────────
+    out += [
+        "### AUC & Calibration",
+        "",
+        "| asset | AUC | Brier | baseline_win% |",
+        "|---|---:|---:|---:|",
+    ]
+    for r in mkt_results:
+        if r["auc"] is None:
+            continue
+        out.append(
+            f"| {r['asset']} | {r['auc']:.4f} | {r['brier']:.4f} | {r['baseline_wr']*100:.1f}% |"
+        )
+    out.append("")
+
+    # ── PM feature coefficients ───────────────────────────────────────────────
+    out += [
+        "### PM Feature Coefficients",
+        "",
+        "_Logistic regression coefficients for the 4 orderbook features. "
+        "Positive = raises P(UP); negative = lowers P(UP). "
+        "Large |coef| = feature carries weight in the model._",
+        "",
+        "| asset | up_imbalance | up_spread | dn_imbalance | dn_spread |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for r in mkt_results:
+        if r.get("coefs") is None:
+            continue
+        feat_coef = dict(zip(r["features"], r["coefs"]))
+        cols = "".join(f"| {feat_coef.get(f, float('nan')):+.4f} " for f in PM_FEATURES)
+        out.append(f"| {r['asset']} {cols}|")
+    out.append("")
+
+    # ── EV sweep ──────────────────────────────────────────────────────────────
+    out += [
+        "### EV Sweep",
+        "",
+        "| asset | threshold | n_trades | fill% | win% | avg_pnl | total_pnl |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for r in mkt_results:
+        asset = r["asset"]
+        valid = _augment_both_sides(r["test_df"].copy(), asset, pm_lookup, dn)
+        if valid.empty:
+            continue
+        n_windows = valid["window_ts"].nunique()
+        for t in THRESHOLDS:
+            cands  = valid[valid["edge"] >= t].sort_values("elapsed_second")
+            trades = cands.groupby("window_ts").first().reset_index()
+            if trades.empty:
+                out.append(f"| {asset} | {t:.2f} | 0 | 0% | — | — | — |")
+                continue
+            fill_rate = len(trades) / n_windows * 100
+            won       = trades["effective_won"]
+            fill_p    = trades["pm_fill_price"].fillna(trades["pm_price_signal"])
+            pnl       = _pnl_per_trade(fill_p, won)
+            out.append(
+                f"| {asset} | {t:.2f} | {len(trades)} | {fill_rate:.0f}% "
+                f"| {won.mean()*100:.1f}% | {pnl.mean():+.4f} | {pnl.sum():+.4f} |"
+            )
+    out.append("")
+    out.append(
+        "_Test set = last 20% of overlap windows (temporal split). "
+        "avg_pnl includes 1.5% buy fee. Model not saved._"
+    )
+    return "\n".join(out)
+
+
+# ── Ensemble builder (standalone, used by main() and section_model_comparison) ──
+
+def _build_ensemble_standalone(r_first: dict, r_mkt: dict) -> "dict | None":
+    """
+    Blend r_first (LGB or LogReg) and market-features model probabilities.
+    Returns a result dict compatible with all report sections.
+    Used by main() to build the primary ensemble model results.
+    """
+    mkt_test   = r_mkt["test_df"]
+    first_test = r_first["test_df"]
+    if mkt_test.empty or "predicted_prob" not in mkt_test.columns:
+        return None
+    if first_test.empty or "predicted_prob" not in first_test.columns:
+        return None
+    first_sub = (
+        first_test[["window_ts", "ts", "predicted_prob"]]
+        .drop_duplicates(["window_ts", "ts"])
+        .rename(columns={"predicted_prob": "p_first"})
+    )
+    merged = mkt_test.merge(first_sub, on=["window_ts", "ts"], how="left").dropna(subset=["p_first"])
+    if merged.empty:
+        return None
+    merged = merged.copy()
+    merged["predicted_prob"] = 0.5 * merged["predicted_prob"] + 0.5 * merged["p_first"]
+    y, p = merged["resolved_up"].values, merged["predicted_prob"].values
+    try:
+        auc   = float(roc_auc_score(y, p))
+        brier = float(brier_score_loss(y, p))
+    except Exception:
+        auc, brier = None, None
+    result: dict = {
+        "asset":           r_first["asset"],
+        "test_df":         merged,
+        "auc":             auc,
+        "brier":           brier,
+        "n_windows_train": r_mkt.get("n_windows_train", 0),
+        "n_windows_test":  r_mkt.get("n_windows_test", 0),
+        "n_train":         r_mkt.get("n_train", 0),
+        "n_test":          len(merged),
+        "baseline_wr":     r_mkt.get("baseline_wr", 0.5),
+        "features":        MARKET_FEATURES,
+    }
+    # Carry through LGB gain importances so section_feature_importance has data to show
+    if "feature_importances" in r_first:
+        result["feature_importances"] = r_first["feature_importances"]
+    return result
+
+
 # ── Report builder ─────────────────────────────────────────────────────────────
 
 def build_report(results: list[dict], pm_lookup: dict, generated_at: str,
                  dn_lookup: "dict | None" = None,
                  ensemble_results: "dict | None" = None,
-                 extended_lgb_results: "dict | None" = None,
+                 extended_logreg_results: "dict | None" = None,
+                 lgb_results: "dict[str, dict] | None" = None,
                  include_extended_features: bool = False,
-                 ablation_sections: "dict[str, str] | None" = None) -> str:
+                 ablation_sections: "dict[str, str] | None" = None,
+                 mkt_results: "list[dict] | None" = None,
+                 up_imb_lookup: "dict | None" = None,
+                 dn_imb_lookup: "dict | None" = None,
+                 compare: bool = False,
+                 logreg_results: "list[dict] | None" = None,
+                 mkt_lgb_results: "dict[str, dict] | None" = None) -> str:
     dn = dn_lookup or {}
     # top-line summary per asset for the overview
     summary_lines = []
@@ -1895,7 +2571,7 @@ def build_report(results: list[dict], pm_lookup: dict, generated_at: str,
         "",
         "## 6. What Drives the Edge? — Feature Importance",
         "",
-        "_LightGBM gain-based importance — how much each feature reduces loss across all trees. Higher = more predictive._",
+        "_Feature importance is model-specific: LightGBM uses gain; LogReg uses signed coefficients._",
         "",
         section_feature_importance(results),
         "",
@@ -1909,6 +2585,20 @@ def build_report(results: list[dict], pm_lookup: dict, generated_at: str,
         section_metrics(results),
         "",
         "---",
+        "",
+        *([] if not compare else [
+            "## 7b. Model Comparison — LogReg · LGB · Market LogReg · Market LGB · Ensemble",
+            "",
+            "Per-asset sweep at thresholds 0.20 and 0.25 across all models. "
+            "All evaluated on the last 20% of PM windows (market model's test set), "
+            "split into H1 (first half) and H2 (second half) plus an All total. "
+            "Market LogReg vs Market LGB directly compares classifiers on the same PM-window features.",
+            "",
+            section_model_comparison(logreg_results or [], lgb_results or {}, pm_lookup, dn,
+                                     mkt_results=mkt_results, mkt_lgb_results=mkt_lgb_results),
+            "",
+            "---",
+        ]),
         "",
         "## 8. Edge by Model Confidence Decile",
         "",
@@ -1945,6 +2635,17 @@ def build_report(results: list[dict], pm_lookup: dict, generated_at: str,
         "",
         "---",
         "",
+        "## 11. Edge by Orderbook Imbalance — Does Market Structure Matter?",
+        "",
+        "Does performance vary with the orderbook imbalance (bid vs ask volume)? "
+        "High imbalance = bid-heavy (more demand). Low imbalance = ask-heavy (more supply). "
+        f"Trades: first qualifying second per window at threshold={DEFAULT_THRESHOLD}, "
+        "imbalance sampled at the trigger second for the side taken.",
+        "",
+        section_orderbook_imbalance(results, pm_lookup, dn, up_imb_lookup or {}, dn_imb_lookup or {}),
+        "",
+        "---",
+        "",
     ]
 
     if include_extended_features:
@@ -1952,11 +2653,14 @@ def build_report(results: list[dict], pm_lookup: dict, generated_at: str,
             "",
             "## 13. Extended Features — Do 10 New Signals Help?",
             "",
-            f"Trains a second LightGBM on {len(EXTENDED_FEATURES)} features (base {len(FEATURES)} + {len(NEW_FEATURES)} new structural/regime features). "
-            "Same split and Platt calibration as the primary model. "
-            "ΔAUC > 0 or ΔBrier < 0 means the extended feature set adds value.",
+            f"Replaces the LGB half of the ensemble with an extended LGB trained on {len(EXTENDED_FEATURES)} features "
+            f"(base {len(FEATURES)} + {len(NEW_FEATURES)} new structural/regime signals). "
+            "The market model is unchanged. Compared against the primary ensemble on the same test windows. "
+            "ΔAUC > 0 or ΔBrier < 0 means the extra LGB signals add value.",
             "",
-            section_extended_features(results, extended_lgb_results or {}, pm_lookup, dn),
+            section_extended_features(results, extended_logreg_results or {}, pm_lookup, dn,
+                                      base_label="Ensemble(LGB+Mkt)",
+                                      extended_label="Extended Ensemble(LGB+Mkt)"),
             "",
             "---",
         ]
@@ -1977,6 +2681,8 @@ def build_report(results: list[dict], pm_lookup: dict, generated_at: str,
                 "---",
             ]
 
+    # Section 15 removed — market features model results now appear in section 7b comparison.
+
     lines += [
         "",
         "## Methodology",
@@ -1992,22 +2698,24 @@ def build_report(results: list[dict], pm_lookup: dict, generated_at: str,
         "| `elapsed_second` | `t − window_start` (0–299) | how far into the window we are; late moves have less time to reverse |",
         "| `hour_sin` | `sin(hour_utc × 2π / 24)` | time-of-day encoded cyclically so midnight wraps correctly |",
         "| `hour_cos` | `cos(hour_utc × 2π / 24)` | paired with `hour_sin` to fully represent hour as a point on the unit circle |",
-        "| `vel_2s` | `(price[t] − price[t−2]) / σ` | very short-term momentum; captures tick-level acceleration |",
         "| `vel_5s` | `(price[t] − price[t−5]) / σ` | short-term momentum over a 5-second lookback |",
-        "| `vel_10s` | `(price[t] − price[t−10]) / σ` | medium short-term momentum; smoother than vel_2s |",
-        "| `acc_4s` | `(price[t] − 2·price[t−2] + price[t−4]) / σ` | second derivative over 4s; positive = accelerating up, negative = decelerating |",
-        "| `acc_10s` | `(price[t] − 2·price[t−5] + price[t−10]) / σ` | second derivative over 10s; slower-frequency curvature |",
-        "| `vel_ratio` | `|vel_2s| / |vel_10s|` | recent speed vs recent trend speed; > 1 = burst, < 1 = fading |",
-        "| `vel_decay` | `|vel_10s| − |vel_2s|` | positive = move is slowing (mean-reversion signal), negative = accelerating |",
-        f"| `vol_10s_log` | `log1p(Σ volume[t−{VOL_LOOKBACK}…t))` | log of coin volume in the last {VOL_LOOKBACK}s; high volume = more conviction |",
+        "| `dist_low_30` | `(price[t] − min(price[t−30:t])) / σ` | near 0 = breakdown zone; very positive = overextended upward |",
+        "| `dist_high_30` | `(price[t] − max(price[t−30:t])) / σ` | near 0 = breakout zone; very negative = far below recent highs (exhaustion) |",
         "| `move_x_elapsed` | `move_sigmas × elapsed_second` | interaction: a large move late in the window is more likely to hold |",
         "| `move_x_vol` | `move_sigmas × vol_10s_log` | interaction: a large move on high volume is more reliable than a thin-book move |",
+        "| `acc_4s` | `(price[t] − 2·price[t−2] + price[t−4]) / σ` | second derivative over 4s; positive = accelerating up, negative = decelerating |",
+        "| `move_x_elapsed_x_vel10s` | `move_sigmas × elapsed_second × vel_10s` | three-way interaction: sustained directional move + late timing + recent momentum |",
+        "| `move_x_acc10s` | `move_sigmas × acc_10s` | interaction: large move with accelerating curvature reinforces conviction |",
         "",
-        "**Extended features** (tested in section 13, not used by primary model unless promoted):\n",
+        f"**Extended features** (tested in section 13 via `--test-extended-features`; added to both LGB and market model components; {len(NEW_FEATURES)} signals on top of the base {len(FEATURES)}):\n",
         "| feature | formula | what it captures |",
         "|---|---|---|",
-        "| `dist_high_30` | `(price[t] − max(price[t−30:t])) / σ` | near 0 = breakout zone; very negative = far below recent highs (exhaustion) |",
-        "| `dist_low_30` | `(price[t] − min(price[t−30:t])) / σ` | near 0 = breakdown zone; very positive = overextended upward |",
+        "| `vel_2s` | `(price[t] − price[t−2]) / σ` | very short-term momentum; captures tick-level acceleration |",
+        "| `vel_10s` | `(price[t] − price[t−10]) / σ` | medium short-term momentum; smoother than vel_2s |",
+        "| `acc_10s` | `(price[t] − 2·price[t−5] + price[t−10]) / σ` | second derivative over 10s; slower-frequency curvature |",
+        "| `vel_ratio` | `vel_2s / vel_10s` | recent speed vs recent trend speed; > 1 = burst, < 1 = fading |",
+        "| `vel_decay` | `vel_10s − vel_2s` | positive = move is slowing (mean-reversion signal), negative = accelerating |",
+        f"| `vol_10s_log` | `log1p(Σ volume[t−{VOL_LOOKBACK}…t))` | log of coin volume in the last {VOL_LOOKBACK}s; high volume = more conviction |",
         "| `zscore_20` | `(price[t] − mean(price[t−20:t])) / std(price[t−20:t])` | local mean-reversion pressure; large values indicate stretch |",
         "| `vol_z_30` | `(vol[t] − mean(vol[t−30:t])) / std(vol[t−30:t])` | abnormal participation; high z = unusual conviction |",
         "| `signed_vol_imb` | `Σ vol[i]·sign(Δprice[i]) / Σ vol[i]` over 10s | net buy vs sell pressure weighted by volume (range ≈ [−1, 1]) |",
@@ -2019,7 +2727,7 @@ def build_report(results: list[dict], pm_lookup: dict, generated_at: str,
         "",
         "### Model & training",
         "",
-        "- **Primary model**: LightGBM (300 trees, max_depth=4, lr=0.05, subsample=0.8) + Platt calibration",
+        "- **Primary model**: Ensemble(LGB + Market Features) — 0.5 × LightGBM(coin features) + 0.5 × LogReg(coin + PM orderbook) — both Platt-calibrated",
         "- **Calibration split**: last 20% of train windows (time-ordered) held out for Platt scaling",
         "- **Train/test split**: test = windows with market (PM) data; train = earlier coin-only windows — window-level, no row leakage",
         "- **EWMA sigma**: walk-forward, λ=0.95, first 20 windows excluded (warmup). Matches live executor.",
@@ -2057,7 +2765,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ablation-assets", nargs="+", default=None, metavar="ASSET",
                    help="Run feature ablation (single, LOO, forward greedy) for these assets (slow)")
     p.add_argument("--test-extended-features", action="store_true",
-                   help="Train/report extended-feature LightGBM comparison (off by default)")
+                   help="Train/report extended-feature LogReg comparison (off by default)")
+    p.add_argument("--compare", action="store_true",
+                   help="Include section 7b model comparison table (LogReg · LGB · Market · Ensemble) in the report")
+    p.add_argument("--ewma-lambda", type=float, default=EWMA_LAMBDA,
+                   help=f"EWMA decay factor λ for volatility estimation (default: {EWMA_LAMBDA})")
+    p.add_argument("--no-save", action="store_true",
+                   help="Skip saving model files to disk (useful for experiments)")
     return p.parse_args()
 
 
@@ -2110,33 +2824,78 @@ def main() -> None:
 
     if args.production:
         # Train on ALL data — no split, no report, no CSV
+        # Primary: Ensemble(LGB + Market). Falls back to LGB, then LogReg if data is unavailable.
         for asset in assets:
-            log.info("=== %s ===", asset)
+            log.info("=== %s (production) ===", asset)
             loaded = _load_asset(args, asset)
             if loaded is None:
                 continue
             pm_df, close_series, volume_series, sigma = loaded
-            df = build_asset_dataset(asset, pm_df, close_series, volume_series, sigma)
+
+            # Full coin dataset — all rows as train for LGB
+            df = build_asset_dataset(asset, pm_df, close_series, volume_series, sigma, ewma_lambda=args.ewma_lambda)
             if df.empty:
                 continue
-            # Fit on everything (override split — mark all rows as train)
             df = df.copy()
             df["split"] = "train"
-            result = train_asset_lgb(asset, df)
-            if result is not None:
-                model_path = os.path.join(args.out_models, f"{asset.lower()}.joblib")
-                joblib.dump({"pipe": result["pipe"], "features": FEATURES, "sigma": sigma}, model_path)
-                log.info("Model → %s  (n=%d)", model_path, result["n_train"])
+
+            lgb_result = train_asset_lgb(asset, df) if _HAS_LGB else None
+
+            # Market features dataset — all rows as train
+            mkt_result = None
+            if not pm_df.empty:
+                mkt_df = build_market_features_dataset(asset, pm_df, close_series, volume_series, sigma, ewma_lambda=args.ewma_lambda)
+                if not mkt_df.empty:
+                    mkt_df = mkt_df.copy()
+                    mkt_df["split"] = "train"
+                    mkt_result = train_asset_logreg(asset, mkt_df, features=MARKET_FEATURES)
+
+            model_path = os.path.join(args.out_models, f"{asset.lower()}.joblib")
+            if lgb_result and mkt_result:
+                model_dict = {
+                    "type":          "ensemble_lgb_mkt",
+                    "lgb_pipe":      lgb_result["pipe"],
+                    "lgb_features":  FEATURES,
+                    "mkt_pipe":      mkt_result["pipe"],
+                    "mkt_features":  MARKET_FEATURES,
+                }
+                if not args.no_save:
+                    joblib.dump(model_dict, model_path)
+                log.info("Ensemble model%s  (LGB n=%d, mkt n=%d)",
+                         f" → {model_path}" if not args.no_save else " [not saved]",
+                         lgb_result["n_train"], mkt_result["n_train"])
+            elif lgb_result:
+                log.warning("%s: no market model — LGB-only model", asset)
+                if not args.no_save:
+                    joblib.dump({"pipe": lgb_result["pipe"], "features": FEATURES, "sigma": sigma}, model_path)
+                log.info("LGB model%s  (n=%d)",
+                         f" → {model_path}" if not args.no_save else " [not saved]",
+                         lgb_result["n_train"])
+            else:
+                # Last resort: plain LogReg
+                logreg_result = train_asset_logreg(asset, df)
+                if logreg_result:
+                    if not args.no_save:
+                        joblib.dump({"pipe": logreg_result["pipe"], "features": FEATURES, "sigma": sigma}, model_path)
+                    log.info("LogReg fallback model%s  (n=%d)",
+                             f" → {model_path}" if not args.no_save else " [not saved]",
+                             logreg_result["n_train"])
         return
 
     # Report mode — train/test split, generate report and predictions CSV
     os.makedirs(os.path.dirname(args.out_report), exist_ok=True)
 
-    results:              list[dict]                   = []
-    pm_lookup:            dict[tuple[str, int], float] = {}
-    dn_lookup:            dict[tuple[str, int], float] = {}
-    extended_lgb_results: dict[str, dict]              = {}
-    ablation_sections:    dict[str, str]               = {}
+    results:                 list[dict]                   = []   # primary: ensemble (or LGB/LogReg fallback)
+    logreg_results:          list[dict]                   = []   # LogReg only — for section 7b comparison
+    lgb_results:             dict[str, dict]              = {}
+    mkt_results:             list[dict]                   = []
+    mkt_lgb_results:         dict[str, dict]              = {}
+    pm_lookup:               dict[tuple[str, int], float] = {}
+    dn_lookup:               dict[tuple[str, int], float] = {}
+    up_imb_lookup:           dict[tuple[str, int], float] = {}
+    dn_imb_lookup:           dict[tuple[str, int], float] = {}
+    extended_logreg_results: dict[str, dict]              = {}
+    ablation_sections:       dict[str, str]               = {}
     ablation_assets = {a.upper() for a in args.ablation_assets} if args.ablation_assets else set()
 
     for asset in assets:
@@ -2150,32 +2909,129 @@ def main() -> None:
         pm_lookup.update({(asset, int(ts)): float(ask) for ts, ask in zip(up_rows["ts"], up_rows["up_ask"])})
         dn_rows = pm_df[pm_df["dn_ask"].notna()]
         dn_lookup.update({(asset, int(ts)): float(ask) for ts, ask in zip(dn_rows["ts"], dn_rows["dn_ask"])})
+        if "up_imbalance" in pm_df.columns:
+            imb_rows = pm_df[pm_df["up_imbalance"].notna()]
+            up_imb_lookup.update({(asset, int(ts)): float(v) for ts, v in zip(imb_rows["ts"], imb_rows["up_imbalance"])})
+        if "dn_imbalance" in pm_df.columns:
+            imb_rows = pm_df[pm_df["dn_imbalance"].notna()]
+            dn_imb_lookup.update({(asset, int(ts)): float(v) for ts, v in zip(imb_rows["ts"], imb_rows["dn_imbalance"])})
 
-        df = build_asset_dataset(asset, pm_df, close_series, volume_series, sigma)
+        df = build_asset_dataset(asset, pm_df, close_series, volume_series, sigma, ewma_lambda=args.ewma_lambda)
         if df.empty:
+            del pm_df, close_series, volume_series
+            gc.collect()
             continue
 
-        # Primary model: LightGBM + Platt calibration (base features)
-        result = train_asset_lgb(asset, df)
-        if result is not None:
-            result["close_series"] = close_series
-            result["sigma"]        = sigma
-            results.append(result)
-            model_path = os.path.join(args.out_models, f"{asset.lower()}.joblib")
-            joblib.dump({"pipe": result["pipe"], "features": FEATURES, "sigma": sigma}, model_path)
-            log.info("Model → %s", model_path)
+        # LogReg (base features) — only needed for --compare section 7b
+        logreg_result = None
+        if args.compare:
+            logreg_result = train_asset_logreg(asset, df)
+            if logreg_result is not None:
+                logreg_result.pop("train_df", None)
+                logreg_result["sigma"] = sigma
+                logreg_results.append(logreg_result)
 
-        # Comparison: LightGBM with extended feature set (report only, not saved)
-        if args.test_extended_features:
-            log.info("=== %s Extended LGB comparison ===", asset)
-            ext_result = train_asset_lgb(asset, df, features=EXTENDED_FEATURES)
-            if ext_result is not None:
-                extended_lgb_results[asset] = ext_result
+        # Market features model (coin + PM orderbook) — other half of the ensemble.
+        # Built first so we can extract its test windows to remap the LGB split.
+        log.info("=== %s Market Features model ===", asset)
+        mkt_df = build_market_features_dataset(asset, pm_df, close_series, volume_series, sigma, ewma_lambda=args.ewma_lambda)
+        mkt_result = None
+        if not mkt_df.empty:
+            mkt_result = train_asset_logreg(asset, mkt_df, features=MARKET_FEATURES)
+            if mkt_result is not None:
+                mkt_result.pop("train_df", None)
+                if args.compare:
+                    mkt_results.append(mkt_result)  # kept for section 7b comparison only
+                log.info("%s: market features model ready", asset)
+            # Market LGB — same windows/features as market LogReg, for section 7b comparison
+            if args.compare and _HAS_LGB:
+                mkt_lgb_result = train_asset_lgb(asset, mkt_df, features=MARKET_FEATURES)
+                if mkt_lgb_result is not None:
+                    mkt_lgb_result.pop("train_df", None)
+                    mkt_lgb_results[asset] = mkt_lgb_result
+                    log.info("%s: market LGB+Platt ready  AUC=%.4f", asset, mkt_lgb_result.get("auc") or 0.0)
+
+        # LightGBM + Platt — one half of the ensemble.
+        # Trains on ALL coin data: pre-PM windows + first 80% of PM windows (coin features only).
+        # Test split = last 20% of PM (market) windows, matching the market model's test split.
+        lgb_df = df.copy()
+        if not mkt_df.empty:
+            mkt_test_wins = set(mkt_df[mkt_df["split"] == "test"]["window_ts"].unique())
+            lgb_df["split"] = lgb_df["window_ts"].apply(
+                lambda w: "test" if w in mkt_test_wins else "train"
+            )
+            log.info(
+                "%s: LGB split — train=%d windows (all coin), test=%d windows (market test set)",
+                asset,
+                lgb_df[lgb_df["split"] == "train"]["window_ts"].nunique(),
+                lgb_df[lgb_df["split"] == "test"]["window_ts"].nunique(),
+            )
+        lgb_result = train_asset_lgb(asset, lgb_df) if _HAS_LGB else None
+        if lgb_result is not None:
+            lgb_result.pop("train_df", None)
+            lgb_result["sigma"] = sigma
+            if args.compare:
+                lgb_results[asset] = lgb_result  # kept for section 7b comparison only
+            log.info("%s: LGB+Platt ready", asset)
+
+        # Extended ensemble comparison (--test-extended-features only, report only, not saved)
+        # Only the LGB gets extended features — market model is unchanged (reuse mkt_result).
+        # This isolates the effect of the extra coin signals on the LGB half of the ensemble.
+        if args.test_extended_features and mkt_result is not None:
+            log.info("=== %s Extended Ensemble comparison ===", asset)
+            ext_lgb = train_asset_lgb(asset, lgb_df, features=EXTENDED_FEATURES) if _HAS_LGB else None
+            if ext_lgb is not None:
+                ext_lgb.pop("train_df", None)
+            if ext_lgb:
+                ext_ens = _build_ensemble_standalone(ext_lgb, mkt_result)
+                if ext_ens is not None:
+                    extended_logreg_results[asset] = ext_ens
+                    log.info("%s: extended ensemble ready  AUC=%.4f", asset, ext_ens.get("auc") or 0.0)
+
+        del mkt_df, lgb_df
+
+        # Build ensemble (LGB + Market) — primary model
+        ens_result = None
+        if lgb_result and mkt_result:
+            ens_result = _build_ensemble_standalone(lgb_result, mkt_result)
+            if ens_result is not None:
+                ens_result["sigma"] = sigma
+                log.info("%s: Ensemble(LGB+Mkt) ready  AUC=%.4f", asset, ens_result.get("auc") or 0.0)
+
+        # Primary result: ensemble > LGB > LogReg
+        primary_result = ens_result or lgb_result or logreg_result
+        if primary_result is not None:
+            results.append(primary_result)
+
+        # Save model to disk
+        model_path = os.path.join(args.out_models, f"{asset.lower()}.joblib")
+        if not args.no_save:
+            if lgb_result and mkt_result:
+                joblib.dump({
+                    "type":         "ensemble_lgb_mkt",
+                    "lgb_pipe":     lgb_result["pipe"],
+                    "lgb_features": FEATURES,
+                    "mkt_pipe":     mkt_result["pipe"],
+                    "mkt_features": MARKET_FEATURES,
+                }, model_path)
+                log.info("Ensemble model → %s", model_path)
+            elif lgb_result:
+                joblib.dump({"pipe": lgb_result["pipe"], "features": FEATURES, "sigma": sigma}, model_path)
+                log.info("LGB model (no market data) → %s", model_path)
+            elif logreg_result:
+                joblib.dump({"pipe": logreg_result["pipe"], "features": FEATURES, "sigma": sigma}, model_path)
+                log.info("LogReg fallback model → %s", model_path)
+        else:
+            log.info("%s: model training complete [not saved — --no-save]", asset)
 
         # Feature ablation (optional — only when --ablation-assets includes this asset)
         if asset in ablation_assets:
             log.info("=== %s feature ablation ===", asset)
             ablation_sections[asset] = section_feature_ablation(asset, df)
+
+        # Release per-asset raw data — result dicts only keep slim test_df + scalars
+        del pm_df, close_series, volume_series, df
+        gc.collect()
 
     if not results:
         log.error("No results produced.")
@@ -2187,9 +3043,16 @@ def main() -> None:
         pm_lookup,
         generated_at,
         dn_lookup=dn_lookup,
-        extended_lgb_results=extended_lgb_results,
+        extended_logreg_results=extended_logreg_results,
+        lgb_results=lgb_results,
         include_extended_features=args.test_extended_features,
         ablation_sections=ablation_sections or None,
+        mkt_results=mkt_results or None,
+        up_imb_lookup=up_imb_lookup,
+        dn_imb_lookup=dn_imb_lookup,
+        compare=args.compare,
+        logreg_results=logreg_results or None,
+        mkt_lgb_results=mkt_lgb_results or None,
     )
 
     with open(args.out_report, "w") as f:
