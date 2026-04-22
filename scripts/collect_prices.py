@@ -38,7 +38,7 @@ from skeptic.utils.time import (
 )
 
 console = Console()
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s", datefmt="%M:%S")
 
 PRICES_DIR = Path("data/prices")
 

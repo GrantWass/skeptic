@@ -27,7 +27,7 @@ import httpx
 
 from skeptic import config
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%M:%S")
 log = logging.getLogger(__name__)
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
@@ -279,8 +279,8 @@ def parse_args() -> argparse.Namespace:
                    help="Output directory for coin price CSVs")
     p.add_argument("--rate-limit-delay", type=float, default=RATE_LIMIT_DELAY,
                    help="Seconds to sleep between requests (default: %(default)s)")
-    p.add_argument("--start-february", action="store_true",
-                   help="Set start timestamp to Feb 1 of the current year (UTC), overrides --start if given.")
+    p.add_argument("--start-january", action="store_true",
+                   help="Set start timestamp to Jan 1 and end to Feb 1 of the current year (UTC), fetches January only.")
     return p.parse_args()
 
 
@@ -289,18 +289,16 @@ def main() -> None:
 
 
     # Determine start and end timestamps
-    if args.start_february:
-        # Set start_ts to Feb 1 of the current year, 00:00:00 UTC
+    if args.start_january:
+        # Jan 1 00:00:00 UTC → Feb 1 00:00:00 UTC (January only)
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
-        start_ts = int(datetime(now.year, 2, 1, tzinfo=timezone.utc).timestamp())
-        log.info("--start-february: Forcing start timestamp to %d (Feb 1, %d UTC)", start_ts, now.year)
-        # End time logic
-        if args.end:
-            end_ts = args.end
-        else:
-            log.info("Scanning %s for end time…", args.prices_dir)
-            _, end_ts = _get_price_time_range(args.prices_dir)
+        start_ts = int(datetime(now.year, 1, 1, tzinfo=timezone.utc).timestamp())
+        end_ts   = int(datetime(now.year, 2, 1, tzinfo=timezone.utc).timestamp())
+        log.info(
+            "--start-january: fetching Jan 1 → Feb 1, %d UTC (%d → %d)",
+            now.year, start_ts, end_ts,
+        )
     elif args.start and args.end:
         start_ts, end_ts = args.start, args.end
     else:

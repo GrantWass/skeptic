@@ -30,7 +30,7 @@ from py_clob_client.utilities import order_to_json
 from skeptic import config
 from skeptic.models.order import Order
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("clob")
 
 
 # ── Dedicated signing executor ────────────────────────────────────────────────
@@ -152,7 +152,9 @@ def presign_market_order(
     Call this at window start (once per token) so the hot path only needs to
     compute HMAC headers and POST.
 
-    Returns (signed_order, serialized_body_bytes, body_dict, usdc_amount).
+    Returns (signed_order, serialized_body_bytes, serialized_body_str, body_dict, usdc_amount).
+    Stores both bytes (for POST content=) and str (for HMAC construction) to avoid
+    a decode() call in the hot path.
     price_cap: max price willing to pay — set high to guarantee fill; actual fill
                is determined by the order book at POST time, not this cap.
     """
@@ -165,8 +167,9 @@ def presign_market_order(
     )
     signed = client.create_market_order(args)
     body = order_to_json(signed, client.creds.api_key, OrderType.FOK)
-    serialized = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
-    return signed, serialized, body, usdc_amount
+    serialized_str   = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+    serialized_bytes = serialized_str.encode()
+    return signed, serialized_bytes, serialized_str, body, usdc_amount
 
 
 def _parse_fill(resp: dict, usdc_amount: float) -> tuple[float, float]:
@@ -207,7 +210,7 @@ def post_presigned_order(
     if not order_id:
         raise RuntimeError(f"Market order failed: {resp}")
     fill_price, fill_size = _parse_fill(resp, usdc_amount)
-    logger.info("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f",
+    logger.debug("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f",
                 order_id, outcome, usdc_amount, fill_price, fill_size)
     return Order(
         order_id=order_id,
@@ -257,18 +260,19 @@ async def sign_and_post_async(
             body=body,
             serialized_body=serialized,
         )
+        assert client.signer is not None, "ClobClient signer not initialised"
         headers = create_level_2_headers(client.signer, client.creds, request_args)
-        return serialized, headers
+        return serialized.encode(), headers  # encode once here, not in the hot path
 
-    serialized, headers = await asyncio.get_event_loop().run_in_executor(_signing_executor, _sign)
+    serialized_bytes, headers = await asyncio.get_running_loop().run_in_executor(_signing_executor, _sign)
     _t_signed = time.perf_counter()
     sign_ms = round((_t_signed - _t0) * 1000, 1)
-    logger.info("ORDER TIMING  sign+headers=%.0fms", sign_ms)
-    url = f"{client.host}{POST_ORDER}"
-    resp = await http.post(url, content=serialized.encode(), headers=headers)
+    global _POST_ORDER_URL
+    if not _POST_ORDER_URL:
+        _POST_ORDER_URL = f"{client.host}{POST_ORDER}"
+    resp = await http.post(_POST_ORDER_URL, content=serialized_bytes, headers=headers)
     _t_resp = time.perf_counter()
     post_ms = round((_t_resp - _t_signed) * 1000, 1)
-    logger.info("ORDER TIMING  http_post=%.0fms  status=%d", post_ms, resp.status_code)
     if resp.status_code != 200:
         raise RuntimeError(f"Order POST {resp.status_code}: {resp.text}")
     data = resp.json()
@@ -276,7 +280,7 @@ async def sign_and_post_async(
     if not order_id:
         raise RuntimeError(f"Market order failed: {data}")
     fill_price, fill_size = _parse_fill(data, usdc_amount)
-    logger.info("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f  total=%.0fms",
+    logger.debug("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f  total=%.0fms",
                 order_id, outcome, usdc_amount, fill_price, fill_size,
                 (time.perf_counter() - _t0) * 1000)
     return Order(
@@ -321,7 +325,7 @@ async def post_presigned_order_async(
     if not order_id:
         raise RuntimeError(f"Market order failed: {data}")
     fill_price, fill_size = _parse_fill(data, usdc_amount)
-    logger.info("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f",
+    logger.debug("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f",
                 order_id, outcome, usdc_amount, fill_price, fill_size)
     return Order(
         order_id=order_id,
@@ -336,10 +340,14 @@ async def post_presigned_order_async(
     )
 
 
+_POST_ORDER_URL: str = ""  # cached at first use
+
+
 async def post_preserialized_order_async(
     http: httpx.AsyncClient,
     client: ClobClient,
     serialized_body: bytes,
+    serialized_body_str: str,
     body_dict: dict,
     token_id: str,
     outcome: str,
@@ -349,24 +357,30 @@ async def post_preserialized_order_async(
     Fastest possible order submission: body is already signed and serialized at
     window start. Hot path only computes HMAC headers (~0.3ms) and POSTs.
 
-    Use with presign_market_order() which returns (signed, serialized_body, body_dict, amount).
+    Use with presign_market_order() which now returns
+    (signed, serialized_bytes, serialized_str, body_dict, amount).
+    serialized_body_str avoids a .decode() call in the hot path.
     """
+    global _POST_ORDER_URL
+    if not _POST_ORDER_URL:
+        _POST_ORDER_URL = f"{client.host}{POST_ORDER}"
     request_args = RequestArgs(
         method="POST",
         request_path=POST_ORDER,
         body=body_dict,
-        serialized_body=serialized_body.decode(),
+        serialized_body=serialized_body_str,
     )
+    assert client.signer is not None, "ClobClient signer not initialised"
     headers = create_level_2_headers(client.signer, client.creds, request_args)
-    url = f"{client.host}{POST_ORDER}"
-    resp = await http.post(url, content=serialized_body, headers=headers)
-    resp.raise_for_status()
+    resp = await http.post(_POST_ORDER_URL, content=serialized_body, headers=headers)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Order POST {resp.status_code}: {resp.text}")
     data = resp.json()
     order_id = data.get("orderID") or data.get("order_id", "")
     if not order_id:
         raise RuntimeError(f"Market order failed: {data}")
     fill_price, fill_size = _parse_fill(data, usdc_amount)
-    logger.info("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f",
+    logger.debug("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f",
                 order_id, outcome, usdc_amount, fill_price, fill_size)
     return Order(
         order_id=order_id,
@@ -405,7 +419,7 @@ def place_market_order(
     if not order_id:
         raise RuntimeError(f"Market order failed: {resp}")
     fill_price, fill_size = _parse_fill(resp, usdc_amount)
-    logger.info("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f",
+    logger.debug("Market order %s  %s  $%.2f USDC  fill_price=%.4f  size=%.4f",
                 order_id, outcome, usdc_amount, fill_price, fill_size)
     return Order(
         order_id=order_id,

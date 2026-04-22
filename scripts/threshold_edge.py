@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%M:%S")
 log = logging.getLogger(__name__)
 
 WINDOW_SECS = 300
@@ -160,14 +160,18 @@ def analyze_asset(
     asset_pm = pm_df[pm_df["asset"] == asset].copy()
     windows = sorted(asset_pm["window_ts"].unique())
 
+    # Extract numpy arrays once — avoids O(N) boolean mask per window
+    ts_idx = coin_series.index.values
+    vals   = coin_series.values
+
     # sigma = std dev of window close-minus-open moves
     window_moves = []
     for wts in windows:
-        mask = (coin_series.index >= wts) & (coin_series.index < wts + WINDOW_SECS)
-        prices = coin_series[mask]
-        if len(prices) < 280:
+        lo = int(np.searchsorted(ts_idx, wts,               side="left"))
+        hi = int(np.searchsorted(ts_idx, wts + WINDOW_SECS, side="left"))
+        if (hi - lo) < 280:
             continue
-        window_moves.append(float(prices.iloc[-1]) - float(prices.iloc[0]))
+        window_moves.append(float(vals[hi - 1]) - float(vals[lo]))
 
     if len(window_moves) < 10:
         log.warning("%s: only %d windows — skipping", asset, len(window_moves))
@@ -180,23 +184,32 @@ def analyze_asset(
     vol_ratios_3h = compute_rolling_vol_ratios(windows, coin_series, sigma, lookback_secs=3 * 3600)
     vol_ratios_1h  = compute_rolling_vol_ratios(windows, coin_series, sigma, lookback_secs=1 * 3600)
 
+    # Pre-group PM data by window and sort index once — avoids O(N_pm) scan + re-sort per window
+    pm_by_window: dict[int, pd.DataFrame] = {
+        int(wts): grp.set_index("ts").sort_index()
+        for wts, grp in asset_pm.groupby("window_ts")
+    }
+
     records = []
     n_unresolved = 0
 
     for wts in windows:
-        mask = (coin_series.index >= wts) & (coin_series.index < wts + WINDOW_SECS)
-        prices = coin_series[mask]
-        if len(prices) < 280:
+        lo = int(np.searchsorted(ts_idx, wts,               side="left"))
+        hi = int(np.searchsorted(ts_idx, wts + WINDOW_SECS, side="left"))
+        if (hi - lo) < 280:
             continue
 
-        open_price   = float(prices.iloc[0])
-        window_move  = float(prices.iloc[-1]) - open_price
+        win_ts_arr = ts_idx[lo:hi]
+        win_pr_arr = vals[lo:hi]
+
+        open_price   = float(win_pr_arr[0])
+        window_move  = float(win_pr_arr[-1]) - open_price
         hour_utc = datetime.fromtimestamp(wts, tz=timezone.utc).hour
 
-        pm_window_df = asset_pm[asset_pm["window_ts"] == wts]
-        if len(pm_window_df) < 280:
+        pm_window_idx = pm_by_window.get(wts)
+        if pm_window_idx is None or len(pm_window_idx) < 280:
             continue
-        resolved_up = _resolve_window(pm_window_df)
+        resolved_up = _resolve_window(pm_window_idx.reset_index())
         if resolved_up is None:
             # PM price didn't reach 0.95/0.05 — fall back to coin price direction
             if window_move > 0:
@@ -207,33 +220,35 @@ def analyze_asset(
                 n_unresolved += 1
                 continue  # truly flat window, skip
 
-        pm_window_idx = pm_window_df.set_index("ts").sort_index()
+        pm_ts_arr = pm_window_idx.index.values  # sorted int64 timestamps
 
         for sig in sigma_multiples:
             up_thresh   = open_price + sig * sigma
             down_thresh = open_price - sig * sigma
 
-            up_trig = down_trig = None
-            for ts, price in prices.items():
-                if ts - wts < min_elapsed_secs:
-                    continue
-                if up_trig is None and price >= up_thresh:
-                    up_trig = int(ts)
-                if down_trig is None and price <= down_thresh:
-                    down_trig = int(ts)
-                if up_trig and down_trig:
-                    break
+            # Numpy threshold detection — avoids Python loop over ~300 seconds
+            if min_elapsed_secs > 0:
+                start_pos = int(np.searchsorted(win_ts_arr, wts + min_elapsed_secs, side="left"))
+                search_pr = win_pr_arr[start_pos:]
+                search_ts = win_ts_arr[start_pos:]
+            else:
+                search_pr = win_pr_arr
+                search_ts = win_ts_arr
 
-            # pick whichever crossed first
-            if up_trig is None and down_trig is None:
+            up_hits = np.where(search_pr >= up_thresh)[0]
+            dn_hits = np.where(search_pr <= down_thresh)[0]
+            up_trig = int(search_ts[up_hits[0]]) if len(up_hits) else None
+            dn_trig = int(search_ts[dn_hits[0]]) if len(dn_hits) else None
+
+            if up_trig is None and dn_trig is None:
                 continue
-            if up_trig is not None and (down_trig is None or up_trig <= down_trig):
+            if up_trig is not None and (dn_trig is None or up_trig <= dn_trig):
                 trigger_ts  = up_trig
                 trigger_dir = "up"
                 price_col   = "up_ask"
                 won         = bool(resolved_up)
             else:
-                trigger_ts  = down_trig
+                trigger_ts  = dn_trig
                 trigger_dir = "down"
                 price_col   = "dn_ask"
                 won         = not bool(resolved_up)
@@ -241,87 +256,77 @@ def analyze_asset(
             if trigger_ts is None:
                 continue
 
-            # ask price at the trigger second (before 1-second fill delay)
-            pm_at_trig = pm_window_idx[pm_window_idx.index >= trigger_ts]
+            # PM lookups: use sorted index + searchsorted instead of boolean masks
+            trig_pos = int(np.searchsorted(pm_ts_arr, trigger_ts, side="left"))
             pm_price_at_trigger: float | None = None
-            if not pm_at_trig.empty and price_col in pm_at_trig.columns:
-                v = pm_at_trig.iloc[0].get(price_col)
+            if trig_pos < len(pm_ts_arr) and price_col in pm_window_idx.columns:
+                v = pm_window_idx.iloc[trig_pos].get(price_col)
                 if not pd.isna(v):
                     pm_price_at_trigger = float(v)
 
-            fill_ts = int(trigger_ts) + 1
-            pm_after = pm_window_idx[pm_window_idx.index >= fill_ts]
-            if pm_after.empty:
-                pm_after = pm_window_idx
-            if pm_after.empty or price_col not in pm_after.columns:
+            fill_pos = int(np.searchsorted(pm_ts_arr, trigger_ts + 1, side="left"))
+            if fill_pos >= len(pm_ts_arr):
+                fill_pos = 0
+            if price_col not in pm_window_idx.columns:
                 continue
-
-            pm_row = pm_after.iloc[0]
+            pm_row = pm_window_idx.iloc[fill_pos]
             if pd.isna(pm_row.get(price_col)):
                 continue
             pm_price = float(pm_row[price_col])
 
-            # ask price at t+2 for aggregate 1s vs 2s slippage comparison
-            fill2_ts = int(trigger_ts) + 2
-            pm_after2 = pm_window_idx[pm_window_idx.index >= fill2_ts]
-            if pm_after2.empty:
-                pm_after2 = pm_window_idx
+            fill2_pos = int(np.searchsorted(pm_ts_arr, trigger_ts + 2, side="left"))
+            if fill2_pos >= len(pm_ts_arr):
+                fill2_pos = 0
             pm_price_2s: float | None = None
-            if not pm_after2.empty and price_col in pm_after2.columns:
-                v2 = pm_after2.iloc[0].get(price_col)
+            if price_col in pm_window_idx.columns:
+                v2 = pm_window_idx.iloc[fill2_pos].get(price_col)
                 if not pd.isna(v2):
                     pm_price_2s = float(v2)
 
-            # Orderbook imbalance at trigger and fill
+            # Orderbook imbalance
             imbalance_col = "up_imbalance" if trigger_dir == "up" else "dn_imbalance"
             imbalance_at_trigger: float | None = None
             imbalance_at_fill: float | None = None
-            if not pm_at_trig.empty and imbalance_col in pm_at_trig.columns:
-                v = pm_at_trig.iloc[0].get(imbalance_col)
+            if trig_pos < len(pm_ts_arr) and imbalance_col in pm_window_idx.columns:
+                v = pm_window_idx.iloc[trig_pos].get(imbalance_col)
                 if not pd.isna(v):
                     imbalance_at_trigger = float(v)
             if imbalance_col in pm_row.index and not pd.isna(pm_row.get(imbalance_col)):
                 imbalance_at_fill = float(pm_row[imbalance_col])
 
-            # velocity & acceleration (sigma units)
-            assert trigger_ts is not None
-            # fetch prices at t, t-2, t-4, t-5, t-10
+            # Velocity lookups: searchsorted on global ts_idx instead of O(N) boolean scan
             _px: dict[int, float | None] = {}
             for offset in (0, 2, 4, 5, 10):
-                ts_lookup = trigger_ts - offset
-                candidates = coin_series.index[coin_series.index <= ts_lookup]
-                _px[offset] = float(coin_series[candidates[-1]]) if len(candidates) > 0 else None
+                idx = int(np.searchsorted(ts_idx, trigger_ts - offset, side="right")) - 1
+                _px[offset] = float(vals[idx]) if idx >= 0 else None
 
             def _diff(a: int, b: int) -> float | None:
                 pa, pb = _px[a], _px[b]
                 return (pa - pb) / sigma if pa is not None and pb is not None else None
 
-            # velocity: price change from t-N to t, in sigma units
-            # acceleration: change in velocity over equal halves (positive = speeding up in trigger dir)
             p0, p2, p4, p5, p10 = _px[0], _px[2], _px[4], _px[5], _px[10]
             v2  = _diff(0, 2)
             v10 = _diff(0, 10)
 
-            # velocity_ratio: abs(v2s) / abs(v10s) — >1 means speeding up into trigger
             vel_ratio: float | None = None
             if v2 is not None and v10 is not None and v10 != 0.0:
                 vel_ratio = abs(v2) / abs(v10)
 
-            # vel_decay: abs(v10s) - abs(v2s) — positive means decelerating into trigger
             vel_decay: float | None = None
             if v2 is not None and v10 is not None:
                 vel_decay = abs(v10) - abs(v2)
 
-            # acc_positive: % of per-second accelerations in trigger direction over last 10s
+            # acc_positive: use window numpy array with searchsorted — no boolean mask
             acc_positive: float | None = None
             sign = 1.0 if trigger_dir == "up" else -1.0
-            trig_slice = prices[
-                (prices.index >= trigger_ts - 10) & (prices.index <= trigger_ts)
-            ].sort_index()
-            if len(trig_slice) >= 3:
-                per_sec_vel = trig_slice.diff().dropna() * sign   # positive = moving in trigger dir
-                per_sec_acc = per_sec_vel.diff().dropna()         # positive = speeding up
-                acc_positive = float((per_sec_acc > 0).mean())
+            lo10 = int(np.searchsorted(win_ts_arr, trigger_ts - 10, side="left"))
+            hi10 = int(np.searchsorted(win_ts_arr, trigger_ts + 1,  side="left"))
+            trig_slice_pr = win_pr_arr[lo10:hi10]
+            if len(trig_slice_pr) >= 3:
+                per_sec_vel = np.diff(trig_slice_pr) * sign
+                per_sec_acc = np.diff(per_sec_vel)
+                if len(per_sec_acc) > 0:
+                    acc_positive = float((per_sec_acc > 0).mean())
 
             vels: dict[str, float | None] = {
                 "vel_2s":      v2,
@@ -383,7 +388,6 @@ def compute_rolling_vol_ratios(
     vals   = coin_series.values
 
     # Pre-compute moves for every valid coin window across the full coin history
-    window_move_map: dict[int, float] = {}
     if len(ts_idx) == 0:
         return {}
     first_ts = int(ts_idx[0])
@@ -392,23 +396,32 @@ def compute_rolling_vol_ratios(
     if first_ts % WINDOW_SECS != 0:
         wstart += WINDOW_SECS
     wend = (last_ts // WINDOW_SECS) * WINDOW_SECS
+
+    map_keys_list: list[int] = []
+    map_vals_list: list[float] = []
     for wts in range(wstart, wend + 1, WINDOW_SECS):
         lo = int(np.searchsorted(ts_idx, wts,               side="left"))
         hi = int(np.searchsorted(ts_idx, wts + WINDOW_SECS, side="left"))
         if (hi - lo) < 280:
             continue
-        window_move_map[wts] = float(vals[hi - 1]) - float(vals[lo])
+        map_keys_list.append(wts)
+        map_vals_list.append(float(vals[hi - 1]) - float(vals[lo]))
+
+    if not map_keys_list:
+        return {wts: None for wts in windows}
+
+    # Sorted arrays allow O(log W) lookup per window instead of O(W) dict scan
+    map_keys_arr = np.array(map_keys_list)
+    map_vals_arr = np.array(map_vals_list)
 
     result: dict[int, float | None] = {}
     for wts in windows:
-        prior_moves = [
-            v for k, v in window_move_map.items()
-            if wts - lookback_secs <= k < wts
-        ]
-        if len(prior_moves) < min_windows:
+        lo = int(np.searchsorted(map_keys_arr, wts - lookback_secs, side="left"))
+        hi = int(np.searchsorted(map_keys_arr, wts,                 side="left"))
+        if (hi - lo) < min_windows:
             result[wts] = None
         else:
-            rolling_sigma = float(np.std(prior_moves))
+            rolling_sigma = float(np.std(map_vals_arr[lo:hi]))
             result[wts] = rolling_sigma / sigma if sigma > 0 else None
 
     return result
@@ -442,16 +455,19 @@ def compute_ewma_sigmas(
     is excluded from the returned map (no prior estimate available).
     """
     cadence_windows = max(1, int(refresh_secs // WINDOW_SECS))
+    # Extract numpy arrays once — avoids O(N) boolean mask per window
+    ts_idx = coin_series.index.values
+    vals   = coin_series.values
     ewma_var: float | None = None
     result: dict[int, float] = {}
     eligible_idx = 0
 
     for wts in windows_sorted:
-        mask = (coin_series.index >= wts) & (coin_series.index < wts + WINDOW_SECS)
-        prices = coin_series[mask]
-        if len(prices) < 280:
+        lo = int(np.searchsorted(ts_idx, wts,               side="left"))
+        hi = int(np.searchsorted(ts_idx, wts + WINDOW_SECS, side="left"))
+        if (hi - lo) < 280:
             continue
-        move = float(prices.iloc[-1]) - float(prices.iloc[0])
+        move = float(vals[hi - 1]) - float(vals[lo])
 
         # Sigma available to TRADE this window = what was known before it started
         if ewma_var is not None:
@@ -500,6 +516,16 @@ def analyze_asset_ewma(
     vol_ratios_3h = compute_rolling_vol_ratios(windows, coin_series, baseline_sigma, lookback_secs=3 * 3600)
     vol_ratios_1h  = compute_rolling_vol_ratios(windows, coin_series, baseline_sigma, lookback_secs=1 * 3600)
 
+    # Extract numpy arrays once — avoids repeated O(N) boolean masks
+    ts_idx = coin_series.index.values
+    vals   = coin_series.values
+
+    # Pre-group PM data by window and sort index once — avoids O(N_pm) scan + re-sort per window
+    pm_by_window: dict[int, pd.DataFrame] = {
+        int(wts): grp.set_index("ts").sort_index()
+        for wts, grp in asset_pm.groupby("window_ts")
+    }
+
     records = []
     n_unresolved = 0
 
@@ -510,19 +536,22 @@ def analyze_asset_ewma(
         if i < EWMA_WARMUP:
             continue
 
-        mask = (coin_series.index >= wts) & (coin_series.index < wts + WINDOW_SECS)
-        prices = coin_series[mask]
-        if len(prices) < 280:
+        lo = int(np.searchsorted(ts_idx, wts,               side="left"))
+        hi = int(np.searchsorted(ts_idx, wts + WINDOW_SECS, side="left"))
+        if (hi - lo) < 280:
             continue
 
-        open_price  = float(prices.iloc[0])
-        window_move = float(prices.iloc[-1]) - open_price
+        win_ts_arr = ts_idx[lo:hi]
+        win_pr_arr = vals[lo:hi]
+
+        open_price  = float(win_pr_arr[0])
+        window_move = float(win_pr_arr[-1]) - open_price
         hour_utc = datetime.fromtimestamp(wts, tz=timezone.utc).hour
 
-        pm_window_df = asset_pm[asset_pm["window_ts"] == wts]
-        if len(pm_window_df) < 280:
+        pm_window_idx = pm_by_window.get(wts)
+        if pm_window_idx is None or len(pm_window_idx) < 280:
             continue
-        resolved_up = _resolve_window(pm_window_df)
+        resolved_up = _resolve_window(pm_window_idx.reset_index())
         if resolved_up is None:
             # PM price didn't reach 0.95/0.05 — fall back to coin price direction
             if window_move > 0:
@@ -533,30 +562,27 @@ def analyze_asset_ewma(
                 n_unresolved += 1
                 continue  # truly flat window, skip
 
-        pm_window_idx = pm_window_df.set_index("ts").sort_index()
+        pm_ts_arr = pm_window_idx.index.values  # sorted int64 timestamps
 
         for sig in sigma_multiples:
             up_thresh   = open_price + sig * ewma_sigma
             down_thresh = open_price - sig * ewma_sigma
 
-            up_trig = down_trig = None
-            for ts, price in prices.items():
-                if up_trig is None and price >= up_thresh:
-                    up_trig = int(ts)
-                if down_trig is None and price <= down_thresh:
-                    down_trig = int(ts)
-                if up_trig and down_trig:
-                    break
+            # Numpy threshold detection — avoids Python loop over ~300 seconds
+            up_hits = np.where(win_pr_arr >= up_thresh)[0]
+            dn_hits = np.where(win_pr_arr <= down_thresh)[0]
+            up_trig = int(win_ts_arr[up_hits[0]]) if len(up_hits) else None
+            dn_trig = int(win_ts_arr[dn_hits[0]]) if len(dn_hits) else None
 
-            if up_trig is None and down_trig is None:
+            if up_trig is None and dn_trig is None:
                 continue
-            if up_trig is not None and (down_trig is None or up_trig <= down_trig):
+            if up_trig is not None and (dn_trig is None or up_trig <= dn_trig):
                 trigger_ts  = up_trig
                 trigger_dir = "up"
                 price_col   = "up_ask"
                 won         = bool(resolved_up)
             else:
-                trigger_ts  = down_trig
+                trigger_ts  = dn_trig
                 trigger_dir = "down"
                 price_col   = "dn_ask"
                 won         = not bool(resolved_up)
@@ -564,47 +590,90 @@ def analyze_asset_ewma(
             if trigger_ts is None:
                 continue
 
-            # ask price at the trigger second (before 1-second fill delay)
-            pm_at_trig = pm_window_idx[pm_window_idx.index >= trigger_ts]
+            # PM lookups: use sorted index + searchsorted instead of boolean masks
+            trig_pos = int(np.searchsorted(pm_ts_arr, trigger_ts, side="left"))
             pm_price_at_trigger: float | None = None
-            if not pm_at_trig.empty and price_col in pm_at_trig.columns:
-                v = pm_at_trig.iloc[0].get(price_col)
+            if trig_pos < len(pm_ts_arr) and price_col in pm_window_idx.columns:
+                v = pm_window_idx.iloc[trig_pos].get(price_col)
                 if not pd.isna(v):
                     pm_price_at_trigger = float(v)
 
-            fill_ts = int(trigger_ts) + 1
-            pm_after = pm_window_idx[pm_window_idx.index >= fill_ts]
-            if pm_after.empty:
-                pm_after = pm_window_idx
-            if pm_after.empty or price_col not in pm_after.columns:
+            fill_pos = int(np.searchsorted(pm_ts_arr, trigger_ts + 1, side="left"))
+            if fill_pos >= len(pm_ts_arr):
+                fill_pos = 0
+            if price_col not in pm_window_idx.columns:
                 continue
-
-            pm_row = pm_after.iloc[0]
+            pm_row = pm_window_idx.iloc[fill_pos]
             if pd.isna(pm_row.get(price_col)):
                 continue
             pm_price = float(pm_row[price_col])
 
-            # ask price at t+2 for aggregate 1s vs 2s slippage comparison
-            fill2_ts = int(trigger_ts) + 2
-            pm_after2 = pm_window_idx[pm_window_idx.index >= fill2_ts]
-            if pm_after2.empty:
-                pm_after2 = pm_window_idx
+            fill2_pos = int(np.searchsorted(pm_ts_arr, trigger_ts + 2, side="left"))
+            if fill2_pos >= len(pm_ts_arr):
+                fill2_pos = 0
             pm_price_2s: float | None = None
-            if not pm_after2.empty and price_col in pm_after2.columns:
-                v2 = pm_after2.iloc[0].get(price_col)
+            if price_col in pm_window_idx.columns:
+                v2 = pm_window_idx.iloc[fill2_pos].get(price_col)
                 if not pd.isna(v2):
                     pm_price_2s = float(v2)
 
-            # Orderbook imbalance at trigger and fill
+            # Orderbook imbalance
             imbalance_col = "up_imbalance" if trigger_dir == "up" else "dn_imbalance"
             imbalance_at_trigger: float | None = None
             imbalance_at_fill: float | None = None
-            if not pm_at_trig.empty and imbalance_col in pm_at_trig.columns:
-                v = pm_at_trig.iloc[0].get(imbalance_col)
+            if trig_pos < len(pm_ts_arr) and imbalance_col in pm_window_idx.columns:
+                v = pm_window_idx.iloc[trig_pos].get(imbalance_col)
                 if not pd.isna(v):
                     imbalance_at_trigger = float(v)
             if imbalance_col in pm_row.index and not pd.isna(pm_row.get(imbalance_col)):
                 imbalance_at_fill = float(pm_row[imbalance_col])
+
+            # Velocity lookups: searchsorted on global ts_idx instead of O(N) boolean scan
+            _px: dict[int, float | None] = {}
+            for offset in (0, 2, 4, 5, 10):
+                idx = int(np.searchsorted(ts_idx, trigger_ts - offset, side="right")) - 1
+                _px[offset] = float(vals[idx]) if idx >= 0 else None
+
+            def _diff(a: int, b: int) -> float | None:
+                pa, pb = _px[a], _px[b]
+                return (pa - pb) / ewma_sigma if pa is not None and pb is not None else None
+
+            p0, p2, p4, p5, p10 = _px[0], _px[2], _px[4], _px[5], _px[10]
+            v2  = _diff(0, 2)
+            v10 = _diff(0, 10)
+
+            vel_ratio: float | None = None
+            if v2 is not None and v10 is not None and v10 != 0.0:
+                vel_ratio = abs(v2) / abs(v10)
+
+            vel_decay: float | None = None
+            if v2 is not None and v10 is not None:
+                vel_decay = abs(v10) - abs(v2)
+
+            # acc_positive: use window numpy array with searchsorted — no boolean mask
+            acc_positive: float | None = None
+            sign = 1.0 if trigger_dir == "up" else -1.0
+            lo10 = int(np.searchsorted(win_ts_arr, trigger_ts - 10, side="left"))
+            hi10 = int(np.searchsorted(win_ts_arr, trigger_ts + 1,  side="left"))
+            trig_slice_pr = win_pr_arr[lo10:hi10]
+            if len(trig_slice_pr) >= 3:
+                per_sec_vel = np.diff(trig_slice_pr) * sign
+                per_sec_acc = np.diff(per_sec_vel)
+                if len(per_sec_acc) > 0:
+                    acc_positive = float((per_sec_acc > 0).mean())
+
+            vels: dict[str, float | None] = {
+                "vel_2s":      v2,
+                "vel_5s":      _diff(0, 5),
+                "vel_10s":     v10,
+                "acc_4s":      (p0 - 2*p2 + p4) / ewma_sigma  # type: ignore[operator]
+                               if p0 is not None and p2 is not None and p4 is not None else None,
+                "acc_10s":     (p0 - 2*p5 + p10) / ewma_sigma  # type: ignore[operator]
+                               if p0 is not None and p5 is not None and p10 is not None else None,
+                "vel_ratio":   vel_ratio,
+                "vel_decay":   vel_decay,
+                "acc_positive": acc_positive,
+            }
 
             records.append({
                 "asset":          asset,
@@ -629,6 +698,7 @@ def analyze_asset_ewma(
                 "imbalance_at_fill":    imbalance_at_fill,
                 "resolved_up":         resolved_up,
                 "won":                 won,
+                **vels,
             })
 
     return pd.DataFrame(records), n_unresolved
@@ -942,15 +1012,6 @@ def section_half_day(df: pd.DataFrame) -> str:
         out.append(f"  {date} {half}  {sign}{abs(edge):.3f}  {bar}{flag}")
     out.append("```\n")
 
-    # Table
-    out.append("| date | half | n_windows | win% | avg_pm | edge |")
-    out.append("|---|---|---:|---:|---:|---:|")
-    for date, half, n, win, pm, edge in half_day_stats:
-        flag = " ⚠" if edge < 0 else ""
-        out.append(
-            f"| {date} | {half} | {n} | {win*100:.0f}% | {pm:.3f} | {edge:+.3f}{flag} |"
-        )
-
     return "\n".join(out)
 
 
@@ -1111,63 +1172,6 @@ def section_edge_by_imbalance(df: pd.DataFrame) -> str:
         "Only includes price-filtered trades (pm_price × 1.015 < win_rate)._"
     )
     return "\n".join(out)
-
-
-def section_imbalance_filter(df: pd.DataFrame) -> str:
-    """
-    Entry filtering strategies based on orderbook imbalance at trigger time.
-
-    Tests whether filtering by imbalance regime improves entry quality:
-    1. **No filter** — baseline (all trades that pass price filter)
-    2. **Bid-heavy only** — only enter when imbalance > 0.60 (demand-heavy)
-    3. **Ask-heavy only** — only enter when imbalance < 0.50 (supply-heavy)
-    """
-    df = _price_filter(df)
-    if df.empty:
-        return "_No trades pass the price filter._"
-    valid = df[df["imbalance_at_trigger"].notna()].copy()
-    if valid.empty:
-        return "_No imbalance data available._"
-
-    q33, q67, _ = _quantile_imbalance_buckets(valid["imbalance_at_trigger"])
-    filters = [
-        ("no_filter", "All", lambda d: d),
-        ("bid_heavy", f"Bid-heavy only (>{q67:.2f})", lambda d, q=q67: d[d["imbalance_at_trigger"] > q]),
-        ("ask_heavy", f"Ask-heavy only (<{q33:.2f})", lambda d, q=q33: d[d["imbalance_at_trigger"] < q]),
-    ]
-
-    out = []
-    out.append(
-        f"_Tercile breakpoints from full distribution: q33={q33:.2f}, q67={q67:.2f}. "
-        f"Bid-heavy = top third (>{q67:.2f}), ask-heavy = bottom third (<{q33:.2f}). "
-        "Each filter covers ~1/3 of baseline trades._\n"
-    )
-
-    # Aggregate metrics
-    out.append("### All Assets (aggregate)\n")
-    out.append("| filter | n_trades | win% | avg_pm | edge | coverage% |")
-    out.append("|---|---:|---:|---:|---:|---:|")
-
-    for _, flabel, ffunc in filters:
-        filtered = ffunc(valid)
-        if filtered.empty:
-            out.append(f"| {flabel} | 0 | — | — | — | 0% |")
-            continue
-        win = filtered["won"].mean()
-        avg_pm = filtered["pm_price"].mean()
-        edge = _edge_from_win_and_pm(win, avg_pm)
-        coverage = len(filtered) / len(valid) * 100
-        out.append(
-            f"| {flabel} | {len(filtered)} | {win*100:.1f}% | {avg_pm:.4f} | {edge:+.4f} | {coverage:.0f}% |"
-        )
-
-    out.append(
-        f"\n_Filters use tercile cutpoints (q33={q33:.2f}, q67={q67:.2f}) so each filter covers ~1/3 of trades. "
-        "coverage% = % of baseline trades that pass that filter. "
-        "Only includes price-filtered trades (pm_price × 1.015 < win_rate)._"
-    )
-    return "\n".join(out)
-
 
 # ── execution slippage ───────────────────────────────────────────────────────
 
@@ -1358,15 +1362,6 @@ def build_report(
         "",
         "---",
         "",
-        "## Imbalance as Entry Filter — Can It Improve Entry Quality?",
-        "",
-        "Tests whether filtering entry by orderbook imbalance at trigger time improves edge.",
-        "Shows win%, edge, and % of baseline trades for each filter.",
-        "",
-        section_imbalance_filter(df),
-        "",
-        "---",
-        "",
         "## 1-Second Execution Slippage — Cost of Fill Delay",
         "",
         "How much does the Polymarket ask price move in the 1 second between signal and fill?",
@@ -1472,6 +1467,269 @@ def section_recent_backtest(df: pd.DataFrame) -> str:
     return "\n".join(out)
 
 
+def analyze_asset_multi_entry_ewma(
+    asset: str,
+    pm_df: pd.DataFrame,
+    coin_series: pd.Series,
+    sigma_multiples: list[float],
+    lambda_: float,
+    win_rates_by_key: dict,  # (asset, sigma, direction) → float
+) -> pd.DataFrame:
+    """
+    Find ALL threshold crossings per window per sigma (both directions).
+    A crossing is detected each time the coin price *transitions* from one side
+    of the threshold to the other (up: below → at/above; down: above → at/below).
+    Multiple entries per window are allowed, including opposing-direction entries.
+
+    For each crossing the price filter is applied:
+        entry if pm_price × 1.015 < win_rate[asset, sigma, direction]
+
+    Returns a flat DataFrame with one row per crossing (all crossings, not just
+    price-filtered ones — use the `entry_taken` column to filter).
+
+    Columns:
+        asset, window_ts, sigma, trigger_dir, trigger_ts, trigger_second,
+        pm_price, won, entry_taken, pnl
+    """
+    asset_pm = pm_df[pm_df["asset"] == asset].copy()
+    windows = sorted(asset_pm["window_ts"].unique())
+
+    ewma_sigmas = compute_ewma_sigmas(windows, coin_series, lambda_)
+
+    ts_idx = coin_series.index.values
+    vals   = coin_series.values
+
+    pm_by_window: dict[int, pd.DataFrame] = {
+        int(wts): grp.set_index("ts").sort_index()
+        for wts, grp in asset_pm.groupby("window_ts")
+    }
+
+    records = []
+
+    for i, wts in enumerate(windows):
+        ewma_sigma = ewma_sigmas.get(wts)
+        if ewma_sigma is None or ewma_sigma <= 0:
+            continue
+        if i < EWMA_WARMUP:
+            continue
+
+        lo = int(np.searchsorted(ts_idx, wts,               side="left"))
+        hi = int(np.searchsorted(ts_idx, wts + WINDOW_SECS, side="left"))
+        if (hi - lo) < 280:
+            continue
+
+        win_ts_arr = ts_idx[lo:hi]
+        win_pr_arr = vals[lo:hi]
+
+        open_price  = float(win_pr_arr[0])
+        window_move = float(win_pr_arr[-1]) - open_price
+
+        pm_window_idx = pm_by_window.get(wts)
+        if pm_window_idx is None or len(pm_window_idx) < 280:
+            continue
+        resolved_up = _resolve_window(pm_window_idx.reset_index())
+        if resolved_up is None:
+            if window_move > 0:
+                resolved_up = True
+            elif window_move < 0:
+                resolved_up = False
+            else:
+                continue  # truly flat, skip
+
+        pm_ts_arr = pm_window_idx.index.values
+
+        for sig in sigma_multiples:
+            up_thresh   = open_price + sig * ewma_sigma
+            dn_thresh   = open_price - sig * ewma_sigma
+
+            win_rate_up = win_rates_by_key.get((asset, sig, "up"))
+            win_rate_dn = win_rates_by_key.get((asset, sig, "down"))
+
+            # Detect all crossing transitions in this window
+            for j in range(1, len(win_pr_arr)):
+                p_prev = float(win_pr_arr[j - 1])
+                p_curr = float(win_pr_arr[j])
+                t_curr = int(win_ts_arr[j])
+
+                for direction in ("up", "down"):
+                    if direction == "up":
+                        crossed = (p_prev < up_thresh) and (p_curr >= up_thresh)
+                        price_col = "up_ask"
+                        won = bool(resolved_up)
+                        win_rate = win_rate_up
+                    else:
+                        crossed = (p_prev > dn_thresh) and (p_curr <= dn_thresh)
+                        price_col = "dn_ask"
+                        won = not bool(resolved_up)
+                        win_rate = win_rate_dn
+
+                    if not crossed:
+                        continue
+
+                    # PM price lookup at trigger + 1
+                    fill_pos = int(np.searchsorted(pm_ts_arr, t_curr + 1, side="left"))
+                    if fill_pos >= len(pm_ts_arr):
+                        fill_pos = 0
+                    if price_col not in pm_window_idx.columns:
+                        continue
+                    pm_row = pm_window_idx.iloc[fill_pos]
+                    if pd.isna(pm_row.get(price_col)):
+                        continue
+                    pm_price = float(pm_row[price_col])
+
+                    entry_taken = (
+                        win_rate is not None
+                        and _price_with_fee(pm_price) < win_rate
+                    )
+                    pnl = (1.0 - _price_with_fee(pm_price)) if (won and entry_taken) \
+                          else (-_price_with_fee(pm_price))   if (not won and entry_taken) \
+                          else 0.0
+
+                    records.append({
+                        "asset":          asset,
+                        "window_ts":      wts,
+                        "sigma":          sig,
+                        "trigger_dir":    direction,
+                        "trigger_ts":     t_curr,
+                        "trigger_second": t_curr - wts,
+                        "pm_price":       pm_price,
+                        "resolved_up":    resolved_up,
+                        "won":            won,
+                        "entry_taken":    entry_taken,
+                        "pnl":            pnl,
+                    })
+
+    return pd.DataFrame(records)
+
+
+def section_multi_entry_pnl(multi_df: pd.DataFrame, first_df: pd.DataFrame) -> str:
+    """
+    PnL metrics for the multi-entry strategy (every threshold crossing that passes
+    the price filter), compared against the single-entry (first crossing only) baseline.
+
+    For each (asset, sigma):
+        n_windows, n_triggers, n_entries, entries/window,
+        win%, avg_pm, avg_pnl/entry, total_pnl, pnl/window
+
+    Also shows an aggregate summary across all assets by sigma.
+    """
+    if multi_df.empty:
+        return "_No multi-entry data available._"
+
+    out = []
+
+    # ── Per-asset tables ───────────────────────────────────────────────────────
+    total_windows = multi_df.groupby("asset")["window_ts"].nunique()
+
+    for asset in sorted(multi_df["asset"].unique()):
+        adf = multi_df[multi_df["asset"] == asset]
+        n_windows = int(total_windows.get(asset, 0))
+
+        out.append(f"### {asset}\n")
+        out.append(
+            "| sigma | n_windows | n_triggers | n_entries | entries/window"
+            " | win% | avg_pm | avg_pnl/entry | total_pnl | pnl/window |"
+        )
+        out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+
+        for sig, sgrp in adf.groupby("sigma"):
+            n_triggers = len(sgrp)
+            taken      = sgrp[sgrp["entry_taken"]]
+            n_entries  = len(taken)
+            if n_entries == 0:
+                out.append(
+                    f"| {sig}σ | {n_windows} | {n_triggers} | 0 | 0.00"
+                    f" | — | — | — | — | — |"
+                )
+                continue
+            entries_pw = n_entries / n_windows
+            win_pct    = taken["won"].mean() * 100
+            avg_pm     = taken["pm_price"].mean()
+            avg_pnl    = taken["pnl"].mean()
+            total_pnl  = taken["pnl"].sum()
+            pnl_pw     = total_pnl / n_windows
+            out.append(
+                f"| {sig}σ | {n_windows} | {n_triggers} | {n_entries}"
+                f" | {entries_pw:.2f}"
+                f" | {win_pct:.1f}%"
+                f" | {avg_pm:.4f}"
+                f" | {avg_pnl:+.4f}"
+                f" | {total_pnl:+.3f}"
+                f" | {pnl_pw:+.4f} |"
+            )
+        out.append("")
+
+    # ── Aggregate by sigma (all assets) ───────────────────────────────────────
+    out.append("### All Assets (aggregate)\n")
+    out.append(
+        "| sigma | n_windows | n_triggers | n_entries | entries/window"
+        " | win% | avg_pm | avg_pnl/entry | total_pnl | pnl/window |"
+    )
+    out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+
+    agg_n_windows = int(multi_df.groupby("asset")["window_ts"].nunique().sum())
+    for sig, sgrp in multi_df.groupby("sigma"):
+        n_triggers = len(sgrp)
+        taken      = sgrp[sgrp["entry_taken"]]
+        n_entries  = len(taken)
+        if n_entries == 0:
+            out.append(f"| {sig}σ | {agg_n_windows} | {n_triggers} | 0 | — | — | — | — | — | — |")
+            continue
+        entries_pw = n_entries / agg_n_windows
+        win_pct    = taken["won"].mean() * 100
+        avg_pm     = taken["pm_price"].mean()
+        avg_pnl    = taken["pnl"].mean()
+        total_pnl  = taken["pnl"].sum()
+        pnl_pw     = total_pnl / agg_n_windows
+        out.append(
+            f"| {sig}σ | {agg_n_windows} | {n_triggers} | {n_entries}"
+            f" | {entries_pw:.2f}"
+            f" | {win_pct:.1f}%"
+            f" | {avg_pm:.4f}"
+            f" | {avg_pnl:+.4f}"
+            f" | {total_pnl:+.3f}"
+            f" | {pnl_pw:+.4f} |"
+        )
+    out.append("")
+
+    # ── Multi vs single comparison (aggregate, all assets all sigmas) ─────────
+    if not first_df.empty:
+        out.append("### Multi-entry vs First-only (all assets · all sigmas)\n")
+        out.append("| strategy | n_entries | win% | avg_pnl/entry | total_pnl |")
+        out.append("|---|---:|---:|---:|---:|")
+
+        multi_taken = multi_df[multi_df["entry_taken"]]
+        if not multi_taken.empty:
+            out.append(
+                f"| multi-entry | {len(multi_taken)}"
+                f" | {multi_taken['won'].mean()*100:.1f}%"
+                f" | {multi_taken['pnl'].mean():+.4f}"
+                f" | {multi_taken['pnl'].sum():+.3f} |"
+            )
+
+        # reconstruct first-only pnl from first_df using same fee logic
+        first_filt = _price_filter(first_df)
+        if not first_filt.empty:
+            first_pnl = (first_filt["won"].astype(float) - _price_with_fee(first_filt["pm_price"]))
+            out.append(
+                f"| first-only  | {len(first_filt)}"
+                f" | {first_filt['won'].mean()*100:.1f}%"
+                f" | {first_pnl.mean():+.4f}"
+                f" | {first_pnl.sum():+.3f} |"
+            )
+
+        out.append("")
+
+    out.append(
+        "_Entry condition: every coin-price crossing of `window_open ± N×σ` "
+        "(transition from one side to the other) where `pm_price × 1.015 < directional win_rate`. "
+        "Opposing-direction entries in the same window are allowed. "
+        "pnl/entry = (1 − pm_price × 1.015) if won else (−pm_price × 1.015). "
+        "pnl/window = total_pnl ÷ n_windows (includes windows with no entries)._"
+    )
+    return "\n".join(out)
+
+
 def section_ewma_cadence_comparison(fast_df: pd.DataFrame, slow_df: pd.DataFrame) -> str:
     """
     Compare the current 5-minute EWMA cadence against a 30-minute refresh cadence.
@@ -1565,8 +1823,9 @@ def section_ewma_cadence_comparison(fast_df: pd.DataFrame, slow_df: pd.DataFrame
 
 def _config_yaml(df: pd.DataFrame) -> str:
     """
-    For each asset, pick the sigma with the best edge_per_session and emit YAML config.
+    For each asset, emit YAML config blocks for sigma_entry 0.3 and 0.5.
     """
+    SHOW_SIGMAS   = [0.3, 0.5]
     total_windows = df.groupby("asset")["window_ts"].nunique()
     blocks = []
 
@@ -1575,41 +1834,40 @@ def _config_yaml(df: pd.DataFrame) -> str:
 
         # Use the most recent window's EWMA sigma as sigma_value (current volatility estimate)
         if "ewma_sigma" in adf.columns:
-            latest_wts = adf["window_ts"].max()
+            latest_wts  = adf["window_ts"].max()
             sigma_value = float(adf[adf["window_ts"] == latest_wts]["ewma_sigma"].iloc[0])
         else:
-            ref = adf[adf["sigma"] > 0].iloc[0]
+            ref         = adf[adf["sigma"] > 0].iloc[0]
             sigma_value = ref["sigma_abs"] / ref["sigma"]
 
-        n_total = total_windows.get(asset, 1)
-
-        best_sig  = None
-        best_eps  = -999.0
-        best_win  = 0.0
-        best_edge = 0.0
-
+        n_total    = total_windows.get(asset, 1)
+        sig_stats  = {}
         for sig, sgrp in adf.groupby("sigma"):
-            win       = sgrp["won"].mean()
-            avg_pm    = sgrp["pm_price"].mean()
-            edge      = _edge_from_win_and_pm(win, avg_pm)
-            fill_rate = sgrp["window_ts"].nunique() / n_total
-            eps       = edge * fill_rate
-            if eps > best_eps:
-                best_eps  = eps
-                best_sig  = sig
-                best_win  = win
-                best_edge = edge
+            if sig not in SHOW_SIGMAS:
+                continue
+            win           = sgrp["won"].mean()
+            avg_pm        = sgrp["pm_price"].mean()
+            edge          = _edge_from_win_and_pm(win, avg_pm)
+            fill_rate     = sgrp["window_ts"].nunique() / n_total
+            eps           = edge * fill_rate
+            sig_stats[sig] = dict(win=win, edge=edge, eps=eps)
 
-        if best_sig is None:
+        if not sig_stats:
             continue
 
-        blocks.append(
-            f"{asset}:  # best entry: {best_sig}σ  |  edge/fill: {best_edge*100:+.1f}%  |  edge/session: {best_eps*100:+.2f}%\n"
-            f"  sigma_value: {sigma_value:.8g}\n"
-            f"  sigma_entry: {best_sig}\n"
-            f"  max_pm_price: {best_win/(1.0 + BUY_FEE_RATE):.2f}\n"
-            f"  name: mom_{asset.strip().lower()}"
-        )
+        lines = []
+        for sig in SHOW_SIGMAS:
+            if sig not in sig_stats:
+                continue
+            s = sig_stats[sig]
+            lines.append(
+                f"{asset}:  # entry: {sig}σ  |  edge/fill: {s['edge']*100:+.1f}%  |  edge/session: {s['eps']*100:+.2f}%\n"
+                f"  sigma_value: {sigma_value:.8g}\n"
+                f"  sigma_entry: {sig}\n"
+                f"  max_pm_price: {s['win']/(1.0 + BUY_FEE_RATE):.2f}\n"
+                f"  name: mom_{asset.strip().lower()}"
+            )
+        blocks.append("\n\n".join(lines))
 
     return "```yaml\n" + "\n\n".join(blocks) + "\n```"
 
@@ -1621,18 +1879,129 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--assets",     nargs="+", default=list(ASSET_TO_SYMBOL.keys()))
     p.add_argument("--prices-dir", default="data/prices")
     p.add_argument("--coin-dir",   default="data/coin_prices")
-    p.add_argument("--sigma",      nargs="+", type=float, default=[0.25, 0.5, 0.75, 1.0])
+    p.add_argument("--sigma",      nargs="+", type=float, default=[0.3, 0.4, 0.5, 0.75])
     p.add_argument("--out-csv",    default="data/reports/threshold_edge.csv")
     p.add_argument("--out-report", default="data/reports/threshold_edge.md")
     p.add_argument(
         "--from-csv", action="store_true", default=False,
         help="Skip data loading/analysis and regenerate the report from the existing --out-csv file",
     )
+    p.add_argument(
+        "--ewma-only", action="store_true", default=False,
+        help="Print only the most recent EWMA sigma values per asset and exit (no full analysis)",
+    )
+    p.add_argument(
+        "--ewma-n", type=int, default=5,
+        help="Number of most recent EWMA values to show per asset (default: 5)",
+    )
+    p.add_argument(
+        "--update-config", action="store_true", default=False,
+        help="With --ewma-only: write the latest EWMA sigma back to --config as sigma_value",
+    )
+    p.add_argument(
+        "--config", default="config/assets.yaml",
+        help="Path to assets.yaml to update when --update-config is set (default: config/assets.yaml)",
+    )
+    p.add_argument(
+        "--ewma-lambda", type=float, default=EWMA_LAMBDA,
+        help=f"EWMA decay factor λ (default: {EWMA_LAMBDA})",
+    )
     return p.parse_args()
+
+
+def _print_ewma_only(
+    assets: list[str],
+    coin_dir: str,
+    lambda_: float,
+    n: int,
+    update_config: str | None = None,
+) -> None:
+    """Load coin prices per asset, compute EWMA sigmas, and print the most recent n values.
+
+    If update_config is a path to assets.yaml, writes the latest EWMA sigma for each
+    asset back as sigma_value in that file.
+    """
+    rows = []
+    latest_sigma: dict[str, float] = {}
+    for asset in assets:
+        coin = load_coin_prices(coin_dir, asset)
+        if coin is None:
+            continue
+        ts_idx = coin.index.values
+        if len(ts_idx) == 0:
+            continue
+        first_ts = int(ts_idx[0])
+        last_ts  = int(ts_idx[-1])
+        wstart = (first_ts // WINDOW_SECS) * WINDOW_SECS
+        if first_ts % WINDOW_SECS != 0:
+            wstart += WINDOW_SECS
+        wend = (last_ts // WINDOW_SECS) * WINDOW_SECS
+        windows = list(range(wstart, wend + 1, WINDOW_SECS))
+        ewma_sigmas = compute_ewma_sigmas(windows, coin, lambda_)
+        if not ewma_sigmas:
+            continue
+        recent = sorted(ewma_sigmas.items())[-n:]
+        latest_sigma[asset] = round(recent[-1][1], 8)
+        for wts, sigma in recent:
+            dt = datetime.fromtimestamp(wts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            rows.append({"asset": asset, "window_utc": dt, "ewma_sigma": round(sigma, 8)})
+
+    if not rows:
+        print("No EWMA data available.")
+        return
+
+    df = pd.DataFrame(rows)
+    print(df.to_string(index=False))
+
+    if update_config and latest_sigma:
+        _update_config_sigmas(update_config, latest_sigma)
+
+
+def _update_config_sigmas(config_path: str, latest_sigma: dict[str, float]) -> None:
+    """Write sigma_value back into assets.yaml for each asset in latest_sigma."""
+    import re
+    try:
+        text = open(config_path).read()
+    except FileNotFoundError:
+        print(f"[ewma] Config not found: {config_path}")
+        return
+
+    updated: list[str] = []
+    for asset, sigma in latest_sigma.items():
+        # Replace the sigma_value line under the asset's block.
+        # Pattern: asset header, then somewhere within a few lines, sigma_value: <old>
+        # We do a targeted line-by-line replacement to avoid clobbering YAML structure.
+        new_text = re.sub(
+            rf"(?m)^({re.escape(asset.upper())}:.*\n(?:[ \t]+.*\n)*?[ \t]+sigma_value:[ \t]*)[^\n]+",
+            lambda m: m.group(1) + str(sigma),
+            text,
+        )
+        if new_text != text:
+            text = new_text
+            updated.append(f"  {asset}: sigma_value → {sigma}")
+        else:
+            print(f"[ewma] Could not find sigma_value for {asset} in {config_path} — skipping")
+
+    if updated:
+        with open(config_path, "w") as f:
+            f.write(text)
+        print(f"\n[ewma] Updated {config_path}:")
+        for line in updated:
+            print(line)
 
 
 def main() -> None:
     args = parse_args()
+
+    lambda_ = args.ewma_lambda
+
+    if args.ewma_only:
+        _print_ewma_only(
+            args.assets, args.coin_dir, lambda_, args.ewma_n,
+            update_config=args.config if args.update_config else None,
+        )
+        return
+
     os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
 
     if args.from_csv:
@@ -1642,10 +2011,8 @@ def main() -> None:
         full = pd.read_csv(args.out_csv)
         log.info("Loaded %d records from %s", len(full), args.out_csv)
         unresolved: dict[str, int] = {}
-        full_30m = pd.DataFrame()
     else:
         all_records = []
-        all_records_30m = []
         unresolved = {}
 
         for asset in args.assets:
@@ -1659,7 +2026,7 @@ def main() -> None:
             if coin is None:
                 continue
 
-            recs, n_unresolved = analyze_asset_ewma(asset, pm_df, coin, args.sigma, EWMA_LAMBDA)
+            recs, n_unresolved = analyze_asset_ewma(asset, pm_df, coin, args.sigma, lambda_)
             unresolved[asset] = n_unresolved
             if not recs.empty:
                 all_records.append(recs)
@@ -1680,7 +2047,6 @@ def main() -> None:
         full = compute_reprice_times(full, args.prices_dir, target_win_rates)
 
         full.to_csv(args.out_csv, index=False)
-        log.info("Raw records → %s", args.out_csv)
 
     report = build_report(full, args.sigma, unresolved)
 

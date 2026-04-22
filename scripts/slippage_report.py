@@ -39,7 +39,7 @@ def main() -> None:
     df = pd.concat(frames, ignore_index=True)
 
     # drop dry runs and keep one row per trade (the resolved/final status row)
-    df = df[df["order_id"] != "DRY_RUN"]
+    df = df[~df["order_id"].isin({"DRY_RUN", "DRY_RUN_OB_FILTERED"})]
     df = df[df["status"].isin(["won", "lost", "unresolved"])]
 
     if df.empty:

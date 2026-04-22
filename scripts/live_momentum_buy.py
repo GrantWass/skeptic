@@ -7,9 +7,11 @@ Buys when:
   1. Coin moves >= sigma_entry * sigma_value from window open
   2. Polymarket ask for that side is <= max_pm_price
 
+Live vs paper trading is controlled entirely by momentum.enabled / model.enabled
+in config/assets.yaml — no separate dry-run flag.
+
 Usage:
     python scripts/live_momentum_buy.py --asset SOL                           # loads from config/assets.yaml
-    python scripts/live_momentum_buy.py --asset SOL --dry-run                 # dry-run using config
     python scripts/live_momentum_buy.py --asset BTC --sigma-value 150.0 --sigma-entry 1.0 --max-pm-price 0.72  # CLI override
 """
 import argparse
@@ -28,6 +30,7 @@ from skeptic.executor.momentum_buy import MomentumBuyExecutor
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%M:%S",
 )
 
 
@@ -72,8 +75,6 @@ def parse_args() -> argparse.Namespace:
                    help="Percent of wallet to deploy per trade (default: from config or POSITION_SIZE_PCT)")
     p.add_argument("--fixed-usdc",   type=float, default=None,
                    help="Fixed dollar amount per trade in USDC (overrides --wallet-pct)")
-    p.add_argument("--dry-run",      action="store_true",
-                   help="Log intended trades without placing real orders")
     p.add_argument("--name",         default="momentum",
                    help="Instance name for trades/status files")
 
@@ -129,10 +130,9 @@ async def main() -> None:
     momentum_enabled = args.momentum_cfg.get("enabled", True)
     model_enabled    = args.model_cfg.get("enabled", True)
     print(f"  Momentum      : {'ENABLED' if momentum_enabled else 'DISABLED'}")
-    print(f"  Model         : {'ENABLED' if model_enabled else 'DISABLED'}")
-    print(f"  Dry run       : {args.dry_run}\n")
+    print(f"  Model         : {'ENABLED' if model_enabled else 'DISABLED'}\n")
 
-    if not args.dry_run:
+    if momentum_enabled or model_enabled:
         confirm = input("Start LIVE trading? [y/N] ").strip().lower()
         if confirm != "y":
             print("Aborted.")
@@ -146,10 +146,10 @@ async def main() -> None:
         direction=args.direction,
         wallet_pct=wallet_pct,
         fixed_usdc=args.fixed_usdc,
-        dry_run=args.dry_run,
         name=args.name,
         model_cfg=args.model_cfg,
         momentum_cfg=args.momentum_cfg,
+        config_path=args.config,
     )
     await executor.run()
 

@@ -19,7 +19,7 @@ from websockets.exceptions import ConnectionClosed
 from skeptic import config
 from skeptic.models.order import Fill
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ws")
 
 # Type alias for fill callback
 FillCallback = Callable[[Fill], Awaitable[None]]
@@ -224,6 +224,10 @@ class MarketChannel:
     def get_bid(self, token_id: str) -> float | None:
         """Return best bid (what you'd receive when selling)."""
         return self.price_cache.get_bid(token_id)
+
+    def get_book(self, token_id: str) -> "BookData | None":
+        """Return full BookData (bid, ask, bid_volume, ask_volume), or None if no book yet."""
+        return self.price_cache.get_book(token_id)
 
     async def subscribe(self, *token_ids: str) -> None:
         for tid in token_ids:

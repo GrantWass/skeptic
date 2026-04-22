@@ -19,6 +19,8 @@ import logging
 import math
 import os
 import time
+import warnings
+import yaml
 from collections import deque
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -38,27 +40,28 @@ _BALANCE_PHRASES = ("insufficient", "not enough", "balance", "funds")
 
 class InsufficientBalanceError(RuntimeError):
     """Raised when an order is rejected due to insufficient USDC balance."""
-from skeptic.clients import ctf as ctf_client
 from skeptic.clients import gamma
 from skeptic.clients.ws import MarketChannel
 from skeptic.models.market import Market
-from skeptic.utils.kelly import kelly_usdc, MOMENTUM_EDGE_THRESHOLD
+from skeptic.utils.kelly import kelly_usdc, MOMENTUM_EDGE_THRESHOLD, KELLY_MAX_USDC, imbalance_kelly_multiplier
 from skeptic.utils.time import current_window_start, next_window_start, sleep_until
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("momentum_buy")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 LIVE_DIR = os.path.join("data", "live")
 
 BINANCE_KLINES_URL  = "https://api.binance.com/api/v3/klines"
-BINANCE_WS_BASE     = "wss://stream.binance.com:9443/ws"
+BINANCE_WS_COMBINED = "wss://stream.binance.com:9443/stream?streams={streams}"
 
 class BinanceCoinStream:
     """
-    Subscribes to Binance's aggTrade WebSocket stream for a single symbol and
-    caches the latest trade price. Reconnects automatically on any error.
+    Subscribes to Binance's aggTrade + depth5 WebSocket streams for a single symbol.
+    Caches the latest trade price and top-5 orderbook bid/ask volumes.
+    Reconnects automatically on any error.
 
     Use get_price() to read the latest price (returns None until first message).
+    Use get_coin_ob_imbalance() to read bid/(bid+ask) ratio from top-5 depth.
     """
 
     def __init__(self, symbol: str) -> None:
@@ -68,6 +71,11 @@ class BinanceCoinStream:
         self._event        = asyncio.Event()
         # (timestamp, quantity) for rolling volume sums — matches 1s OHLCV volume column
         self._vol_history: deque[tuple[float, float]] = deque(maxlen=500)
+        # Top-5 orderbook bid/ask volume totals (updated from @depth5@100ms)
+        self._coin_bid_vol: float = 0.0
+        self._coin_ask_vol: float = 0.0
+        # Rolling (timestamp, imbalance) history — ~100ms updates, 200 entries ≈ 20s
+        self._ob_history: deque[tuple[float, float]] = deque(maxlen=200)
 
     def get_price(self) -> float | None:
         return self._price
@@ -77,6 +85,34 @@ class BinanceCoinStream:
         cutoff = time.time() - 10.0
         total  = sum(q for ts, q in self._vol_history if ts >= cutoff)
         return math.log1p(total)
+
+    def get_coin_ob_imbalance(self) -> float | None:
+        """bid_vol / (bid_vol + ask_vol) from top-5 depth levels. None if no depth data yet."""
+        total = self._coin_bid_vol + self._coin_ask_vol
+        if total <= 0:
+            return None
+        return self._coin_bid_vol / total
+
+    def get_ob_metrics(self) -> tuple[float | None, float | None, float | None]:
+        """
+        Returns (snapshot, mean_5s, trend) at the current moment.
+
+        snapshot — imbalance of the most recent depth update
+        mean_5s  — mean imbalance over the last 5 seconds (~50 depth updates)
+        trend    — snapshot − mean_5s (positive = book getting more bid-heavy into entry)
+
+        All three are None if fewer than 3 depth samples exist in the last 5 seconds.
+        """
+        if not self._ob_history:
+            return None, None, None
+        now     = time.time()
+        snap    = self._ob_history[-1][1]
+        window  = [imb for ts, imb in self._ob_history if ts >= now - 5.0]
+        if len(window) < 3:
+            return snap, None, None
+        mean_5s = sum(window) / len(window)
+        trend   = snap - mean_5s
+        return snap, mean_5s, trend
 
     @property
     def stale(self) -> bool:
@@ -105,7 +141,9 @@ class BinanceCoinStream:
         return self._price
 
     async def run(self) -> None:
-        url     = f"{BINANCE_WS_BASE}/{self._symbol}@aggTrade"
+        sym     = self._symbol
+        streams = f"{sym}@aggTrade/{sym}@depth5@100ms"
+        url     = BINANCE_WS_COMBINED.format(streams=streams)
         backoff = 1.0
         while True:
             try:
@@ -114,11 +152,23 @@ class BinanceCoinStream:
                 ) as ws:
                     backoff = 1.0
                     async for raw in ws:
-                        msg               = json.loads(raw)
-                        self._price       = float(msg["p"])
-                        self._last_update = time.time()
-                        self._vol_history.append((self._last_update, float(msg["q"])))
-                        self._event.set()
+                        envelope = json.loads(raw)
+                        # Combined stream wraps each message: {"stream": "...", "data": {...}}
+                        stream_name = envelope.get("stream", "")
+                        msg         = envelope.get("data", envelope)
+                        if "@aggTrade" in stream_name:
+                            self._price       = float(msg["p"])
+                            self._last_update = time.time()
+                            self._vol_history.append((self._last_update, float(msg["q"])))
+                            self._event.set()
+                        elif "@depth5" in stream_name:
+                            bids = msg.get("bids") or []
+                            asks = msg.get("asks") or []
+                            self._coin_bid_vol = sum(float(b[1]) for b in bids)
+                            self._coin_ask_vol = sum(float(a[1]) for a in asks)
+                            _total = self._coin_bid_vol + self._coin_ask_vol
+                            if _total > 0:
+                                self._ob_history.append((time.time(), self._coin_bid_vol / _total))
             except Exception as exc:
                 log.warning(
                     "BinanceCoinStream %s disconnected: %s — reconnect in %.0fs",
@@ -145,12 +195,13 @@ TRADE_FIELDS = [
     "slippage", "window_start_ts", "window_end_ts",
     "sign_ms", "post_ms", "order_ms",
     "resolution", "pnl_usdc", "status", "order_id",
+    "coin_ob_imbalance", "coin_ob_imb_5s", "coin_ob_trend",
 ]
 
 SLIPPAGE = 0.075
 BUY_FEE_RATE = 0.015
-MODEL_EDGE_THRESHOLD = 0.20   # min predicted_win - pm_ask to fire a model dry-run trade
 EWMA_LAMBDA = 0.95             # decay factor for walk-forward sigma estimate
+SESSION_LOSS_LIMIT = 10.0      # dollars: disable a strategy if it loses this much in one session
 
 MODEL_TRADE_FIELDS = [
     "ts", "asset", "side", "token_id",
@@ -160,6 +211,7 @@ MODEL_TRADE_FIELDS = [
     "window_start_ts", "window_end_ts",
     "sign_ms", "post_ms", "order_ms",
     "resolution", "pnl_usdc", "status", "order_id", "slippage",
+    "coin_ob_imbalance", "coin_ob_imb_5s", "coin_ob_trend",
 ]
 
 
@@ -189,6 +241,9 @@ class ModelTrade:
     status: str = "open"
     order_id: str = ""
     slippage: float = 0.0
+    coin_ob_imbalance: float | None = None
+    coin_ob_imb_5s: float | None = None
+    coin_ob_trend: float | None = None
 
 
 def _ensure_model_csv(trades_csv: str) -> None:
@@ -255,6 +310,9 @@ class MomentumTrade:
     pnl_usdc: float | None = None
     status: str = "open"
     order_id: str = ""
+    coin_ob_imbalance: float | None = None
+    coin_ob_imb_5s: float | None = None
+    coin_ob_trend: float | None = None
 
 
 def _ensure_live_dir(trades_csv: str) -> None:
@@ -315,10 +373,10 @@ class MomentumBuyExecutor:
         direction: str = "both",
         wallet_pct: float = 0.10,
         fixed_usdc: float | None = None,
-        dry_run: bool = False,
         name: str = "momentum",
         model_cfg: dict | None = None,
         momentum_cfg: dict | None = None,
+        config_path: str = "config/assets.yaml",
     ) -> None:
         assert direction in ("up", "down", "both"), "direction must be 'up', 'down', or 'both'"
         self.asset        = asset
@@ -328,20 +386,30 @@ class MomentumBuyExecutor:
         self.direction    = direction
         self.wallet_pct   = wallet_pct
         self.fixed_usdc      = fixed_usdc
-        self.dry_run         = dry_run
+        self._config_path = config_path
         _mom = momentum_cfg or {}
-        self._momentum_enabled: bool = bool(_mom.get("enabled", True))
+        self._momentum_enabled: bool              = bool(_mom.get("enabled", True))
+        self._momentum_multi_trade_cooldown: int  = int(_mom.get("multi_trade_cooldown", 0))
+        self._momentum_max_trades_per_window: int = int(_mom.get("max_trades_per_window", 0))
+        _mfi = _mom.get("min_fav_imbalance")
+        self._momentum_min_fav_imbalance: float | None = float(_mfi) if _mfi is not None else None
+        _mfi_mean = _mom.get("min_fav_imbalance_mean")
+        self._momentum_min_fav_imbalance_mean: float | None = float(_mfi_mean) if _mfi_mean is not None else None
         _mc = model_cfg or {}
         self._model_cfg = _mc
         self._model_enabled:         bool        = bool(_mc.get("enabled", True))
         self._model_window_start:    int         = int(_mc.get("window_start", 0))
         self._model_window_end:      int         = int(_mc.get("window_end",   300))
-        self._MODEL_EDGE_THRESHOLD:  float       = float(_mc.get("edge_threshold", MODEL_EDGE_THRESHOLD))
+        self._MODEL_EDGE_THRESHOLD:  float       = float(_mc.get("edge_threshold", .20))
         self._model_fixed_usdc:         float | None = _mc.get("fixed_usdc")
 
         self._model_multi_trade_cooldown: int        = int(_mc.get("multi_trade_cooldown", 0))
         self._model_max_trades_per_window: int       = int(_mc.get("max_trades_per_window", 3))
         self._model_max_slippage:          float     = float(_mc.get("max_slippage", 0.10))
+        _mdl_mfi = _mc.get("min_fav_imbalance")
+        self._model_min_fav_imbalance: float | None  = float(_mdl_mfi) if _mdl_mfi is not None else None
+        _mdl_mfi_mean = _mc.get("min_fav_imbalance_mean")
+        self._model_min_fav_imbalance_mean: float | None = float(_mdl_mfi_mean) if _mdl_mfi_mean is not None else None
 
         self._symbol = ASSET_TO_SYMBOL.get(asset.upper())
         if self._symbol is None:
@@ -370,11 +438,22 @@ class MomentumBuyExecutor:
         self._sigma_initial: float = sigma_value
         self._ewma_var: float = float(sigma_value) ** 2
 
+        # CLOB availability backoff — set when 425 persists after retry
+        self._clob_backoff_until: float = 0.0
+
+        # Session-level PnL accumulators for the loss circuit breaker.
+        # Only real fills count (DRY_RUN and FOK_KILLED trades are excluded).
+        self._session_momentum_pnl: float = 0.0
+        self._session_model_pnl:    float = 0.0
+
         # Per-window state
         self._market:   Market | None = None
         self._filled:   bool = False
-        self._trade:    MomentumTrade | None = None
-        self._presigned: dict[str, object] = {}
+        self._momentum_trade_count:  int          = 0
+        self._momentum_last_fire_ts: float | None = None
+        self._trade:      MomentumTrade | None = None
+        self._momentum_trades: list[MomentumTrade] = []
+        self._presigned: dict[str, tuple] = {}
         self._tp_sell_order_id: str | None = None   # open take-profit sell order
         self._window_start: int = 0
         self._window_end:   int = 0
@@ -383,6 +462,12 @@ class MomentumBuyExecutor:
         self._position_usdc: float = 0.0
         # (timestamp, price) ring buffer — used to compute velocity/acceleration features
         self._price_history: deque[tuple[float, float]] = deque(maxlen=60)
+        # Cached hour features — computed once per window, reused for all inferences
+        self._cached_hour_sin: float = 0.0
+        self._cached_hour_cos: float = 0.0
+        # Cached book data — fetched once per status loop
+        self._cached_up_book: Any = None
+        self._cached_dn_book: Any = None
         # Model dry-run state — separate from live trading state
         self._model_last_fire_ts: float | None = None   # None = not fired this window
         self._model_trades: list[ModelTrade]   = []     # all trades this window
@@ -394,7 +479,14 @@ class MomentumBuyExecutor:
         _ensure_live_dir(self._trades_csv)
         _ensure_model_csv(self._model_trades_csv)
         _model_csv_ensured.add(self._model_trades_csv)
-        async with httpx.AsyncClient(http2=True, limits=httpx.Limits(max_connections=50, max_keepalive_connections=12)) as http:
+        async with httpx.AsyncClient(
+            http2=True,
+            limits=httpx.Limits(
+                max_connections=50,
+                max_keepalive_connections=12,
+                keepalive_expiry=None,   # never proactively expire idle connections
+            ),
+        ) as http:
             self._http = http
             ws_task          = asyncio.create_task(self._ws.run())
             coin_stream_task = asyncio.create_task(self._coin_stream.run())
@@ -446,6 +538,8 @@ class MomentumBuyExecutor:
         if strategy == "momentum":
             self._momentum_enabled = False
             self._filled = False
+            self._momentum_trade_count  = 0
+            self._momentum_last_fire_ts = None
         elif strategy == "model":
             self._model_enabled = False
             self._model_last_fire_ts = None
@@ -472,9 +566,21 @@ class MomentumBuyExecutor:
         self._window_start  = window_start
         self._window_end    = window_end
         self._price_history.clear()
+        self._momentum_trade_count:  int          = 0
+        self._momentum_last_fire_ts: float | None = None
+        self._momentum_trades        = []
         self._model_last_fire_ts = None
         self._model_trades       = []
         self._model_trade        = None
+        # Clear cached book data at window start
+        self._cached_up_book = None
+        self._cached_dn_book = None
+
+        # Pre-compute hour features once per window
+        _hour_utc = datetime.fromtimestamp(window_start, tz=timezone.utc).hour
+        _hour_rad = _hour_utc * (2 * 3.141592653589793 / 24)
+        self._cached_hour_sin = round(math.sin(_hour_rad), 8)
+        self._cached_hour_cos = round(math.cos(_hour_rad), 8)
 
         # Apply EWMA sigma for this window (estimated from all prior windows)
         old_sigma = self.sigma_value
@@ -490,7 +596,44 @@ class MomentumBuyExecutor:
                 "%s EWMA σ: using config seed %.6g (no prior windows yet)",
                 self.asset, self.sigma_value,
             )
+        # Hot-reload enabled flags from config each window so changes take effect without restart
+        try:
+            with open(self._config_path) as _f:
+                _cfg = yaml.safe_load(_f) or {}
+            _global_mom = _cfg.get("MOMENTUM", {})
+            _global_mdl = _cfg.get("MODEL", {})
+            _asset_cfg  = _cfg.get(self.asset.upper(), {})
+            _mom_cfg    = {**_global_mom, **_asset_cfg.get("momentum", {})}
+            _mdl_cfg    = {**_global_mdl, **_asset_cfg.get("model", {})}
+            self._momentum_enabled = bool(_mom_cfg.get("enabled", True))
+            self._model_enabled    = bool(_mdl_cfg.get("enabled", True))
+            _mfi = _mom_cfg.get("min_fav_imbalance")
+            self._momentum_min_fav_imbalance = float(_mfi) if _mfi is not None else None
+            _mfi_mean = _mom_cfg.get("min_fav_imbalance_mean")
+            self._momentum_min_fav_imbalance_mean = float(_mfi_mean) if _mfi_mean is not None else None
+            _mdl_mfi = _mdl_cfg.get("min_fav_imbalance")
+            self._model_min_fav_imbalance    = float(_mdl_mfi) if _mdl_mfi is not None else None
+            _mdl_mfi_mean = _mdl_cfg.get("min_fav_imbalance_mean")
+            self._model_min_fav_imbalance_mean = float(_mdl_mfi_mean) if _mdl_mfi_mean is not None else None
+        except Exception as exc:
+            log.warning("%s config reload failed: %s — keeping existing enabled flags", self.asset, exc)
+
+        # Session loss circuit breaker takes precedence over config reload.
+        if self._session_momentum_pnl <= -SESSION_LOSS_LIMIT:
+            self._momentum_enabled = False
+            log.info("MOMENTUM loss limit still active  %s  session_pnl=$%.4f — staying in dry run", self.asset, self._session_momentum_pnl)
+        if self._session_model_pnl <= -SESSION_LOSS_LIMIT:
+            self._model_enabled = False
+            log.info("[MODEL] loss limit still active  %s  session_pnl=$%.4f — staying in dry run", self.asset, self._session_model_pnl)
+
         balance = await asyncio.to_thread(clob_client.get_usdc_balance, self._clob)
+        if balance < 2.0:
+            log.warning(
+                "%s balance $%.4f < $2.00 — disabling momentum and model for this window",
+                self.asset, balance,
+            )
+            self._momentum_enabled = False
+            self._model_enabled    = False
         if self.fixed_usdc is not None:
             self._position_usdc = self.fixed_usdc
         else:
@@ -525,7 +668,7 @@ class MomentumBuyExecutor:
                 break
             await asyncio.sleep(0.1)
 
-        if not self.dry_run and self._momentum_enabled:
+        if self._momentum_enabled:
             for token_id in all_tokens:
                 try:
                     presigned_tuple = await asyncio.to_thread(
@@ -550,11 +693,11 @@ class MomentumBuyExecutor:
                 pass
 
         # Snapshot state now — _run_window will reset these at the next window start
-        trade_snap        = self._trade
-        model_trades_snap = list(self._model_trades)
-        market_snap       = self._market
-        coin_open_snap    = self._coin_open
-        coin_close_snap   = self._coin_current
+        momentum_trades_snap = list(self._momentum_trades)
+        model_trades_snap    = list(self._model_trades)
+        market_snap          = self._market
+        coin_open_snap       = self._coin_open
+        coin_close_snap      = self._coin_current
 
         # Cancel any open take-profit sell before resolution
         if self._tp_sell_order_id:
@@ -562,10 +705,11 @@ class MomentumBuyExecutor:
             self._tp_sell_order_id = None
             await asyncio.to_thread(clob_client.cancel_order, self._clob, tp_oid)
 
-        if trade_snap:
-            asyncio.create_task(self._resolve_bg(
-                trade_snap, market_snap, coin_open_snap, coin_close_snap, delay=8.0
-            ))
+        for _mom in momentum_trades_snap:
+            if _mom.status in ("open", "fok_killed"):
+                asyncio.create_task(self._resolve_bg(
+                    _mom, market_snap, coin_open_snap, coin_close_snap, delay=8.0
+                ))
 
         for _mt in model_trades_snap:
             if _mt.status in ("open", "fok_killed"):
@@ -622,8 +766,20 @@ class MomentumBuyExecutor:
             self._coin_current = coin_price
             self._price_history.append((time.time(), coin_price))
 
-            if self._filled:
-                continue
+            # ── Multi-trade gate ──────────────────────────────────────────────
+            _cd  = self._momentum_multi_trade_cooldown
+            _max = self._momentum_max_trades_per_window
+            if _cd == 0:
+                # Classic single-entry: block after first fill
+                if self._filled:
+                    continue
+            else:
+                # Cooldown mode: respect max-trades cap and per-trade cooldown
+                if _max > 0 and self._momentum_trade_count >= _max:
+                    continue
+                if (self._momentum_last_fire_ts is not None
+                        and time.time() - self._momentum_last_fire_ts < _cd):
+                    continue
 
             move   = coin_price - self._coin_open
             sigmas = move / self.sigma_value if self.sigma_value else 0.0
@@ -637,6 +793,8 @@ class MomentumBuyExecutor:
                         "  [MOMENTUM DISABLED]" if not self._momentum_enabled else "",
                     )
                     self._filled = True
+                    self._momentum_trade_count  += 1
+                    self._momentum_last_fire_ts  = time.time()
                     _skipped.discard("up")
                     await self._execute_buy("UP", self._market.up_token.token_id,
                                             pm_price, coin_price, move)
@@ -654,6 +812,8 @@ class MomentumBuyExecutor:
                         "  [MOMENTUM DISABLED]" if not self._momentum_enabled else "",
                     )
                     self._filled = True
+                    self._momentum_trade_count  += 1
+                    self._momentum_last_fire_ts  = time.time()
                     _skipped.discard("down")
                     await self._execute_buy("DOWN", self._market.down_token.token_id,
                                             pm_price, coin_price, move)
@@ -664,10 +824,15 @@ class MomentumBuyExecutor:
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
-    def _kelly_stake(self, edge: float) -> float:
-        """Scale momentum stake from fixed_usdc up to KELLY_MAX_USDC. fixed_usdc is the floor."""
+    def _kelly_stake(self, edge: float, imbalance: float | None = None) -> float:
+        """Scale momentum stake from fixed_usdc up to KELLY_MAX_USDC, adjusted for orderbook imbalance."""
         fixed = self.fixed_usdc if self.fixed_usdc is not None else self._position_usdc
-        return kelly_usdc(edge=edge, edge_threshold=MOMENTUM_EDGE_THRESHOLD, fixed_usdc=fixed)
+        stake = kelly_usdc(edge=edge, edge_threshold=MOMENTUM_EDGE_THRESHOLD, fixed_usdc=fixed)
+        if imbalance is not None:
+            stake = round(stake * imbalance_kelly_multiplier(imbalance), 4)
+            stake = max(fixed, min(KELLY_MAX_USDC, stake))
+            log.info("Kelly $%.2f USDC  (imbalance=%.4f)", stake, imbalance)
+        return stake
 
     def _model_kelly_stake(self, edge: float) -> float:
         """Scale model stake from fixed_usdc up to KELLY_MAX_USDC. fixed_usdc is the floor."""
@@ -684,10 +849,61 @@ class MomentumBuyExecutor:
     ) -> None:
         t0 = time.perf_counter()
 
-        # Kelly sizing: edge = max_pm_price - ask
-        stake    = self._kelly_stake(self.max_pm_price - trigger_pm_price)
+        # Orderbook imbalance: bid_volume / (bid_volume + ask_volume) on the traded token
+        # Use cached book if available, otherwise fetch
+        if side.upper() == "UP" and self._cached_up_book is not None:
+            _book = self._cached_up_book
+        elif side.upper() == "DOWN" and self._cached_dn_book is not None:
+            _book = self._cached_dn_book
+        else:
+            _book = self._ws.price_cache.get_book(token_id)
+        
+        imbalance: float | None = None
+        if _book is not None:
+            _total_vol = _book.bid_volume + _book.ask_volume
+            if _total_vol > 0:
+                imbalance = _book.bid_volume / _total_vol
+
+        # Kelly sizing: edge = max_pm_price - ask, scaled by imbalance
+        stake    = self._kelly_stake(self.max_pm_price - trigger_pm_price, imbalance=imbalance)
         est_size = round(stake / trigger_pm_price, 2)
         fee_usdc = round(stake * BUY_FEE_RATE, 4)
+
+        # Coin orderbook metrics at trigger time
+        _ob_snap, _ob_mean_5s, _ob_trend = self._coin_stream.get_ob_metrics()
+
+        # Direction-adjusted favorable imbalance: bid-heavy (high) is good for UP,
+        # ask-heavy (low raw = high favorable) is good for DOWN.
+        _fav_imb: float | None = None
+        if _ob_snap is not None:
+            _fav_imb = _ob_snap if side.upper() == "UP" else 1.0 - _ob_snap
+        _fav_imb_mean: float | None = None
+        if _ob_mean_5s is not None:
+            _fav_imb_mean = _ob_mean_5s if side.upper() == "UP" else 1.0 - _ob_mean_5s
+        _snap_filtered = (
+            self._momentum_min_fav_imbalance is not None
+            and _fav_imb is not None
+            and _fav_imb < self._momentum_min_fav_imbalance
+        )
+        _mean_filtered = (
+            self._momentum_min_fav_imbalance_mean is not None
+            and _fav_imb_mean is not None
+            and _fav_imb_mean < self._momentum_min_fav_imbalance_mean
+        )
+        _ob_filtered = _snap_filtered or _mean_filtered
+        _ob_filter_str = ""
+        if _ob_filtered:
+            _snap_str = f"snap={_fav_imb:.3f}<{self._momentum_min_fav_imbalance}" if _snap_filtered else (f"snap={_fav_imb:.3f}" if _fav_imb is not None else "snap=n/a")
+            _mean_str = f"  mean={_fav_imb_mean:.3f}<{self._momentum_min_fav_imbalance_mean}" if _mean_filtered else (f"  mean={_fav_imb_mean:.3f}" if _fav_imb_mean is not None else "  mean=n/a")
+            _ob_filter_str = f"  {_snap_str}{_mean_str}"
+
+        # Get book once and cache for potential take-profit order
+        _book = self._ws.price_cache.get_book(token_id)
+        imbalance: float | None = None
+        if _book is not None:
+            _total_vol = _book.bid_volume + _book.ask_volume
+            if _total_vol > 0:
+                imbalance = _book.bid_volume / _total_vol
 
         trade = MomentumTrade(
             ts=time.time(),
@@ -708,39 +924,80 @@ class MomentumBuyExecutor:
             slippage=SLIPPAGE,
             window_start_ts=self._window_start,
             window_end_ts=self._window_end,
+            coin_ob_imbalance=round(_ob_snap, 4)    if _ob_snap    is not None else None,
+            coin_ob_imb_5s=round(_ob_mean_5s, 4)   if _ob_mean_5s is not None else None,
+            coin_ob_trend=round(_ob_trend, 4)       if _ob_trend   is not None else None,
         )
+        # Register immediately so the status loop shows this trade while the order is in-flight.
+        # The dataclass is mutated in-place as order results arrive below.
+        self._trade = trade
+        self._momentum_trades.append(trade)
 
-        if self.dry_run or not self._momentum_enabled:
+        _imb_str = f"  imbalance={imbalance:.3f}" if imbalance is not None else "  imbalance=n/a"
+        _fav_str = _ob_filter_str if _ob_filtered else (f"  fav_imb={_fav_imb:.3f}" if _fav_imb is not None else "  fav_imb=n/a")
+        if not self._momentum_enabled or _ob_filtered:
+            _reason = "OB FILTER" if _ob_filtered else "MOMENTUM DISABLED"
             log.info(
-                "[%s] BUY %s %s  $%.2f USDC  pm=%.4f  coin_open=%g  coin_now=%g  move=%+g",
-                "DRY RUN" if self.dry_run else "MOMENTUM DISABLED",
-                self.asset, side, stake, trigger_pm_price,
-                self._coin_open, coin_trigger, coin_move,
+                "[%s] BUY %s %s  $%.2f USDC  pm=%.4f%s%s",
+                _reason, self.asset, side, stake, trigger_pm_price, _imb_str, _fav_str,
             )
+            trade.order_id = "DRY_RUN_OB_FILTERED" if _ob_filtered else "DRY_RUN"
+            if _ob_filtered:
+                self._momentum_trade_count -= 1
+                self._filled = False
+        elif time.time() < self._clob_backoff_until:
+            _remaining = self._clob_backoff_until - time.time()
+            log.info("CLOB backoff active %s %s — %.0fs remaining, skipping order", self.asset, side, _remaining)
             trade.order_id = "DRY_RUN"
+            self._filled = False
         else:
             try:
                 presigned = self._presigned.get(token_id)
                 fixed = self.fixed_usdc if self.fixed_usdc is not None else self._position_usdc
-                if presigned is not None and stake <= fixed:
-                    # Fast path: Kelly didn't scale up — use pre-signed order.
-                    # Hot path cost: HMAC headers (~0.3ms) + network POST only.
-                    _, serialized_body, body_dict, pre_usdc = presigned
-                    t_post_start = time.perf_counter()
-                    order = await clob_client.post_preserialized_order_async(
-                        self._http, self._clob, serialized_body, body_dict,
-                        token_id, side, pre_usdc,
-                    )
-                    trade.sign_ms = None  # presigned — no sign cost at trigger time
-                    trade.post_ms = round((time.perf_counter() - t_post_start) * 1000, 1)
-                    stake = pre_usdc
-                    trade.fee_usdc = round(pre_usdc * BUY_FEE_RATE, 4)
-                    trade.fill_usdc = round(pre_usdc + trade.fee_usdc, 4)
-                else:
-                    # Kelly scaled up (or no pre-signed order) — sign fresh at trigger time.
-                    order, trade.sign_ms, trade.post_ms = await clob_client.sign_and_post_async(
-                        self._http, self._clob, token_id, side, stake, price_cap=0.90,
-                    )
+                assert self._http is not None
+                _mom_retry_delay = 2.0
+                order = None
+                for _attempt in range(2):
+                    try:
+                        if presigned is not None and stake <= fixed:
+                            # Fast path: Kelly didn't scale up — use pre-signed order.
+                            # Hot path cost: HMAC headers (~0.3ms) + network POST only.
+                            _, serialized_body, serialized_body_str, body_dict, pre_usdc = presigned
+                            t_post_start = time.perf_counter()
+                            order = await clob_client.post_preserialized_order_async(
+                                self._http, self._clob, serialized_body, serialized_body_str,
+                                body_dict, token_id, side, pre_usdc,
+                            )
+                            trade.sign_ms = None  # presigned — no sign cost at trigger time
+                            trade.post_ms = round((time.perf_counter() - t_post_start) * 1000, 1)
+                            stake = pre_usdc
+                            trade.fee_usdc = round(pre_usdc * BUY_FEE_RATE, 4)
+                            trade.fill_usdc = round(pre_usdc + trade.fee_usdc, 4)
+                        else:
+                            # Kelly scaled up (or no pre-signed order) — sign fresh at trigger time.
+                            order, trade.sign_ms, trade.post_ms = await clob_client.sign_and_post_async(
+                                self._http, self._clob, token_id, side, stake, price_cap=0.90,
+                            )
+                        break
+                    except Exception as _inner_exc:
+                        _exc_str = str(_inner_exc)
+                        if _attempt == 0 and "425" in _exc_str:
+                            log.warning(
+                                "425 service not ready %s %s — retrying in %.0fs",
+                                self.asset, side, _mom_retry_delay,
+                            )
+                            presigned = None
+                            await asyncio.sleep(_mom_retry_delay)
+                            continue
+                        if _attempt == 0 and "400" in _exc_str and presigned is not None:
+                            log.warning(
+                                "400 bad request %s %s (presigned stale?) — retrying with fresh sign",
+                                self.asset, side,
+                            )
+                            presigned = None
+                            continue
+                        raise
+                assert order is not None
 
                 trade.order_ms   = round((time.perf_counter() - t0) * 1000, 1)
                 trade.order_id   = order.order_id
@@ -753,13 +1010,26 @@ class MomentumBuyExecutor:
                 _fmt_ms = lambda v: f"{v:.0f}ms" if v is not None else "—"
                 log.info(
                     "FILLED  %s %s  %.4f shares @ %.4f  ($%.2f incl fee %.4f)"
-                    "  slippage=%+.4f  order=%s  sign=%s post=%s total=%s",
+                    "  slippage=%+.4f  order=%s  total=%s",
                     self.asset, side, trade.fill_size, trade.fill_price,
                     trade.fill_usdc, trade.fee_usdc, trade.slippage, order.order_id[:16],
-                    _fmt_ms(trade.sign_ms), _fmt_ms(trade.post_ms), _fmt_ms(trade.order_ms),
+                    _fmt_ms(trade.order_ms),
                 )
             except Exception as exc:
                 trade.order_ms = round((time.perf_counter() - t0) * 1000, 1)
+                if "425" in str(exc):
+                    _backoff = 30.0
+                    self._clob_backoff_until = time.time() + _backoff
+                    log.warning(
+                        "425 persisted after retry %s %s — CLOB backoff %.0fs",
+                        self.asset, side, _backoff,
+                    )
+                    self._filled = False
+                    self._momentum_trade_count -= 1
+                    self._momentum_last_fire_ts = None
+                    self._momentum_trades.remove(trade)
+                    self._trade = None
+                    return
                 err_str = str(exc).lower()
                 if any(p in err_str for p in _BALANCE_PHRASES):
                     trade.status = "insufficient_balance_disabled"
@@ -777,17 +1047,17 @@ class MomentumBuyExecutor:
                         trade.status     = "fok_killed"
                         trade.order_id   = "FOK_KILLED"
                         self._filled     = False  # allow retry in same window
+                        self._momentum_trade_count  -= 1
                         log.warning("FOK KILLED %s %s  hypothetical fill=%.4f (+%.2f slip)", self.asset, side, trade.fill_price, FOK_SLIPPAGE)
                     else:
                         log.error("Order failed %s %s: %s", self.asset, side, exc)
                         trade.status = "order_failed"
                         # bad token / orderbook gone — don't retry
 
-        self._trade = trade
         await asyncio.to_thread(_write_trade, trade, self._trades_csv)
 
         # Place take-profit sell immediately after fill — sits in book at 0.98
-        if not self.dry_run and trade.status == "open" and trade.fill_size > 0:
+        if trade.status == "open" and trade.fill_size > 0:
             asyncio.create_task(self._take_profit_bg(trade, token_id))
 
     # ── Take-profit sell ──────────────────────────────────────────────────────
@@ -806,7 +1076,6 @@ class MomentumBuyExecutor:
         MIN_SELL_SIZE = 5.0
         sell_size = await asyncio.to_thread(clob_client.get_token_balance, self._clob, token_id)
         if sell_size < MIN_SELL_SIZE:
-            log.info("Take-profit: skipping %s — size %.4f below min %.0f shares", self.asset, sell_size, MIN_SELL_SIZE)
             return
         sell_size = round(sell_size, 4)
 
@@ -900,6 +1169,9 @@ class MomentumBuyExecutor:
             trade.status = "unresolved"
             await asyncio.to_thread(_write_trade, trade, self._trades_csv)
             return
+        
+        # Cache resolved value (used in model resolution too)
+        resolved_up = resolved_up
 
         win = (resolved_up and trade.side.upper() == "UP") or (not resolved_up and trade.side.upper() == "DOWN")
         payout = trade.fill_size if win else 0.0
@@ -913,6 +1185,17 @@ class MomentumBuyExecutor:
         log.info("RESOLVED  %s %s  PnL=$%.4f  %s", self.asset, trade.side, pnl, trade.status.upper())
         await asyncio.to_thread(_write_trade, trade, self._trades_csv)
 
+        # Session loss circuit breaker — only real fills count.
+        if not is_fok and trade.order_id and not trade.order_id.startswith("DRY_RUN") and trade.order_id != "FOK_KILLED":
+            self._session_momentum_pnl += pnl
+            log.info("MOMENTUM session PnL  %s  cumulative=$%.4f", self.asset, self._session_momentum_pnl)
+            if self._session_momentum_pnl <= -SESSION_LOSS_LIMIT and self._momentum_enabled:
+                self._momentum_enabled = False
+                log.warning(
+                    "MOMENTUM LOSS LIMIT HIT  %s  session_pnl=$%.4f  limit=$%.2f — switching to dry run",
+                    self.asset, self._session_momentum_pnl, SESSION_LOSS_LIMIT,
+                )
+
     async def _execute_model_buy(
         self,
         side: str,
@@ -922,13 +1205,44 @@ class MomentumBuyExecutor:
         predicted_win: float,
         elapsed: int,
     ) -> None:
+        if time.time() < self._clob_backoff_until:
+            _remaining = self._clob_backoff_until - time.time()
+            log.info("[MODEL] CLOB backoff active %s %s — %.0fs remaining, skipping order", self.asset, side, _remaining)
+            return
         _trigger_ts = time.perf_counter()
-        paper_run = not self._model_enabled
         model_usdc = self._model_kelly_stake(edge)
+        coin_move  = (self._coin_current or self._coin_open or 0.0) - (self._coin_open or 0.0)
+
+        _ob_snap, _ob_mean_5s, _ob_trend = self._coin_stream.get_ob_metrics()
+
+        # Direction-adjusted favorable imbalance filter
+        _model_fav_imb: float | None = None
+        if _ob_snap is not None:
+            _model_fav_imb = _ob_snap if side.upper() == "UP" else 1.0 - _ob_snap
+        _model_fav_imb_mean: float | None = None
+        if _ob_mean_5s is not None:
+            _model_fav_imb_mean = _ob_mean_5s if side.upper() == "UP" else 1.0 - _ob_mean_5s
+        _model_snap_filtered = (
+            self._model_min_fav_imbalance is not None
+            and _model_fav_imb is not None
+            and _model_fav_imb < self._model_min_fav_imbalance
+        )
+        _model_mean_filtered = (
+            self._model_min_fav_imbalance_mean is not None
+            and _model_fav_imb_mean is not None
+            and _model_fav_imb_mean < self._model_min_fav_imbalance_mean
+        )
+        _model_ob_filtered = _model_snap_filtered or _model_mean_filtered
+        _model_ob_filter_str = ""
+        if _model_ob_filtered:
+            _snap_str = f"snap={_model_fav_imb:.3f}<{self._model_min_fav_imbalance}" if _model_snap_filtered else (f"snap={_model_fav_imb:.3f}" if _model_fav_imb is not None else "snap=n/a")
+            _mean_str = f"  mean={_model_fav_imb_mean:.3f}<{self._model_min_fav_imbalance_mean}" if _model_mean_filtered else (f"  mean={_model_fav_imb_mean:.3f}" if _model_fav_imb_mean is not None else "  mean=n/a")
+            _model_ob_filter_str = f"  {_snap_str}{_mean_str}"
+
+        paper_run = not self._model_enabled or _model_ob_filtered
         fill_price = trigger_ask + SLIPPAGE if paper_run else trigger_ask
         est_size   = round(model_usdc / fill_price, 2) if fill_price > 0 else 0.0
         fee_usdc   = round(model_usdc * BUY_FEE_RATE, 4)
-        coin_move  = (self._coin_current or self._coin_open or 0.0) - (self._coin_open or 0.0)
 
         mtrade = ModelTrade(
             ts=time.time(),
@@ -947,20 +1261,51 @@ class MomentumBuyExecutor:
             coin_move=coin_move,
             window_start_ts=self._window_start,
             window_end_ts=self._window_end,
+            coin_ob_imbalance=round(_ob_snap, 4)    if _ob_snap    is not None else None,
+            coin_ob_imb_5s=round(_ob_mean_5s, 4)   if _ob_mean_5s is not None else None,
+            coin_ob_trend=round(_ob_trend, 4)       if _ob_trend   is not None else None,
         )
 
         if paper_run:
-            mtrade.order_id = "DRY_RUN"
+            mtrade.order_id = "DRY_RUN_OB_FILTERED" if _model_ob_filtered else "DRY_RUN"
             mtrade.slippage = SLIPPAGE
             # sign_ms / post_ms / order_ms intentionally left None — no real order placed
-            log.info("[MODEL] DRY-RUN ENTRY %s %s  predicted=%.1f%%  ask=%.3f  fill=%.3f  edge=%+.3f  elapsed=%ds",
-                     self.asset, side, predicted_win * 100, trigger_ask, fill_price, edge, elapsed)
+            if not self._model_enabled and _model_ob_filtered:
+                _paper_reason = "MODEL DISABLED + OB FILTERED"
+            elif _model_ob_filtered:
+                _paper_reason = "OB FILTERED"
+            else:
+                _paper_reason = "MODEL DISABLED"
+            _fav_str = _model_ob_filter_str if _model_ob_filtered else (f"  snap={_model_fav_imb:.3f}" if _model_fav_imb is not None else "") + (f"  mean={_model_fav_imb_mean:.3f}" if _model_fav_imb_mean is not None else "")
+            log.info("[%s] ENTRY %s %s  predicted=%.1f%%  ask=%.3f  fill=%.3f  edge=%+.3f  elapsed=%ds%s",
+                     _paper_reason, self.asset, side, predicted_win * 100,
+                     trigger_ask, fill_price, edge, elapsed, _fav_str)
+            if _model_ob_filtered:
+                self._model_trade = mtrade
+                await asyncio.to_thread(_write_model_trade, mtrade, self._model_trades_csv)
+                return  # don't count against per-window trade limit
         else:
             try:
-                order, mtrade.sign_ms, mtrade.post_ms = await clob_client.sign_and_post_async(
-                    self._http, self._clob, token_id, side, model_usdc,
-                    price_cap=trigger_ask + self._model_max_slippage,
-                )
+                assert self._http is not None
+                _retry_delay = 2.0
+                order = None
+                for _attempt in range(2):
+                    try:
+                        order, mtrade.sign_ms, mtrade.post_ms = await clob_client.sign_and_post_async(
+                            self._http, self._clob, token_id, side, model_usdc,
+                            price_cap=trigger_ask + self._model_max_slippage,
+                        )
+                        break
+                    except Exception as _inner_exc:
+                        if _attempt == 0 and "425" in str(_inner_exc):
+                            log.warning(
+                                "[MODEL] 425 service not ready %s %s — retrying in %.0fs",
+                                self.asset, side, _retry_delay,
+                            )
+                            await asyncio.sleep(_retry_delay)
+                            continue
+                        raise
+                assert order is not None
                 mtrade.order_ms   = round((time.perf_counter() - _trigger_ts) * 1000, 1)
                 mtrade.order_id   = order.order_id
                 mtrade.fill_price = order.price if order.price > 0 else trigger_ask
@@ -974,6 +1319,15 @@ class MomentumBuyExecutor:
                          mtrade.fill_price, mtrade.fill_usdc, edge, elapsed, mtrade.order_ms)
             except Exception as exc:
                 mtrade.order_ms = round((time.perf_counter() - _trigger_ts) * 1000, 1)
+                if "425" in str(exc):
+                    _backoff = 30.0
+                    self._clob_backoff_until = time.time() + _backoff
+                    log.warning(
+                        "[MODEL] 425 persisted after retry %s %s — CLOB backoff %.0fs",
+                        self.asset, side, _backoff,
+                    )
+                    self._model_last_fire_ts = None
+                    return  # don't record as a trade or count against limit
                 log.error("[MODEL] Order failed %s %s: %s", self.asset, side, exc)
                 mtrade.status = "order_failed"
                 err_str = str(exc).lower()
@@ -992,9 +1346,7 @@ class MomentumBuyExecutor:
                         mtrade.slippage   = FOK_SLIPPAGE
                         mtrade.status     = "fok_killed"
                         mtrade.order_id   = "FOK_KILLED"
-                        self._model_last_fire_ts = None  # allow retry this window
                         log.warning("[MODEL] FOK KILLED %s %s  hypothetical fill=%.4f (+%.2f slip)", self.asset, side, mtrade.fill_price, FOK_SLIPPAGE)
-                        self._model_trades.append(mtrade)
                         self._model_trade = mtrade
                         await asyncio.to_thread(_write_model_trade, mtrade, self._model_trades_csv)
                         return  # don't count against per-window trade limit
@@ -1057,6 +1409,17 @@ class MomentumBuyExecutor:
                  trade.status.upper())
         await asyncio.to_thread(_write_model_trade, trade, self._model_trades_csv)
 
+        # Session loss circuit breaker — only real fills count.
+        if not is_fok and trade.order_id and not trade.order_id.startswith("DRY_RUN") and trade.order_id != "FOK_KILLED":
+            self._session_model_pnl += pnl
+            log.info("[MODEL] session PnL  %s  cumulative=$%.4f", self.asset, self._session_model_pnl)
+            if self._session_model_pnl <= -SESSION_LOSS_LIMIT and self._model_enabled:
+                self._model_enabled = False
+                log.warning(
+                    "[MODEL] LOSS LIMIT HIT  %s  session_pnl=$%.4f  limit=$%.2f — switching to dry run",
+                    self.asset, self._session_model_pnl, SESSION_LOSS_LIMIT,
+                )
+
     # ── Binance REST fallback (window open price only) ────────────────────────
 
     async def _fetch_coin_price_at(self, ts: int) -> float | None:
@@ -1094,14 +1457,15 @@ class MomentumBuyExecutor:
         if p0 is None or not sigma:
             return {}
 
+        # Fast lookup: history is in chrono order, search from the end (most recent prices)
         def _px_at(offset: float) -> float | None:
             """Last price at or before now-offset seconds (matches 1s candle close lookback)."""
             target = now - offset
-            result = None
-            for ts, px in self._price_history:
+            # Iterate backwards from end — prices are monotonically increasing
+            for ts, px in reversed(self._price_history):
                 if ts <= target:
-                    result = px
-            return result
+                    return px
+            return None
 
         p2  = _px_at(2)
         p4  = _px_at(4)
@@ -1142,47 +1506,126 @@ class MomentumBuyExecutor:
         elapsed_second = int(now - self._window_start)
         vol_10s_log    = self._coin_stream.get_vol_10s_log()
 
-        _hour_utc = datetime.fromtimestamp(self._window_start, tz=timezone.utc).hour
-        _hour_rad = _hour_utc * (2 * 3.141592653589793 / 24)
+        # dist_low_30 / dist_high_30: distance from 30s rolling low/high (σ-norm)
+        dist_low_30:  float | None = None
+        dist_high_30: float | None = None
+        cutoff_30 = now - 30.0
+        prices_30 = [px for ts, px in self._price_history if ts >= cutoff_30]
+        if len(prices_30) >= 10:
+            _lo = min(prices_30)
+            _hi = max(prices_30)
+            dist_low_30  = (p0 - _lo) / sigma   # ≥0: distance above rolling low
+            dist_high_30 = (p0 - _hi) / sigma   # ≤0: distance below rolling high
+
+        # Interaction features
+        move_x_elapsed = move_sigmas * elapsed_second
+        move_x_vol     = (move_sigmas * vol_10s_log) if vol_10s_log is not None else None
+        move_x_elapsed_x_vel10s: float | None = (
+            move_x_elapsed * vel_10s if vel_10s is not None else None
+        )
+        move_sigmas_x_acc10s: float | None = (
+            move_sigmas * acc_10s if acc_10s is not None else None
+        )
+
+        # PM orderbook imbalance features for the market component of the ensemble
+        # Use cached books from status loop if available
+        up_imbalance: float | None = None
+        dn_imbalance: float | None = None
+        if self._market is not None:
+            up_book = self._cached_up_book
+            dn_book = self._cached_dn_book
+            if up_book is not None:
+                _up_total = up_book.bid_volume + up_book.ask_volume
+                if _up_total > 0:
+                    up_imbalance = up_book.bid_volume / _up_total
+            if dn_book is not None:
+                _dn_total = dn_book.bid_volume + dn_book.ask_volume
+                if _dn_total > 0:
+                    dn_imbalance = dn_book.bid_volume / _dn_total
 
         feats: dict[str, float | None] = {
             "move_sigmas":    _r(move_sigmas, 4),
             "elapsed_second": elapsed_second,
-            "hour_sin":       round(math.sin(_hour_rad), 8),
-            "hour_cos":       round(math.cos(_hour_rad), 8),
-            "vel_2s":         _r(vel_2s),
+            "hour_sin":       self._cached_hour_sin,
+            "hour_cos":       self._cached_hour_cos,
             "vel_5s":         _r(vel_5s),
-            "vel_10s":        _r(vel_10s),
+            "dist_low_30":    _r(dist_low_30),
+            "dist_high_30":   _r(dist_high_30),
+            "move_x_elapsed": _r(move_x_elapsed),
+            "move_x_vol":     _r(move_x_vol),
             "acc_4s":         _r(acc_4s),
+            "move_x_elapsed_x_vel10s": _r(move_x_elapsed_x_vel10s),
+            "move_x_acc10s":           _r(move_sigmas_x_acc10s),
+            # Extended features
+            "vel_2s":         _r(vel_2s),
+            "vel_10s":        _r(vel_10s),
             "acc_10s":        _r(acc_10s),
             "vel_ratio":      _r(vel_ratio),
             "vel_decay":      _r(vel_decay),
             "vol_10s_log":    _r(vol_10s_log),
-            "move_x_elapsed": _r(move_sigmas * elapsed_second),
-            "move_x_vol":     _r(move_sigmas * vol_10s_log) if vol_10s_log is not None else None,
+            # Market features (PM orderbook) — used by the market component of the ensemble
+            "up_imbalance":   _r(up_imbalance, 4),
+            "dn_imbalance":   _r(dn_imbalance, 4),
         }
 
         return feats
 
     def _run_inference(self, features: dict) -> float | None:
-        """Synchronous sklearn inference — call via asyncio.to_thread."""
+        """Synchronous sklearn inference — safe to call directly in the event loop (~0.3ms)."""
         if self._model is None or not features:
             return None
         try:
-            feat_order = self._model["features"]
-            # Preserve training feature names to avoid sklearn/lightgbm name warnings.
-            X = pd.DataFrame(
-                [[features.get(f) for f in feat_order]],
-                columns=feat_order,
-                dtype=float,
-            )
-            return float(self._model["pipe"].predict_proba(X)[0, 1])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                warnings.filterwarnings("ignore", message=".*does not have valid feature names.*")
+                
+                t0 = time.perf_counter()
+                model_type = self._model.get("type", "logreg")
+                if model_type == "ensemble_lgb_mkt":
+                    # Run LGB on coin features
+                    lgb_feats = self._model["lgb_features"]
+                    X_lgb = pd.DataFrame([[features.get(f) for f in lgb_feats]], columns=lgb_feats)
+                    p_lgb = float(self._model["lgb_pipe"].predict_proba(X_lgb)[0, 1])
+                    # Run market model on coin + PM orderbook features
+                    mkt_feats = self._model["mkt_features"]
+                    X_mkt = pd.DataFrame([[features.get(f) for f in mkt_feats]], columns=mkt_feats)
+                    p_mkt = float(self._model["mkt_pipe"].predict_proba(X_mkt)[0, 1])
+                    result = 0.5 * p_lgb + 0.5 * p_mkt
+                    log.debug(
+                        "inference ensemble  lgb=%.4f  mkt=%.4f  blend=%.4f  %.2fms",
+                        p_lgb, p_mkt, result, (time.perf_counter() - t0) * 1000,
+                    )
+                    return result
+                else:
+                    # Legacy single-pipeline model (logreg or lgb-only)
+                    feat_order = self._model["features"]
+                    X = np.array([[features.get(f) for f in feat_order]], dtype=float)
+                    result = float(self._model["pipe"].predict_proba(X)[0, 1])
+                    log.debug(
+                        "inference %s  prob=%.4f  %.2fms",
+                        model_type, result, (time.perf_counter() - t0) * 1000,
+                    )
+                    return result
         except Exception as exc:
             log.warning("Inference failed: %s", exc)
             return None
 
     async def _status_loop(self) -> None:
+        _last_inference_ts: float = 0.0
+        _last_write_ts:     float = 0.0
+        _last_keepalive_ts: float = 0.0
+        _cached_predicted_win: float | None = None
         while True:
+            # Keep the HTTP/2 connection to the CLOB warm so order POSTs don't
+            # pay a TLS re-handshake. Fire a lightweight GET every 60 seconds.
+            now = time.time()
+            if self._http is not None and now - _last_keepalive_ts >= 60.0:
+                try:
+                    await self._http.get(f"{self._clob.host}/time", timeout=3.0)
+                    _last_keepalive_ts = now
+                except Exception:
+                    pass  # stale connection — next order will reconnect
+
             market = self._market
             up_price = dn_price = up_ask = dn_ask = None
             if market:
@@ -1191,93 +1634,92 @@ class MomentumBuyExecutor:
                 up_ask   = self._ws.get_ask(market.up_token.token_id)
                 dn_ask   = self._ws.get_ask(market.down_token.token_id)
 
-            features      = self._compute_features()
-            predicted_win: float | None = None
-            inference_ms: float | None = None
-            try:
-                t0 = time.perf_counter()
-                predicted_win = await asyncio.to_thread(self._run_inference, features)
-                inference_ms = (time.perf_counter() - t0) * 1000.0
-                # if self._model is not None and features:
-                #     log.info(
-                #         "Model inference latency: %.2f ms | predicted_win=%s",
-                #         inference_ms,
-                #         f"{predicted_win:.4f}" if predicted_win is not None else "None",
-                #     )
-            except Exception as exc:
-                log.warning("Inference failed: %s", exc)
+            # Cache time.time() once per iteration
+            t_now = time.time()
+            
+            # Update cached books (will be used by feature computation and order execution)
+            if market is not None:
+                self._cached_up_book = self._ws.get_book(market.up_token.token_id)
+                self._cached_dn_book = self._ws.get_book(market.down_token.token_id)
+            
+            features = self._compute_features()
+
+            # Run inference at most every 0.5s — spawning a thread + building a
+            # DataFrame on every tick is the main CPU cost on slower machines.
+            predicted_win: float | None = _cached_predicted_win
+            if t_now - _last_inference_ts >= 0.5:
+                _cached_predicted_win = self._run_inference(features)
+                predicted_win      = _cached_predicted_win
+                _last_inference_ts = t_now
 
             # Model trade: fire when edge >= threshold
             # once-per-window (cooldown=0) or every N seconds (cooldown=N)
-            try:
-                _cd = self._model_multi_trade_cooldown
-                _model_gate = (
-                    self._model_last_fire_ts is None
-                    if _cd == 0
-                    else (self._model_last_fire_ts is None or
-                          time.time() - self._model_last_fire_ts >= _cd)
-                )
-                # Check max trades per window limit
-                _max_trades = self._model_max_trades_per_window
-                _trades_limit_ok = (_max_trades == 0 or len(self._model_trades) < _max_trades)
-
-                if (
-                    predicted_win is not None
-                    and _model_gate
-                    and _trades_limit_ok
-                    and market is not None
-                    and self._coin_open is not None
-                    and self._coin_current is not None
-                ):
-                    up_ask_now = self._ws.get_ask(market.up_token.token_id)
-                    dn_ask_now = self._ws.get_ask(market.down_token.token_id)
-                    up_edge = (predicted_win - up_ask_now) if up_ask_now is not None else None
-                    dn_edge = ((1.0 - predicted_win) - dn_ask_now) if dn_ask_now is not None else None
-
-                    fire_side: str | None = None
-                    fire_ask:  float | None = None
-                    fire_edge: float | None = None
-                    fire_token: str | None = None
-
-                    elapsed_now = int(time.time() - self._window_start)
-                    in_model_window = (
-                        self._model_window_start <= elapsed_now <= self._model_window_end
-                    )
-
-                    if in_model_window and up_edge is not None and up_edge >= self._MODEL_EDGE_THRESHOLD:
-                        if dn_edge is None or up_edge >= dn_edge:
-                            fire_side, fire_ask, fire_edge, fire_token = (
-                                "UP", up_ask_now, up_edge, market.up_token.token_id
-                            )
-                    if in_model_window and dn_edge is not None and dn_edge >= self._MODEL_EDGE_THRESHOLD:
-                        if fire_side is None or dn_edge > (fire_edge or 0):
-                            fire_side, fire_ask, fire_edge, fire_token = (
-                                "DOWN", dn_ask_now, dn_edge, market.down_token.token_id
-                            )
-
-                    if (
-                        fire_side is not None and fire_ask is not None
-                        and fire_token is not None and fire_edge is not None
-                    ):
-                        self._model_last_fire_ts = time.time()
-                        asyncio.create_task(self._execute_model_buy(
-                            side=fire_side,
-                            token_id=fire_token,
-                            trigger_ask=fire_ask,
-                            edge=fire_edge,
-                            predicted_win=predicted_win,
-                            elapsed=int(time.time() - self._window_start),
-                        ))
-            except Exception as exc:
-                log.warning("Model fire logic failed: %s", exc)
+            if (
+                predicted_win is not None
+                and market is not None
+                and self._coin_open is not None
+                and self._coin_current is not None
+            ):
+                try:
+                    # Check gate conditions
+                    _cd = self._model_multi_trade_cooldown
+                    if _cd == 0:
+                        _model_gate = self._model_last_fire_ts is None
+                    else:
+                        _model_gate = (self._model_last_fire_ts is None or
+                                      t_now - self._model_last_fire_ts >= _cd)
+                    
+                    _max_trades = self._model_max_trades_per_window
+                    _trades_limit_ok = (_max_trades == 0 or len(self._model_trades) < _max_trades)
+                    
+                    if _model_gate and _trades_limit_ok:
+                        # Get asks once
+                        up_ask_now = self._ws.get_ask(market.up_token.token_id)
+                        dn_ask_now = self._ws.get_ask(market.down_token.token_id)
+                        
+                        # Compute edges
+                        up_edge = (predicted_win - up_ask_now) if up_ask_now is not None else None
+                        dn_edge = ((1.0 - predicted_win) - dn_ask_now) if dn_ask_now is not None else None
+                        
+                        # Check window timing
+                        elapsed_now = int(t_now - self._window_start)
+                        in_model_window = (self._model_window_start <= elapsed_now <= self._model_window_end)
+                        
+                        if in_model_window:
+                            # Pick the best side (highest edge)
+                            best_side = None
+                            best_ask = None
+                            best_edge = None
+                            best_token = None
+                            best_edge_val = -1.0
+                            
+                            if up_edge is not None and up_edge >= self._MODEL_EDGE_THRESHOLD and up_edge > best_edge_val:
+                                best_side, best_ask, best_edge, best_token = ("UP", up_ask_now, up_edge, market.up_token.token_id)
+                                best_edge_val = up_edge
+                            if dn_edge is not None and dn_edge >= self._MODEL_EDGE_THRESHOLD and dn_edge > best_edge_val:
+                                best_side, best_ask, best_edge, best_token = ("DOWN", dn_ask_now, dn_edge, market.down_token.token_id)
+                            
+                            if best_side is not None:
+                                self._model_last_fire_ts = t_now
+                                asyncio.create_task(self._execute_model_buy(
+                                    side=best_side,
+                                    token_id=best_token,
+                                    trigger_ask=best_ask,
+                                    edge=best_edge,
+                                    predicted_win=predicted_win,
+                                    elapsed=elapsed_now,
+                                ))
+                except Exception as exc:
+                    log.warning("Model fire logic failed: %s", exc)
 
             try:
+                _coin_ob_imb = self._coin_stream.get_coin_ob_imbalance()
                 payload = {
-                    "updated_at":     time.time(),
+                    "updated_at":     t_now,
                     "window_start":   self._window_start,
                     "window_end":     self._window_end,
-                    "elapsed_secs":   round(time.time() - self._window_start),
-                    "remaining_secs": round(self._window_end - time.time()),
+                    "elapsed_secs":   round(t_now - self._window_start),
+                    "remaining_secs": round(self._window_end - t_now),
                     "asset":          self.asset,
                     "sigma_value":    self.sigma_value,
                     "sigma_entry":    self.sigma_entry,
@@ -1291,9 +1733,14 @@ class MomentumBuyExecutor:
                     "down_price":     dn_price,
                     "up_ask":         up_ask,
                     "down_ask":       dn_ask,
-                    "filled":         self._filled,
-                    "trade":          asdict(self._trade) if self._trade else None,
-                    "dry_run":        self.dry_run,
+                    "coin_bid_vol":   self._coin_stream._coin_bid_vol or None,
+                    "coin_ask_vol":   self._coin_stream._coin_ask_vol or None,
+                    "coin_ob_imbalance": _coin_ob_imb,
+                    "filled":                  self._filled,
+                    "momentum_trade_count":    self._momentum_trade_count,
+                    "trade":                   asdict(self._trade) if self._trade else None,
+                    "momentum_trades":         [asdict(t) for t in self._momentum_trades],
+
                     "features":       {k: (float(v) if v is not None else None) for k, v in features.items()},
                     "predicted_win":        predicted_win,
                     "MODEL_EDGE_THRESHOLD": self._MODEL_EDGE_THRESHOLD,
@@ -1303,9 +1750,11 @@ class MomentumBuyExecutor:
                     "model_enabled":        self._model_enabled,
                     "price_history":        [px for _, px in self._price_history],
                 }
-                await asyncio.to_thread(_write_status, payload, self._status_json)
+                if t_now - _last_write_ts >= 2.0:
+                    await asyncio.to_thread(_write_status, payload, self._status_json)
+                    _last_write_ts = t_now
             except Exception as exc:
                 log.warning("Status write failed: %s", exc, exc_info=True)
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.5)
 
 

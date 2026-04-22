@@ -14,10 +14,22 @@ python scripts/fetch_coin_prices.py
 
 streamlit run scripts/live_dashboard.py
 
-python scripts/slippage_report.py
-python scripts/threshold_edge.py
-python scripts/threshold_edge.py --assets BTC DOGE ETH SOL --no-ewma
+python scripts/threshold_edge.py --assets BTC DOGE ETH SOL BNB XRP
 
-python scripts/train_model.py --assets BTC
+python scripts/train_model.py --assets BTC DOGE ETH SOL BNB XRP
 
 python scripts/regime.py
+
+python scripts/live_momentum_buy.py --asset BTC  
+
+python scripts/run_all.py --yes 
+
+python scripts/threshold_edge.py --ewma-only --update-config
+
+python scripts/train_model.py \
+  --ewma-lambda 0.90 \
+  --no-save
+
+  python scripts/threshold_edge.py --assets BTC DOGE ETH SOL BNB XRP --ewma-lambda .90
+
+  python scripts/train_nn.py --no-save
