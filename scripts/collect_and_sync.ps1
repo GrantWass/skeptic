@@ -1,20 +1,20 @@
 <#
 .SYNOPSIS
-    Collect Polymarket price data all day and sync to GitHub every 30 minutes.
+    Collect Polymarket price data all day and sync to AWS S3 every 30 minutes.
 
 .DESCRIPTION
     1. Runs collect_prices.py continuously (auto-restarts on crash).
-    2. Every 30 minutes commits and pushes data/prices/
-       to GitHub via Git LFS.
-    3. Keeps your PC awake using the Windows SetThreadExecutionState API.
-    4. On Ctrl+C a final sync is always performed before exit.
+    2. Runs collect_orderbook.py continuously (auto-restarts on crash).
+    3. Every 30 minutes uploads today's data/prices/ and data/orderbook/ to S3
+       via scripts/sync_to_s3.py (--today-only for speed).
+    4. On Ctrl+C a full S3 sync is performed before exit.
+    5. Keeps your PC awake using the Windows SetThreadExecutionState API.
 
     PREREQUISITES
     -------------
-    • Git for Windows   https://git-scm.com/download/win
-    • Git LFS           https://git-lfs.com  (or: winget install GitHub.GitLFS)
     • Python 3 with the project's .venv created, OR Python 3 on PATH
-    • Git remote configured and authenticated (HTTPS credential manager or SSH key)
+    • boto3 installed:  pip install boto3
+    • S3_BUCKET (and optionally S3_PREFIX) set in your .env file
 
     FIRST RUN
     ---------
@@ -28,22 +28,18 @@
 
     HOW TO STOP
     -----------
-    Press Ctrl+C once. The script will stop the collector, do a final git push,
+    Press Ctrl+C once. The script will stop the collectors, do a final S3 sync,
     then exit cleanly.
 
 .PARAMETER SyncIntervalMinutes
-    How often (minutes) to commit and push new data. Default: 30.
+    How often (minutes) to upload new data to S3. Default: 30.
 
 .PARAMETER CollectArgs
     Extra arguments forwarded to collect_prices.py, e.g. "--assets BTC ETH --interval 2".
-
-.PARAMETER Branch
-    Git branch/ref to push to. Default: HEAD (the currently checked-out branch).
 #>
 param(
     [int]   $SyncIntervalMinutes = 30,
-    [string]$CollectArgs         = "",
-    [string]$Branch              = "HEAD"
+    [string]$CollectArgs         = ""
 )
 
 Set-StrictMode -Version Latest
@@ -52,9 +48,11 @@ $ErrorActionPreference = "Stop"
 # ─────────────────────────────────────────────────────────────────────────────
 # Paths
 # ─────────────────────────────────────────────────────────────────────────────
-$ROOT    = Split-Path -Parent $PSScriptRoot
-$COLLECT = Join-Path $PSScriptRoot "collect_prices.py"
-$LOG     = Join-Path $ROOT "data\collect_and_sync.log"
+$ROOT      = Split-Path -Parent $PSScriptRoot
+$COLLECT   = Join-Path $PSScriptRoot "collect_prices.py"
+$ORDERBOOK = Join-Path $PSScriptRoot "collect_orderbook.py"
+$SYNC_S3   = Join-Path $PSScriptRoot "sync_to_s3.py"
+$LOG       = Join-Path $ROOT "data\collect_and_sync.log"
 
 New-Item -ItemType Directory -Force -Path "$ROOT\data" | Out-Null
 Set-Content $LOG ""   # reset log on each run
@@ -88,7 +86,7 @@ Log "Sleep prevention active (SetThreadExecutionState)."
 # Find Python 3  (prefers .venv)
 # ─────────────────────────────────────────────────────────────────────────────
 function Find-Python {
-      foreach ($cmd in "python", "python3") {
+    foreach ($cmd in "python", "python3") {
         try {
             if ((& $cmd --version 2>&1) -match "Python 3") { return $cmd }
         } catch {}
@@ -96,7 +94,6 @@ function Find-Python {
     return $null
 }
 
-# Prefer the repo .venv explicitly, fall back to system python if needed
 $venvPython = Join-Path $ROOT ".venv\Scripts\python.exe"
 if (Test-Path $venvPython) {
     $PY = $venvPython
@@ -110,98 +107,36 @@ if (-not $PY) {
 }
 Log "Python: $PY"
 
-# Helper to run git commands with redirected output to avoid PowerShell native-command exceptions.
-function Run-Git([string[]]$GitArgs) {
-    $tmpOut = [System.IO.Path]::GetTempFileName()
-    $tmpErr = [System.IO.Path]::GetTempFileName()
-    try {
-        $p = Start-Process -FilePath git -ArgumentList $GitArgs -WorkingDirectory $ROOT -NoNewWindow -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr -PassThru -Wait
-
-        $out = (Get-Content $tmpOut -Raw) -split "`r?`n"
-        $err = (Get-Content $tmpErr -Raw) -split "`r?`n"
-
-        foreach ($line in $out) { if ($line -ne '') { Log "git: $line" } }
-        foreach ($line in $err) { if ($line -ne '') { Log "git: $line" } }
-
-        return $p.ExitCode
-    } finally {
-        Remove-Item -ErrorAction SilentlyContinue $tmpOut, $tmpErr
-    }
-}
-
 # ─────────────────────────────────────────────────────────────────────────────
-# One-time Git LFS initialisation (runs fast on subsequent calls)
+# S3 sync — uploads data/prices/ and data/orderbook/ to S3
+# --today-only on periodic syncs (fast); full sync on exit
 # ─────────────────────────────────────────────────────────────────────────────
-function Initialize-GitLFS {
-    $lfs = Get-Command git-lfs -ErrorAction SilentlyContinue
-    if (-not $lfs) {
-        Log "WARNING: git-lfs not found. Install from https://git-lfs.com and re-run."
-        Log "         Data will still be pushed but WITHOUT LFS (CSV files inline in git)."
-        return
-    }
-
-    Push-Location $ROOT
+function Sync-ToS3([string]$label, [switch]$TodayOnly) {
+    Log "=== S3 sync ($label) ==="
     try {
-        git lfs install --local 2>&1 | Out-Null
-        git lfs track "data/prices/*.csv" 2>&1 | Out-Null
+        $syncArgs = @($SYNC_S3, "--dirs", "prices", "orderbook")
+        if ($TodayOnly) { $syncArgs += "--today-only" }
 
-        # Commit .gitattributes if it changed
-        $dirty = (git status --porcelain ".gitattributes" 2>&1) -ne ""
-        if ($dirty) {
-            git add ".gitattributes" | Out-Null
-            # use Run-Git to capture/log output safely
-            $code = Run-Git @('commit','-m','lfs')
-            if ($code -ne 0) { Log "Git commit returned exit code $code" }
-            $code = Run-Git @('push','-u','origin',$Branch)
-            if ($code -ne 0) { Log "Git push returned exit code $code" }
-            Log "Git LFS .gitattributes committed and pushed."
+        $p = Start-Process `
+            -FilePath         $PY `
+            -ArgumentList     $syncArgs `
+            -WorkingDirectory $ROOT `
+            -NoNewWindow `
+            -PassThru `
+            -Wait
+
+        if ($p.ExitCode -eq 0) {
+            Log "S3 sync complete."
         } else {
-            Log "Git LFS already configured."
-        }
-    } finally {
-        Pop-Location
-    }
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Commit and push new data
-# ─────────────────────────────────────────────────────────────────────────────
-function Sync-Data([string]$label) {
-    Push-Location $ROOT
-    try {
-        # Always stage (add) all CSVs in data/prices/ before checking for changes
-        if (Test-Path "data\prices") {
-            Run-Git @('add','-f','data/prices/*.csv') | Out-Null
-        }
-
-        $changed = git diff --cached --name-only 2>&1
-        $changedFiles = @($changed | Where-Object { $_ -and $_.Trim() -ne "" })
-        if ($changedFiles.Count -gt 0) {    
-            $commitCode = Run-Git @('commit','-m','data')
-            if ($commitCode -eq 0) {
-                $pushCode = Run-Git @('push','-u','origin',$Branch)
-                if ($pushCode -eq 0) {
-                    Log "Pushed $($changedFiles.Count) file(s) to GitHub."
-                } else {
-                    Log "Git push failed (exit code $pushCode)."
-                }
-            } else {
-                Log "Git commit failed (exit code $commitCode)."
-            }
-        } else {
-            Log "Sync: no new data to commit."
+            Log "WARNING: sync_to_s3.py exited with code $($p.ExitCode)."
         }
     } catch {
-        Log "Sync error: $_"
-    } finally {
-        Pop-Location
+        Log "ERROR during S3 sync: $_"
     }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Launch collect_prices.py as a child process
-# Output goes directly to this console window (no extra disk writes).
-# PYTHONUNBUFFERED=1 ensures you see log lines in real time.
 # ─────────────────────────────────────────────────────────────────────────────
 function Start-Collector {
     $env:PYTHONUNBUFFERED = "1"
@@ -216,24 +151,34 @@ function Start-Collector {
         -PassThru
 }
 
+function Start-OrderbookCollector {
+    $env:PYTHONUNBUFFERED = "1"
+    $argList = @($ORDERBOOK, "--interval", "0.25")
+
+    return Start-Process `
+        -FilePath         $PY `
+        -ArgumentList     $argList `
+        -WorkingDirectory $ROOT `
+        -NoNewWindow `
+        -PassThru
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main loop
 # ─────────────────────────────────────────────────────────────────────────────
 Log "=== collect_and_sync starting ==="
 Log "Sync interval : every $SyncIntervalMinutes minute(s)"
-Log "Push target   : $Branch"
-Log "Press Ctrl+C to stop (a final sync will run automatically)."
-
-Initialize-GitLFS
+Log "Press Ctrl+C to stop (a final S3 sync will run automatically)."
 
 $proc        = $null
+$obProc      = $null
 $restarts    = 0
 $maxRestarts = 100
 $lastSync    = Get-Date   # start the clock; first push after $SyncIntervalMinutes
 
 try {
     while ($restarts -lt $maxRestarts) {
-        # ── (Re)start the Python collector if it isn't running ────────────────
+        # ── (Re)start the price collector if it isn't running ─────────────────
         if ($null -eq $proc -or $proc.HasExited) {
             if ($null -ne $proc) {
                 $exitCode = $proc.ExitCode
@@ -251,24 +196,38 @@ try {
             Log "Collector running (PID $($proc.Id))."
         }
 
-        # ── Periodic git sync ─────────────────────────────────────────────────
+        # ── (Re)start the orderbook collector if it isn't running ─────────────
+        if ($null -eq $obProc -or $obProc.HasExited) {
+            if ($null -ne $obProc) {
+                Log "Orderbook collector exited (code $($obProc.ExitCode)). Restarting in 5 s..."
+                Start-Sleep -Seconds 5
+            } else {
+                Log "Launching orderbook collector..."
+            }
+            $obProc = Start-OrderbookCollector
+            Log "Orderbook collector running (PID $($obProc.Id))."
+        }
+
+        # ── Periodic S3 sync (today's files only — fast) ─────────────────────
         if (((Get-Date) - $lastSync).TotalMinutes -ge $SyncIntervalMinutes) {
-            Log "=== Scheduled sync ==="
-            Sync-Data "auto-sync"
+            Sync-ToS3 "auto-sync" -TodayOnly
             $lastSync = Get-Date
         }
 
         Start-Sleep -Seconds 15
     }
 } finally {
-    # ── Cleanup: stop the collector then do one last push ─────────────────────
+    # ── Cleanup: stop both collectors then do a full S3 sync ──────────────────
     if ($null -ne $proc -and -not $proc.HasExited) {
         Log "Stopping collector (PID $($proc.Id))..."
         try { $proc.Kill(); $proc.WaitForExit(5000) | Out-Null } catch {}
     }
+    if ($null -ne $obProc -and -not $obProc.HasExited) {
+        Log "Stopping orderbook collector (PID $($obProc.Id))..."
+        try { $obProc.Kill(); $obProc.WaitForExit(5000) | Out-Null } catch {}
+    }
 
-    Log "=== Final sync ==="
-    Sync-Data "final-sync"
+    Sync-ToS3 "final-sync"   # full sync on exit (catches any missed files)
 
     # Allow Windows to sleep again
     [WakePC]::SetThreadExecutionState([WakePC]::ES_CONTINUOUS) | Out-Null

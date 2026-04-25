@@ -24,8 +24,9 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import httpx
+import pandas as pd
 
-from skeptic import config
+from skeptic import config, storage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%M:%S")
 log = logging.getLogger(__name__)
@@ -47,24 +48,25 @@ OUTPUT_DIR  = os.path.join("data", "coin_prices")
 
 def _get_price_time_range(prices_dir: str) -> tuple[int, int]:
     """Scan price CSV files to find the overall min/max timestamp."""
-    csv_files = sorted(Path(prices_dir).glob("prices_*.csv"))
+    csv_files = storage.list_csv_paths(prices_dir, "prices_*.csv")
     if not csv_files:
         raise FileNotFoundError(f"No prices_*.csv files found in {prices_dir}")
 
     ts_min = float("inf")
     ts_max = float("-inf")
     for f in csv_files:
-        with open(f, newline="") as fh:
-            reader = csv.DictReader(fh)
-            for row in reader:
-                try:
-                    ts = int(row["ts"])
-                    if ts < ts_min:
-                        ts_min = ts
-                    if ts > ts_max:
-                        ts_max = ts
-                except (KeyError, ValueError):
-                    continue
+        df = storage.read_csv(f, usecols=["ts"])
+        if df.empty:
+            continue
+        ts_col = pd.to_numeric(df["ts"], errors="coerce").dropna()
+        if ts_col.empty:
+            continue
+        file_min = int(ts_col.min())
+        file_max = int(ts_col.max())
+        if file_min < ts_min:
+            ts_min = file_min
+        if file_max > ts_max:
+            ts_max = file_max
     if ts_min == float("inf"):
         raise ValueError("No valid timestamps found in price CSV files")
     return int(ts_min), int(ts_max)
@@ -269,7 +271,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fetch 1s Binance klines for Polymarket assets")
     p.add_argument("--assets", nargs="+", default=list(ASSET_TO_SYMBOL.keys()),
                    help="Assets to fetch (default: all configured)")
-    p.add_argument("--prices-dir", default="data/prices",
+    p.add_argument("--prices-dir", default=storage.default_data_location("prices", "data/prices"),
                    help="Directory of prices_*.csv files used to infer time range")
     p.add_argument("--start", type=int, default=None,
                    help="Override start Unix timestamp (seconds)")
@@ -331,3 +333,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

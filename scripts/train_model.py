@@ -35,6 +35,8 @@ from sklearn.metrics import brier_score_loss, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from skeptic import storage
+
 try:
     import xgboost as xgb
     _HAS_XGB = True
@@ -130,19 +132,19 @@ from skeptic.models.calibration import PlattScaledModel  # noqa: F401 — re-exp
 
 def load_pm_windows(prices_dir: str, asset: str) -> pd.DataFrame:
     """Load all prices_*.csv files, filter to asset. Returns ts, window_ts, up_ask, dn_ask, and orderbook cols."""
-    files = sorted(Path(prices_dir).glob("prices_*.csv"))
+    files = storage.list_csv_paths(prices_dir, "prices_*.csv")
     if not files:
         raise FileNotFoundError(f"No prices_*.csv in {prices_dir}")
     frames = []
     _COLS = ["ts", "window_ts", "asset", "up_ask", "dn_ask", "up_imbalance", "dn_imbalance"]
     for f in files:
         try:
-            df = pd.read_csv(f, usecols=_COLS)
+            df = storage.read_csv(f, usecols=_COLS)
         except Exception:
             try:
-                df = pd.read_csv(f, usecols=_COLS, engine="python")
+                df = storage.read_csv(f, usecols=_COLS, engine="python")
             except Exception as e2:
-                log.warning("Skipping corrupt prices file %s: %s", f.name, e2)
+                log.warning("Skipping corrupt prices file %s: %s", Path(f).name, e2)
                 continue
         frames.append(df[df["asset"] == asset])
     out = pd.concat(frames, ignore_index=True)
@@ -158,10 +160,10 @@ def load_coin_series(coin_dir: str, asset: str) -> tuple[pd.Series | None, pd.Se
         log.warning("%s: no symbol mapping", asset)
         return None, None
     path = os.path.join(coin_dir, f"{symbol}_1s.csv")
-    if not os.path.exists(path):
+    if not storage.path_exists(path):
         log.warning("%s: coin file missing: %s", asset, path)
         return None, None
-    df = pd.read_csv(path, usecols=["ts", "close", "volume"])
+    df = storage.read_csv(path, usecols=["ts", "close", "volume"])
     if df.empty:
         log.warning("%s: coin file is empty", asset)
         return None, None
@@ -2833,9 +2835,9 @@ def build_report(results: list[dict], pm_lookup: dict, generated_at: str,
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train per-asset logistic regression for P(resolved_up)")
-    p.add_argument("--prices-dir", default="data/prices",
+    p.add_argument("--prices-dir", default=storage.default_data_location("prices", "data/prices"),
                    help="Directory containing prices_*.csv (default: %(default)s)")
-    p.add_argument("--coin-dir",   default="data/coin_prices",
+    p.add_argument("--coin-dir",   default=storage.default_data_location("coin_prices", "data/coin_prices"),
                    help="Directory containing {SYMBOL}_1s.csv (default: %(default)s)")
     p.add_argument("--out-report", default="data/reports/model_report.md",
                    help="Output markdown report (default: %(default)s)")
@@ -3153,3 +3155,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

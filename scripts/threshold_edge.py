@@ -31,6 +31,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 
+from skeptic import storage
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%M:%S")
 log = logging.getLogger(__name__)
 
@@ -100,22 +102,22 @@ def _price_filter(df: pd.DataFrame) -> pd.DataFrame:
 # ── data loading ──────────────────────────────────────────────────────────────
 
 def load_prices(prices_dir: str) -> pd.DataFrame:
-    files = sorted(Path(prices_dir).glob("prices_*.csv"))
+    files = storage.list_csv_paths(prices_dir, "prices_*.csv")
     if not files:
         raise FileNotFoundError(f"No prices_*.csv in {prices_dir}")
-    df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+    df = pd.concat([storage.read_csv(f) for f in files], ignore_index=True)
     df = df.drop_duplicates(subset=["ts", "window_ts", "asset"])
     df = df.sort_values(["asset", "window_ts", "ts"]).reset_index(drop=True)
     return df
 
 
 def load_prices_for_asset(prices_dir: str, asset: str) -> pd.DataFrame:
-    files = sorted(Path(prices_dir).glob("prices_*.csv"))
+    files = storage.list_csv_paths(prices_dir, "prices_*.csv")
     if not files:
         raise FileNotFoundError(f"No prices_*.csv in {prices_dir}")
     frames = []
     for f in files:
-        chunk = pd.read_csv(f)
+        chunk = storage.read_csv(f)
         chunk = chunk[chunk["asset"] == asset.upper()]
         if not chunk.empty:
             frames.append(chunk)
@@ -133,10 +135,10 @@ def load_coin_prices(coin_dir: str, asset: str) -> pd.Series | None:
         log.warning("No symbol mapping for %s", asset)
         return None
     path = os.path.join(coin_dir, f"{symbol}_1s.csv")
-    if not os.path.exists(path):
+    if not storage.path_exists(path):
         log.warning("No coin price file: %s", path)
         return None
-    df = pd.read_csv(path, usecols=["ts", "close"])
+    df = storage.read_csv(path, usecols=["ts", "close"])
     df = df.drop_duplicates("ts").set_index("ts")["close"].astype(float)
     if df.empty:
         log.warning("No coin price data for %s — skipping", asset)
@@ -1713,8 +1715,8 @@ def _config_yaml(df: pd.DataFrame) -> str:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--assets",     nargs="+", default=list(ASSET_TO_SYMBOL.keys()))
-    p.add_argument("--prices-dir", default="data/prices")
-    p.add_argument("--coin-dir",   default="data/coin_prices")
+    p.add_argument("--prices-dir", default=storage.default_data_location("prices", "data/prices"))
+    p.add_argument("--coin-dir",   default=storage.default_data_location("coin_prices", "data/coin_prices"))
     p.add_argument("--sigma",      nargs="+", type=float, default=[0.3, 0.4, 0.5, 0.75])
     p.add_argument("--out-csv",    default="data/reports/threshold_edge.csv")
     p.add_argument("--out-report", default="data/reports/threshold_edge.md")
@@ -1892,3 +1894,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

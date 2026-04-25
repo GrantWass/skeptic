@@ -26,4 +26,6 @@ data/models/*.joblib
 data/orderbook/*.csv
 
 
-data/prices/
+data/prices/*.csv
+data/coin_prices/*.csv
+data/prices/prices_20260425.csv

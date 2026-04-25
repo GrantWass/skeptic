@@ -35,3 +35,7 @@ ASSETS: list[str] = ["BTC", "ETH", "SOL", "DOGE", "HYPE", "XRP", "BNB"]
 # --- Paths ---
 CREDS_FILE = ".creds.json"
 REPORTS_DIR = "data/reports"
+
+# --- S3 ---
+S3_BUCKET: str = os.getenv("S3_BUCKET", "").strip()
+S3_PREFIX: str = os.getenv("S3_PREFIX", "").strip("/")

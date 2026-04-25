@@ -86,6 +86,7 @@ from train_model import (  # type: ignore[import]
     section_orderbook_imbalance,
     _load_asset,
 )
+from skeptic import storage
 from skeptic.models.calibration import PlattScaledModel  # noqa: F401 — joblib compat
 
 logging.basicConfig(
@@ -844,8 +845,8 @@ def build_nn_report(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train per-asset GRU+MLP for P(resolved_up)")
-    p.add_argument("--prices-dir",  default="data/prices")
-    p.add_argument("--coin-dir",    default="data/coin_prices")
+    p.add_argument("--prices-dir",  default=storage.default_data_location("prices", "data/prices"))
+    p.add_argument("--coin-dir",    default=storage.default_data_location("coin_prices", "data/coin_prices"))
     p.add_argument("--out-report",  default="data/reports/nn_report.md")
     p.add_argument("--out-models",  default="data/models")
     p.add_argument("--assets",      nargs="+", default=None)
@@ -979,3 +980,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
