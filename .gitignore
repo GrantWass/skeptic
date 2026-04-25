@@ -25,3 +25,5 @@ data/live/*.csv
 data/models/*.joblib
 data/orderbook/*.csv
 
+
+data/prices/
