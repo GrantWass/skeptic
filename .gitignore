@@ -23,4 +23,5 @@ data/live/*.json
 data/live/*.csv
 .claude
 data/models/*.joblib
+data/orderbook/*.csv
 
