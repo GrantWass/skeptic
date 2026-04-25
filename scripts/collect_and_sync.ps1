@@ -7,7 +7,7 @@
     2. Runs collect_orderbook.py continuously (auto-restarts on crash).
     3. Every 30 minutes uploads today's data/prices/ and data/orderbook/ to S3
        via scripts/sync_to_s3.py (--today-only for speed).
-    4. On Ctrl+C a full S3 sync is performed before exit.
+    4. On Ctrl+C collectors are stopped immediately (no final S3 sync).
     5. Keeps your PC awake using the Windows SetThreadExecutionState API.
 
     PREREQUISITES
@@ -28,8 +28,7 @@
 
     HOW TO STOP
     -----------
-    Press Ctrl+C once. The script will stop the collectors, do a final S3 sync,
-    then exit cleanly.
+    Press Ctrl+C once. The script will stop the collectors and exit cleanly.
 
 .PARAMETER SyncIntervalMinutes
     How often (minutes) to upload new data to S3. Default: 30.
@@ -109,7 +108,7 @@ Log "Python: $PY"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # S3 sync — uploads data/prices/ and data/orderbook/ to S3
-# --today-only on periodic syncs (fast); full sync on exit
+# --today-only on periodic syncs (fast)
 # ─────────────────────────────────────────────────────────────────────────────
 function Sync-ToS3([string]$label, [switch]$TodayOnly) {
     Log "=== S3 sync ($label) ==="
@@ -168,7 +167,7 @@ function Start-OrderbookCollector {
 # ─────────────────────────────────────────────────────────────────────────────
 Log "=== collect_and_sync starting ==="
 Log "Sync interval : every $SyncIntervalMinutes minute(s)"
-Log "Press Ctrl+C to stop (a final S3 sync will run automatically)."
+Log "Press Ctrl+C to stop."
 
 $proc        = $null
 $obProc      = $null
@@ -217,7 +216,7 @@ try {
         Start-Sleep -Seconds 15
     }
 } finally {
-    # ── Cleanup: stop both collectors then do a full S3 sync ──────────────────
+    # ── Cleanup: stop both collectors and exit ─────────────────────────────────
     if ($null -ne $proc -and -not $proc.HasExited) {
         Log "Stopping collector (PID $($proc.Id))..."
         try { $proc.Kill(); $proc.WaitForExit(5000) | Out-Null } catch {}
@@ -226,8 +225,6 @@ try {
         Log "Stopping orderbook collector (PID $($obProc.Id))..."
         try { $obProc.Kill(); $obProc.WaitForExit(5000) | Out-Null } catch {}
     }
-
-    Sync-ToS3 "final-sync"   # full sync on exit (catches any missed files)
 
     # Allow Windows to sleep again
     [WakePC]::SetThreadExecutionState([WakePC]::ES_CONTINUOUS) | Out-Null

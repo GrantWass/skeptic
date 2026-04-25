@@ -72,14 +72,33 @@ def default_data_location(data_type: str, local_fallback: str) -> str:
         return local_fallback
 
 
-# ── Low-level helpers ─────────────────────────────────────────────────────────
+# -- Low-level helpers ---------------------------------------------------------
 
-def upload_file(local_path: str | Path, s3_key: str) -> None:
-    """Upload a single local file to S3."""
+def upload_file(local_path: str | Path, s3_key: str) -> bool:
+    """Upload a single local file to S3.
+
+    Returns True when an upload occurs, False when skipped as unchanged.
+    """
     s3 = _client()
     bucket = _bucket()
-    log.info("s3 upload: %s → s3://%s/%s", local_path, bucket, s3_key)
+    local_path = Path(local_path)
+
+    # Fast unchanged check: if key exists and object size matches local file size,
+    # treat it as already synced.
+    try:
+        head = s3.head_object(Bucket=bucket, Key=s3_key)
+        remote_size = int(head.get("ContentLength", -1))
+        local_size = local_path.stat().st_size
+        if remote_size == local_size:
+            log.info("s3 skip unchanged: %s", local_path)
+            return False
+    except Exception:
+        # Missing object (or head failure): proceed with upload.
+        pass
+
+    log.info("s3 upload: %s -> s3://%s/%s", local_path, bucket, s3_key)
     s3.upload_file(str(local_path), bucket, s3_key)
+    return True
 
 
 def list_keys(prefix: str) -> list[str]:
@@ -145,7 +164,7 @@ def read_csv(path: str | Path, **kwargs):
     return pd.read_csv(path, **kwargs)
 
 
-# ── Directory sync helpers ─────────────────────────────────────────────────────
+# -- Directory sync helpers ----------------------------------------------------
 
 def sync_prices(local_dir: str | Path, today_only: bool = False) -> int:
     """Upload prices_*.csv files from local_dir to S3. Returns file count.
@@ -156,8 +175,8 @@ def sync_prices(local_dir: str | Path, today_only: bool = False) -> int:
     pattern = f"prices_{_today_utc()}.csv" if today_only else "prices_*.csv"
     count = 0
     for f in sorted(Path(local_dir).glob(pattern)):
-        upload_file(f, f"{prefix}/{f.name}")
-        count += 1
+        if upload_file(f, f"{prefix}/{f.name}"):
+            count += 1
     return count
 
 
@@ -170,8 +189,8 @@ def sync_orderbook(local_dir: str | Path, today_only: bool = False) -> int:
     pattern = f"orderbook_{_today_utc()}.csv" if today_only else "orderbook_*.csv"
     count = 0
     for f in sorted(Path(local_dir).glob(pattern)):
-        upload_file(f, f"{prefix}/{f.name}")
-        count += 1
+        if upload_file(f, f"{prefix}/{f.name}"):
+            count += 1
     return count
 
 
@@ -183,8 +202,8 @@ def sync_coin_prices(local_dir: str | Path, today_only: bool = False) -> int:
     prefix = f"{_prefix()}/coin_prices"
     count = 0
     for f in sorted(Path(local_dir).glob("*.csv")):
-        upload_file(f, f"{prefix}/{f.name}")
-        count += 1
+        if upload_file(f, f"{prefix}/{f.name}"):
+            count += 1
     return count
 
 
@@ -196,4 +215,3 @@ def sync_file(local_path: str | Path, data_type: str) -> None:
     local_path = Path(local_path)
     key = f"{_prefix()}/{data_type}/{local_path.name}"
     upload_file(local_path, key)
-
