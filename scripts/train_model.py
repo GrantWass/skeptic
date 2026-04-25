@@ -56,7 +56,8 @@ VOL_LOOKBACK  = 10
 
 
 DEFAULT_THRESHOLD = 0.25
-BUY_FEE_RATE = 0.015
+FEE_GAMMA = 0.072  # Polymarket CLOB fee coefficient: fee = C × γ × p × (1 − p)
+BUY_FEE_RATE = FEE_GAMMA  # deprecated alias
 
 ASSET_TO_SYMBOL = {
     "BTC":  "BTCUSDT",
@@ -133,9 +134,16 @@ def load_pm_windows(prices_dir: str, asset: str) -> pd.DataFrame:
     if not files:
         raise FileNotFoundError(f"No prices_*.csv in {prices_dir}")
     frames = []
+    _COLS = ["ts", "window_ts", "asset", "up_ask", "dn_ask", "up_imbalance", "dn_imbalance"]
     for f in files:
-        df = pd.read_csv(f, usecols=["ts", "window_ts", "asset", "up_ask", "dn_ask",
-                                      "up_imbalance", "dn_imbalance"])
+        try:
+            df = pd.read_csv(f, usecols=_COLS)
+        except Exception:
+            try:
+                df = pd.read_csv(f, usecols=_COLS, engine="python")
+            except Exception as e2:
+                log.warning("Skipping corrupt prices file %s: %s", f.name, e2)
+                continue
         frames.append(df[df["asset"] == asset])
     out = pd.concat(frames, ignore_index=True)
     out = out.drop_duplicates(subset=["ts", "window_ts"]).sort_values(["window_ts", "ts"])
@@ -272,11 +280,16 @@ def build_window_features(
     volume_series: pd.Series,
     sigma:         float,
     hour_utc:      int,  # kept as param so callers pass the same value; converted internally
-) -> pd.DataFrame:
+    prev_state:    dict | None = None,
+) -> tuple[pd.DataFrame, dict]:
     """
     Vectorized per-window feature computation.
-    Returns a DataFrame with one row per second where coin data exists.
+    Returns (df, state) where state carries path-feature accumulators to the
+    next window so the GRU sees non-NaN context at second 1 of each window.
+    Pass prev_state=None to start fresh (first window or after a gap).
     """
+    _EMPTY_STATE: dict = {}
+
     ts_idx = close_series.index.values
     prices = close_series.values
     vols   = volume_series.values
@@ -285,7 +298,7 @@ def build_window_features(
     hi = int(np.searchsorted(ts_idx, window_ts + WINDOW_SECS, side="left"))
 
     if (hi - lo) < MIN_COIN_ROWS:
-        return pd.DataFrame()
+        return pd.DataFrame(), _EMPTY_STATE
 
     win_ts    = ts_idx[lo:hi]
     win_price = prices[lo:hi]
@@ -395,6 +408,19 @@ def build_window_features(
     # 8: Momentum slope — recent acceleration in σ units
     mom_slope = vel_2s - vel_10s   # NaN propagates where either is NaN
 
+    # 11–13: Rolling MA deviations and additional velocity timescale
+    # MA deviation: current price vs rolling mean — distinct from velocity
+    # (velocity compares endpoints; MA deviation compares vs the average of the window)
+    vel_20s    = _vel(20)
+    ma_dev_10s = np.full(n, np.nan)
+    ma_dev_30s = np.full(n, np.nan)
+    if n > 10:
+        _sw_p10_ma = _sw(win_price, 10)
+        ma_dev_10s[10:n] = (win_price[10:n] - _sw_p10_ma[:n - 10].mean(axis=1)) / sigma
+    if n > 30:
+        _sw_p30_ma = sw_p30 if sw_p30 is not None else _sw(win_price, 30)
+        ma_dev_30s[30:n] = (win_price[30:n] - _sw_p30_ma[:n - 30].mean(axis=1)) / sigma
+
     # 10: Time since last direction flip (seconds; trend persistence signal)
     time_since_flip = np.empty(n)
     time_since_flip[0] = 0.0
@@ -410,19 +436,28 @@ def build_window_features(
 
     # ── Quant path features ───────────────────────────────────────────────────
     # All use only information available at second t (no lookahead).
+    # prev_state carries accumulators from the previous window so these features
+    # are non-NaN/non-zero from second 1 of every window.
 
-    # 1. VWAP deviation — running volume-weighted average price vs current price
-    _run_vol      = np.cumsum(win_vol)
-    _run_pv       = np.cumsum(win_price * win_vol)
+    ps = prev_state or {}
+
+    # 1. VWAP deviation — multi-window running VWAP (resets only on fresh start)
+    _init_vol = ps.get("run_vol", 0.0)
+    _init_pv  = ps.get("run_pv",  0.0)
+    _run_vol      = np.cumsum(win_vol) + _init_vol
+    _run_pv       = np.cumsum(win_price * win_vol) + _init_pv
     _safe_run_vol = np.where(_run_vol > 1e-10, _run_vol, 1.0)
     _vwap         = np.where(_run_vol > 1e-10, _run_pv / _safe_run_vol, win_price)
     vwap_dev = (win_price - _vwap) / sigma
 
-    # 2–5. Running max/min from window open → channel position + excursions
-    max_price_run    = np.maximum.accumulate(win_price)
-    min_price_run    = np.minimum.accumulate(win_price)
-    max_up_excursion = (max_price_run - open_price) / sigma   # ≥ 0
-    max_dn_excursion = (min_price_run - open_price) / sigma   # ≤ 0
+    # 2–5. Running max/min: seeded from previous window high/low so the channel
+    #      and excursion features reflect recent multi-window range, not just intra-window.
+    _init_max = ps.get("max_price", open_price)
+    _init_min = ps.get("min_price", open_price)
+    max_price_run    = np.maximum(np.maximum.accumulate(win_price), _init_max)
+    min_price_run    = np.minimum(np.minimum.accumulate(win_price), _init_min)
+    max_up_excursion = (max_price_run - open_price) / sigma
+    max_dn_excursion = (min_price_run - open_price) / sigma
     running_range    = max_price_run - min_price_run
     _safe_range      = np.where(running_range > 1e-10, running_range, 1.0)
     chan_pos         = np.where(running_range > 1e-10,
@@ -432,8 +467,12 @@ def build_window_features(
                                 np.abs(win_price - open_price) / _safe_range,
                                 0.0)
 
-    # 6. Running directional consistency since window open ∈ [-1, 1]
-    dir_consistency_window = np.cumsum(tick_sign) / np.arange(1, n + 1)
+    # 6. Running directional consistency — multi-window momentum
+    _init_tick_sum = ps.get("tick_sum", 0)
+    _init_n_ticks  = ps.get("n_ticks",  0)
+    _tick_cumsum           = np.cumsum(tick_sign) + _init_tick_sum
+    _total_ticks           = np.arange(1, n + 1) + _init_n_ticks
+    dir_consistency_window = _tick_cumsum / _total_ticks
 
     # 7. 10s price-change / volume correlation (measures buy pressure conviction)
     pv_corr_10 = np.full(n, np.nan)
@@ -494,9 +533,22 @@ def build_window_features(
         "dir_consistency_window": dir_consistency_window,
         "pv_corr_10":             pv_corr_10,
         "vol_accel":              vol_accel,
+        # Rolling MA deviation features
+        "vel_20s":    vel_20s,
+        "ma_dev_10s": ma_dev_10s,
+        "ma_dev_30s": ma_dev_30s,
     })
 
-    return df
+    # Build state dict for the next window
+    state = {
+        "run_vol":   float(_run_vol[-1]),
+        "run_pv":    float(_run_pv[-1]),
+        "max_price": float(max_price_run[-1]),
+        "min_price": float(min_price_run[-1]),
+        "tick_sum":  int(_tick_cumsum[-1]),
+        "n_ticks":   int(_total_ticks[-1]),
+    }
+    return df, state
 
 
 # ── Asset dataset builder ─────────────────────────────────────────────────────
@@ -543,30 +595,45 @@ def build_asset_dataset(
     skipped_coin       = 0
     skipped_resolution = 0
     skipped_ewma       = 0
+    prev_state: dict | None = None
+    prev_wts:   int  | None = None
 
     for wts in windows:
         lo = int(np.searchsorted(ts_idx, wts,               side="left"))
         hi = int(np.searchsorted(ts_idx, wts + WINDOW_SECS, side="left"))
         if (hi - lo) < MIN_COIN_ROWS:
             skipped_coin += 1
+            prev_state = None; prev_wts = wts
             continue
 
         window_move = float(vals[hi - 1]) - float(vals[lo])
         label       = resolve_window(window_move)
         if label is None:
             skipped_resolution += 1
+            prev_state = None; prev_wts = wts
             continue
 
         win_sigma = ewma_sigmas.get(wts)
         if win_sigma is None or win_sigma <= 0:
             skipped_ewma += 1
+            prev_state = None; prev_wts = wts
             continue
 
+        # Reset state on gaps > 1 window (data outage, market close, etc.)
+        if prev_wts is not None and wts - prev_wts > WINDOW_SECS + 30:
+            prev_state = None
+
         hour_utc = datetime.fromtimestamp(wts, tz=timezone.utc).hour
-        feat_df  = build_window_features(wts, close_series, volume_series, win_sigma, hour_utc)
+        feat_df, state = build_window_features(
+            wts, close_series, volume_series, win_sigma, hour_utc,
+            prev_state=prev_state,
+        )
         if feat_df.empty:
             skipped_coin += 1
+            prev_state = None; prev_wts = wts
             continue
+        prev_state = state
+        prev_wts   = wts
 
         feat_df["window_ts"]   = wts
         feat_df["ewma_sigma"]  = win_sigma
@@ -643,31 +710,45 @@ def build_market_features_dataset(
     ts_idx = close_series.index.values
     vals   = close_series.values
     all_frames: list[pd.DataFrame] = []
-    n_skipped = 0
+    n_skipped  = 0
+    prev_state: dict | None = None
+    prev_wts:   int  | None = None
 
     for wts in overlap_windows:
         lo = int(np.searchsorted(ts_idx, wts,               side="left"))
         hi = int(np.searchsorted(ts_idx, wts + WINDOW_SECS, side="left"))
         if (hi - lo) < MIN_COIN_ROWS:
             n_skipped += 1
+            prev_state = None; prev_wts = wts
             continue
 
         window_move = float(vals[hi - 1]) - float(vals[lo])
         label       = resolve_window(window_move)
         if label is None:
             n_skipped += 1
+            prev_state = None; prev_wts = wts
             continue
 
         win_sigma = ewma_sigmas.get(wts)
         if win_sigma is None or win_sigma <= 0:
             n_skipped += 1
+            prev_state = None; prev_wts = wts
             continue
 
+        if prev_wts is not None and wts - prev_wts > WINDOW_SECS + 30:
+            prev_state = None
+
         hour_utc = datetime.fromtimestamp(wts, tz=timezone.utc).hour
-        feat_df  = build_window_features(wts, close_series, volume_series, win_sigma, hour_utc)
+        feat_df, state = build_window_features(
+            wts, close_series, volume_series, win_sigma, hour_utc,
+            prev_state=prev_state,
+        )
         if feat_df.empty:
             n_skipped += 1
+            prev_state = None; prev_wts = wts
             continue
+        prev_state = state
+        prev_wts   = wts
 
         feat_df["window_ts"]   = wts
         feat_df["ewma_sigma"]  = win_sigma
@@ -1293,8 +1374,12 @@ def section_edge_by_elapsed(results: list[dict]) -> str:
 # ── Trading-focused sections ──────────────────────────────────────────────────
 
 def _fill_with_fee(fill_price: pd.Series) -> pd.Series:
-    """Effective entry cost per share after applying the buy fee."""
-    return fill_price * (1.0 + BUY_FEE_RATE)
+    """Effective entry cost per share after applying the buy fee.
+
+    fee_per_share = FEE_GAMMA × p × (1 − p)
+    effective_cost = p + FEE_GAMMA × p × (1 − p)
+    """
+    return fill_price + FEE_GAMMA * fill_price * (1.0 - fill_price)
 
 
 def _pnl_per_trade(fill_price: pd.Series, won: pd.Series) -> pd.Series:
@@ -1370,7 +1455,7 @@ def section_threshold_ev(results: list[dict], pm_lookup: dict, dn_lookup: dict) 
     out.append(
         "_fill_rate% = % of test windows where a trade fires at this threshold. "
         "avg_fill = avg ask price 1s after trigger (network latency). "
-        "avg_pnl per trade assumes a 1.5% buy fee on entry. "
+        "avg_pnl per trade includes CLOB fee (C × 0.072 × p × (1 − p)) on entry. "
         "Best side (UP or DOWN) taken per window._"
     )
     return "\n".join(out)
@@ -1658,22 +1743,30 @@ def section_model_comparison(
         "_All models evaluated on the same windows: the last 20% of PM windows (market model's test set), "
         "split into H1 (first half) and H2 (second half) to check consistency over time. "
         "AUC/Brier shown on All rows only (recomputed on the restricted subset). "
-        "fill% = trades ÷ n_windows. avg_pnl and total_pnl include the 1.5% buy fee._"
+        "fill% = trades ÷ n_windows. avg_pnl and total_pnl include the CLOB fee._"
     )
     return "\n".join(out)
 
 
-def _multi_trade_window_both(window_df: pd.DataFrame, threshold: float, cooldown: int = 5) -> pd.DataFrame:
+def _multi_trade_window_both(
+    window_df:  pd.DataFrame,
+    threshold:  float,
+    cooldown:   int = 5,
+    max_trades: int | None = None,
+) -> pd.DataFrame:
     """
     Greedy multi-trade picker for a single window — UP and DOWN tracked independently.
     At each second, UP fires if edge_up >= threshold and cooldown since last UP trade.
     DOWN fires if edge_dn >= threshold and cooldown since last DOWN trade.
     Both can fire in the same second.
+    max_trades caps total trades (UP + DOWN combined) per window.
     """
     selected = []
     last_up = -cooldown - 1
     last_dn = -cooldown - 1
     for _, row in window_df.sort_values("elapsed_second").iterrows():
+        if max_trades is not None and len(selected) >= max_trades:
+            break
         elapsed = row["elapsed_second"]
         if row["edge_up"] >= threshold and elapsed - last_up >= cooldown:
             r = row.copy()
@@ -1684,7 +1777,8 @@ def _multi_trade_window_both(window_df: pd.DataFrame, threshold: float, cooldown
             r["effective_won"]   = int(bool(row["resolved_up"]))
             selected.append(r)
             last_up = elapsed
-        if row["edge_dn"] >= threshold and elapsed - last_dn >= cooldown:
+        if (max_trades is None or len(selected) < max_trades) \
+                and row["edge_dn"] >= threshold and elapsed - last_dn >= cooldown:
             r = row.copy()
             r["side_taken"]      = "dn"
             r["edge"]            = row["edge_dn"]
@@ -1698,46 +1792,44 @@ def _multi_trade_window_both(window_df: pd.DataFrame, threshold: float, cooldown
 
 def section_multi_trade(results: list[dict], pm_lookup: dict, dn_lookup: dict) -> str:
     """
-    Compares three strategies at each threshold:
-      A) First-only        — one trade per window (first second EITHER side edge >= threshold)
-      B) Multi 5s cooldown  — UP and DOWN re-enter independently every 5s
-      C) Multi 10s cooldown — UP and DOWN re-enter independently every 10s
+    Compares four capped multi-trade strategies at threshold=0.20.
 
-    avg_pnl and total_pnl are per-trade so they are directly comparable across strategies.
+    Layout: one row per strategy, columns = metrics.
+    pnl/win = total_pnl / n_windows — the key metric for comparing strategies
+    that fire different numbers of trades per window.
     """
-    THRESHOLDS = [0.15, 0.20, 0.25]
-    COOLDOWNS  = [5, 10]
+    THRESHOLD  = 0.20
+    STRATEGIES = [
+        ("cap3 / 5s",  3, 5),
+        ("cap3 / 10s", 3, 10),
+        ("cap8 / 5s",  8, 5),
+        ("cap8 / 10s", 8, 10),
+    ]
     out = []
 
-    def _build_multi_both(valid: pd.DataFrame, group_cols: list, t: float, cd: int) -> pd.DataFrame:
+    def _build(valid: pd.DataFrame, group_cols: list, cap: int, cd: int) -> pd.DataFrame:
         parts = [
-            _multi_trade_window_both(grp, t, cd)
+            _multi_trade_window_both(grp, THRESHOLD, cooldown=cd, max_trades=cap)
             for _, grp in valid.groupby(group_cols)
         ]
         non_empty = [p for p in parts if not p.empty]
         return pd.concat(non_empty, ignore_index=True) if non_empty else pd.DataFrame()
 
-    def _fmt(trades: pd.DataFrame, n_win: int) -> str:
+    def _row(name: str, trades: pd.DataFrame, n_win: int) -> str:
         if trades.empty:
-            return "0 | — | — | — | —"
-        fill_p = trades["pm_fill_price"].fillna(trades["pm_price_signal"])
-        won    = trades["effective_won"]
-        pnl    = _pnl_per_trade(fill_p, won)
+            return f"| {name} | — | — | — | — | — |"
+        fill_p  = trades["pm_fill_price"].fillna(trades["pm_price_signal"])
+        won     = trades["effective_won"]
+        pnl     = _pnl_per_trade(fill_p, won)
+        pnl_win = pnl.sum() / n_win
         return (
-            f"{len(trades)} |"
-            f" {len(trades)/n_win:.2f} |"
-            f" {won.mean()*100:.1f}% |"
-            f" {pnl.mean():+.4f} |"
-            f" {pnl.sum():+.4f}"
+            f"| {name} "
+            f"| {len(trades)/n_win:.2f} "
+            f"| {won.mean()*100:.1f}% "
+            f"| {pnl.mean():+.4f} "
+            f"| {pnl_win:+.4f} "
+            f"| {pnl.sum():+.4f} |"
         )
-
-    header = (
-        "| threshold"
-        " | A: n | A: t/win | A: win% | A: avg_pnl | A: total_pnl"
-        " | B(5s): n | B: t/win | B: win% | B: avg_pnl | B: total_pnl"
-        " | C(10s): n | C: t/win | C: win% | C: avg_pnl | C: total_pnl |"
-    )
-    sep = "|---|" + "---:|" * 15
 
     all_frames = []
     for r in results:
@@ -1750,29 +1842,22 @@ def section_multi_trade(results: list[dict], pm_lookup: dict, dn_lookup: dict) -
         all_frames.append(valid)
 
     if all_frames:
-        all_valid       = pd.concat(all_frames, ignore_index=True)
-        n_windows_total = all_valid.groupby("asset")["window_ts"].nunique().sum()
-        out.append("### All Assets (aggregated)\n")
-        out.append(header)
-        out.append(sep)
+        all_valid = pd.concat(all_frames, ignore_index=True)
+        n_win_tot = all_valid.groupby("asset")["window_ts"].nunique().sum()
 
-        for t in THRESHOLDS:
-            cands_a  = all_valid[all_valid["edge"] >= t].sort_values("elapsed_second")
-            a_trades = cands_a.groupby(["asset", "window_ts"]).first().reset_index()
-            b_trades = _build_multi_both(all_valid, ["asset", "window_ts"], t, COOLDOWNS[0])
-            c_trades = _build_multi_both(all_valid, ["asset", "window_ts"], t, COOLDOWNS[1])
-            out.append(
-                f"| {t:.2f} | {_fmt(a_trades, n_windows_total)}"
-                f" | {_fmt(b_trades, n_windows_total)}"
-                f" | {_fmt(c_trades, n_windows_total)} |"
-            )
+        out.append(f"### All Assets (aggregated) — threshold = {THRESHOLD}\n")
+        out.append("| strategy | trades/win | win% | avg_pnl | pnl/win | total_pnl |")
+        out.append("|:---|---:|---:|---:|---:|---:|")
+        for name, cap, cd in STRATEGIES:
+            trades = _build(all_valid, ["asset", "window_ts"], cap, cd)
+            out.append(_row(name, trades, n_win_tot))
         out.append("")
 
     out.append(
-        "_A = first qualifying second per window (best side at that instant). "
-        "B = UP and DOWN re-enter independently with 5s cooldown per side. "
-        "C = UP and DOWN re-enter independently with 10s cooldown per side. "
-        "t/win = avg trades per window. avg_pnl and total_pnl are per-trade._"
+        "_trades/win = avg trades fired per window (UP + DOWN combined). "
+        "win% and avg_pnl are per-trade. "
+        "pnl/win = total_pnl / n_windows — profit per window, accounting for trade frequency. "
+        "cap3/cap8 = max trades per window. 5s/10s = cooldown between re-entries per side._"
     )
     return "\n".join(out)
 
@@ -1856,7 +1941,7 @@ def build_predictions_df(results: list[dict], pm_lookup: dict) -> pd.DataFrame:
         test_df["pm_fill_price"] = test_df["ts"].apply(
             lambda t: pm_lookup.get((asset, int(t) + 1))
         )
-        test_df["edge"] = test_df["predicted_prob"] - test_df["pm_price_up_equiv"] * (1.0 + BUY_FEE_RATE)
+        test_df["edge"] = test_df["predicted_prob"] - _fill_with_fee(test_df["pm_price_up_equiv"])
         cols = ["asset", "window_ts", "ts", "elapsed_second", "resolved_up",
                 "predicted_prob", "pm_price_up_equiv", "edge"]
         frames.append(test_df[[c for c in cols if c in test_df.columns]])
@@ -2113,7 +2198,7 @@ def section_slippage(results: list[dict], pm_lookup: dict, dn_lookup: dict,
     1-second and 2-second execution slippage at actual trade moments.
     Slippage = ask at fill second (t+N) − ask at signal second (t), for the side taken.
     Positive = PM repriced against us; negative = moved in our favour.
-    Does NOT include the 1.5% fee.
+    Does NOT include the CLOB fee.
 
     1s slippage is already baked into all PnL numbers (fills are simulated at t+1).
     2s comparison shows the cost of a slower execution path.
@@ -2179,7 +2264,7 @@ def section_slippage(results: list[dict], pm_lookup: dict, dn_lookup: dict,
         f"_Avg additional slippage from 2s vs 1s fill: {extra.mean():+.5f} "
         f"(median {extra.median():+.5f}). "
         f"1s slippage is already baked into all PnL numbers — fills are simulated at t+1. "
-        f"adverse = PM ask moved up before fill. Does NOT include the 1.5% buy fee._"
+        f"adverse = PM ask moved up before fill. Does NOT include the CLOB fee._"
     )
     return "\n".join(out)
 
@@ -2204,8 +2289,8 @@ def _augment_both_sides(test_df: pd.DataFrame, asset: str,
     df["up_ask_fill"] = df["ts"].apply(lambda t: pm_lookup.get((asset, int(t) + 1)))
     df["dn_ask"]      = df["ts"].apply(lambda t: dn_lookup.get((asset, int(t))))
     df["dn_ask_fill"] = df["ts"].apply(lambda t: dn_lookup.get((asset, int(t) + 1)))
-    df["edge_up"]     = df["predicted_prob"]         - df["up_ask"] * (1.0 + BUY_FEE_RATE)
-    df["edge_dn"]     = (1.0 - df["predicted_prob"]) - df["dn_ask"] * (1.0 + BUY_FEE_RATE)
+    df["edge_up"]     = df["predicted_prob"]         - _fill_with_fee(df["up_ask"])
+    df["edge_dn"]     = (1.0 - df["predicted_prob"]) - _fill_with_fee(df["dn_ask"])
     # Best side per second; UP wins ties
     take_dn           = df["edge_dn"] > df["edge_up"]
     df["edge"]        = np.where(take_dn, df["edge_dn"], df["edge_up"])
@@ -2404,7 +2489,7 @@ def section_market_features_model(
     out.append("")
     out.append(
         "_Test set = last 20% of overlap windows (temporal split). "
-        "avg_pnl includes 1.5% buy fee. Model not saved._"
+        "avg_pnl includes CLOB fee. Model not saved._"
     )
     return "\n".join(out)
 
@@ -2532,7 +2617,7 @@ def build_report(results: list[dict], pm_lookup: dict, generated_at: str,
         "## 2. What Edge Threshold Should I Use? — EV Sweep",
         "",
         "Sweeps thresholds from 5c to 30c. `fill_rate%` = how often a trade fires per session.",
-        "`avg_pnl` includes a 1.5% buy fee on entry. Best side (UP or DOWN) taken at first trigger each window.",
+        "`avg_pnl` includes CLOB fee on entry. Best side (UP or DOWN) taken at first trigger each window.",
         "",
         section_threshold_ev(results, pm_lookup, dn),
         "",
@@ -2540,9 +2625,9 @@ def build_report(results: list[dict], pm_lookup: dict, generated_at: str,
         "",
         "## 3. Multi-Trade vs First-Only Comparison",
         "",
-        "**A**: one trade per window (first second either side edge ≥ threshold). "
-        "**B/C**: UP and DOWN re-enter independently with 5s / 10s cooldown per side. "
-        "`avg_pnl` is per-trade across all columns so they are directly comparable.",
+        "UP and DOWN re-enter independently per side after a cooldown. "
+        "`pnl/win` is the key metric — it shows total profit per window, capturing both "
+        "trade quality and how many trades each strategy fires.",
         "",
         section_multi_trade(results, pm_lookup, dn),
         "",
@@ -2554,7 +2639,7 @@ def build_report(results: list[dict], pm_lookup: dict, generated_at: str,
         "1s = current execution (already baked into all PnL numbers). "
         "2s = cost of a slower execution path, shown for comparison.",
         f"Measured at actual trade moments (first qualifying second per window at threshold={DEFAULT_THRESHOLD}).",
-        "Does NOT include the 1.5% fee.",
+        "Does NOT include the CLOB fee.",
         "",
         section_slippage(results, pm_lookup, dn),
         "",
@@ -2736,10 +2821,10 @@ def build_report(results: list[dict], pm_lookup: dict, generated_at: str,
         "",
         "### Edge & trading",
         "",
-        "- `edge_up = predicted_prob − up_ask × 1.015`",
-        "- `edge_dn = (1 − predicted_prob) − dn_ask × 1.015`",
+        "- `edge_up = predicted_prob − (up_ask + 0.072 × up_ask × (1 − up_ask))`",
+        "- `edge_dn = (1 − predicted_prob) − (dn_ask + 0.072 × dn_ask × (1 − dn_ask))`",
         "- Trade side: whichever side has higher edge at the first qualifying second (tie → UP)",
-        f"- Buy fee: {BUY_FEE_RATE*100:.1f}% applied to fill price in all PnL tables",
+        f"- CLOB fee: C × {FEE_GAMMA} × p × (1 − p) applied in all PnL tables",
     ]
     return "\n".join(lines)
 

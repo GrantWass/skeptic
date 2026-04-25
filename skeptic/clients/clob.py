@@ -341,6 +341,22 @@ async def post_presigned_order_async(
 
 
 _POST_ORDER_URL: str = ""  # cached at first use
+_WARM_URL: str = ""       # cached at first use
+
+
+async def warm_connection_async(http: httpx.AsyncClient, client: ClobClient) -> None:
+    """
+    Establish (or re-confirm) the TCP+TLS connection to the CLOB host so the
+    hot-path POST at trade time reuses an already-open connection.
+    Hits GET /time — a cheap, read-only endpoint — and discards the response.
+    """
+    global _WARM_URL
+    if not _WARM_URL:
+        _WARM_URL = f"{client.host}/time"
+    try:
+        await http.get(_WARM_URL)
+    except Exception:
+        pass  # warmup is best-effort; don't block window execution
 
 
 async def post_preserialized_order_async(

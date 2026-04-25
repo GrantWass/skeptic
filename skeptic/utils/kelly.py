@@ -8,7 +8,7 @@ MOMENTUM_EDGE_THRESHOLD = 0.10  # momentum: edge at which scaling begins (max_pm
 # ask-heavy (low imbalance) → more supply, better fills, higher edge → scale up
 # bid-heavy (high imbalance) → more demand pressure against us → scale down
 IMBALANCE_NEUTRAL   = 0.51   # midpoint of balanced tercile (0.50–0.52)
-IMBALANCE_SENSITIVITY = 4.0  # multiplier range: ±(sensitivity * delta)
+IMBALANCE_SENSITIVITY = 5.0  # multiplier range: ±(sensitivity * delta)
 IMBALANCE_MIN_MULT  = 0.5    # floor: never go below 50% of Kelly stake
 IMBALANCE_MAX_MULT  = 1.5    # ceiling: never exceed 150% of Kelly stake
 
@@ -25,8 +25,8 @@ def imbalance_kelly_multiplier(imbalance: float) -> float:
 
     Linear around IMBALANCE_NEUTRAL, clamped to [IMBALANCE_MIN_MULT, IMBALANCE_MAX_MULT].
 
-    Examples (sensitivity=4.0, neutral=0.51):
-      imbalance=0.40 → 1.44   imbalance=0.51 → 1.00   imbalance=0.62 → 0.56
+    Examples (sensitivity=5.0, neutral=0.51):
+      imbalance=0.40 → 1.50   imbalance=0.51 → 1.00   imbalance=0.62 → 0.50
     """
     mult = 1.0 + (IMBALANCE_NEUTRAL - imbalance) * IMBALANCE_SENSITIVITY
     return max(IMBALANCE_MIN_MULT, min(IMBALANCE_MAX_MULT, mult))
